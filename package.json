@@ -1,0 +1,138 @@
+{
+  "name": "agent-peers-mcp",
+  "displayName": "Agent Peers",
+  "version": "0.1.0",
+  "description": "Cross-agent context sharing MCP server & VSCode extension — Claude Code, Codex, GitHub Copilot Chat, and more",
+  "publisher": "agent-peers",
+  "license": "MIT",
+  "type": "module",
+  "main": "./out/extension/index.js",
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "agent-peers",
+          "title": "Agent Peers",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "agent-peers": [
+        {
+          "id": "agentPeers.peerList",
+          "name": "Peers"
+        },
+        {
+          "id": "agentPeers.messages",
+          "name": "Messages"
+        },
+        {
+          "id": "agentPeers.context",
+          "name": "Shared Context"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "agentPeers.refreshPeers",
+        "title": "Refresh Peers",
+        "icon": "$(refresh)",
+        "category": "Agent Peers"
+      },
+      {
+        "command": "agentPeers.sendMessage",
+        "title": "Send Message to Peer",
+        "icon": "$(comment)",
+        "category": "Agent Peers"
+      },
+      {
+        "command": "agentPeers.shareContext",
+        "title": "Share Current Context",
+        "icon": "$(broadcast)",
+        "category": "Agent Peers"
+      },
+      {
+        "command": "agentPeers.startBroker",
+        "title": "Start Broker Daemon",
+        "category": "Agent Peers"
+      },
+      {
+        "command": "agentPeers.showDashboard",
+        "title": "Show Dashboard",
+        "icon": "$(dashboard)",
+        "category": "Agent Peers"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "agentPeers.refreshPeers",
+          "when": "view == agentPeers.peerList",
+          "group": "navigation"
+        },
+        {
+          "command": "agentPeers.sendMessage",
+          "when": "view == agentPeers.messages",
+          "group": "navigation"
+        },
+        {
+          "command": "agentPeers.shareContext",
+          "when": "view == agentPeers.context",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Agent Peers",
+      "properties": {
+        "agentPeers.brokerPort": {
+          "type": "number",
+          "default": 7899,
+          "description": "Port for the broker daemon"
+        },
+        "agentPeers.autoStartBroker": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically start the broker daemon when the extension activates"
+        },
+        "agentPeers.pollIntervalMs": {
+          "type": "number",
+          "default": 1000,
+          "description": "Polling interval for messages (milliseconds)"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "npm run build:broker && npm run build:server && npm run build:extension",
+    "build:broker": "bun build src/broker/index.ts --outdir out/broker --target node",
+    "build:server": "bun build src/server/index.ts --outdir out/server --target node",
+    "build:extension": "bun build src/extension/index.ts --outdir out/extension --target node --external vscode",
+    "dev:broker": "bun src/broker/index.ts",
+    "dev:server": "bun src/server/index.ts",
+    "watch": "bun build src/extension/index.ts --outdir out/extension --target node --external vscode --watch",
+    "package": "vsce package",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.95.0"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1"
+  }
+}
