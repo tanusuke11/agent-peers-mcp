@@ -8,5 +8,5 @@ bun.lock
 tsconfig.json
 src/
 node_modules/
-out/broker/
 out/server/
+justfile
