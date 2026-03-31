@@ -69,6 +69,10 @@ export interface Peer {
   registeredAt: string;
   /** When the peer last sent a heartbeat */
   lastSeen: string;
+  /** Whether the peer is connected via MCP (true) or discovered via process scan (false) */
+  connected?: boolean;
+  /** Whether the peer has been suspended from context sharing */
+  suspended?: boolean;
 }
 
 // ─── Messages ──────────────────────────────────────────────────
@@ -131,11 +135,14 @@ export interface PollMessagesRequest {
 }
 
 export interface PollMessagesResponse {
+  /** false if the peer ID was not found in the broker (e.g. after a purge) */
+  found: boolean;
   messages: Message[];
 }
 
 export interface BrokerHealthResponse {
   status: "ok";
+  pid: number;
   peerCount: number;
   uptime: number;
 }

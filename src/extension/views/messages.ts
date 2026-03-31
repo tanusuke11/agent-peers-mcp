@@ -31,11 +31,7 @@ export class MessagesProvider implements vscode.TreeDataProvider<MessageItem> {
   }
 
   async getChildren(): Promise<MessageItem[]> {
-    if (this.messages.length === 0) {
-      const item = new vscode.TreeItem("No messages yet");
-      item.iconPath = new vscode.ThemeIcon("info");
-      return [item as unknown as MessageItem];
-    }
+    if (this.messages.length === 0) return [];
 
     return this.messages
       .slice()
@@ -57,7 +53,7 @@ class MessageItem extends vscode.TreeItem {
       `---`,
       msg.text,
     ].join("\n"));
-    this.iconPath = new vscode.ThemeIcon(messageThemeIcon(msg.type));
+    this.iconPath = new vscode.ThemeIcon(messageThemeIcon(msg.type), messageThemeColor(msg.type));
   }
 }
 
@@ -78,5 +74,15 @@ function messageThemeIcon(type: string): string {
     case "context-response": return "file-code";
     case "task-handoff": return "arrow-swap";
     default: return "comment";
+  }
+}
+
+function messageThemeColor(type: string): vscode.ThemeColor {
+  switch (type) {
+    case "text": return new vscode.ThemeColor("charts.blue");
+    case "context-request": return new vscode.ThemeColor("charts.yellow");
+    case "context-response": return new vscode.ThemeColor("charts.green");
+    case "task-handoff": return new vscode.ThemeColor("charts.red");
+    default: return new vscode.ThemeColor("charts.foreground");
   }
 }

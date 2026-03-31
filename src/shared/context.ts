@@ -3,15 +3,17 @@
  * Used by both the MCP server and VSCode extension
  */
 
+import { execFile } from "child_process";
+import { promisify } from "util";
 import type { ActiveFile, GitContext } from "./types.ts";
+
+const execFileAsync = promisify(execFile);
 
 /** Run a command and return stdout, or null on failure */
 async function run(cmd: string[], cwd: string): Promise<string | null> {
   try {
-    const proc = Bun.spawn(cmd, { cwd, stdout: "pipe", stderr: "ignore" });
-    const text = await new Response(proc.stdout).text();
-    const code = await proc.exited;
-    return code === 0 ? text.trim() : null;
+    const { stdout } = await execFileAsync(cmd[0]!, cmd.slice(1), { cwd });
+    return stdout.trim();
   } catch {
     return null;
   }
@@ -72,17 +74,17 @@ export async function gatherGitContext(cwd: string): Promise<GitContext | null> 
   };
 }
 
-/** Get the TTY of the parent process (for terminal identification) */
+/** Get a session identifier for the current process (cross-platform) */
 export function getTty(): string | null {
-  try {
-    const ppid = process.ppid;
-    if (ppid) {
-      const proc = Bun.spawnSync(["ps", "-o", "tty=", "-p", String(ppid)]);
-      const tty = new TextDecoder().decode(proc.stdout).trim();
-      if (tty && tty !== "?" && tty !== "??") return tty;
-    }
-  } catch { /* ignore */ }
-  return null;
+  // Check terminal-specific environment variables (all platforms)
+  return (
+    process.env.TERM_SESSION_ID    // macOS Terminal / iTerm2
+    ?? process.env.WT_SESSION       // Windows Terminal
+    ?? process.env.TMUX             // tmux (contains socket path + session id)
+    ?? process.env.STY              // GNU screen
+    ?? process.env.ZELLIJ_SESSION_NAME  // Zellij
+    ?? (process.ppid ? String(process.ppid) : null)  // fallback: parent PID
+  ) ?? null;
 }
 
 /**

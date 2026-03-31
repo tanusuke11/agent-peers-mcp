@@ -5,7 +5,7 @@
   "description": "Cross-agent context sharing MCP server & VSCode extension — Claude Code, Codex, GitHub Copilot Chat, and more",
   "publisher": "agent-peers",
   "license": "MIT",
-  "type": "module",
+
   "main": "./out/extension/index.js",
   "engines": {
     "vscode": "^1.95.0"
@@ -29,27 +29,29 @@
     "views": {
       "agent-peers": [
         {
+          "id": "agentPeers.control",
+          "name": "Control"
+        },
+        {
           "id": "agentPeers.peerList",
           "name": "Peers"
-        },
-        {
-          "id": "agentPeers.messages",
-          "name": "Messages"
-        },
-        {
-          "id": "agentPeers.context",
-          "name": "Shared Context"
         }
       ]
     },
-    "commands": [
+    "viewsWelcome": [
       {
-        "command": "agentPeers.refreshPeers",
-        "title": "Refresh Peers",
-        "icon": "$(refresh)",
-        "category": "Agent Peers"
+        "view": "agentPeers.peerList",
+        "contents": "Broker is not running.\n[Start Broker](command:agentPeers.startBroker)",
+        "when": "!agentPeers.brokerConnected"
       },
       {
+        "view": "agentPeers.peerList",
+        "contents": "No peers connected.",
+        "when": "agentPeers.brokerConnected"
+      }
+    ],
+    "commands": [
+{
         "command": "agentPeers.sendMessage",
         "title": "Send Message to Peer",
         "icon": "$(comment)",
@@ -64,6 +66,13 @@
       {
         "command": "agentPeers.startBroker",
         "title": "Start Broker Daemon",
+        "icon": "$(play)",
+        "category": "Agent Peers"
+      },
+      {
+        "command": "agentPeers.stopBroker",
+        "title": "Stop Broker",
+        "icon": "$(debug-stop)",
         "category": "Agent Peers"
       },
       {
@@ -71,26 +80,72 @@
         "title": "Show Dashboard",
         "icon": "$(dashboard)",
         "category": "Agent Peers"
+      },
+      {
+        "command": "agentPeers.disconnectPeer",
+        "title": "Suspend Peer",
+        "icon": "$(debug-disconnect)",
+        "category": "Agent Peers"
+      },
+      {
+        "command": "agentPeers.connectPeer",
+        "title": "Resume Peer",
+        "icon": "$(plug)",
+        "category": "Agent Peers"
+      },
+      {
+        "command": "agentPeers.addMcpServer",
+        "title": "Config Claude Code to MCP",
+        "icon": "$(plug)",
+        "category": "Agent Peers"
+      },
+      {
+        "command": "agentPeers.addMcpServerCodex",
+        "title": "Config Codex to MCP",
+        "icon": "$(plug)",
+        "category": "Agent Peers"
+      },
+      {
+        "command": "agentPeers.toggleAutoStart",
+        "title": "Toggle Auto-Start Broker",
+        "icon": "$(settings-gear)",
+        "category": "Agent Peers"
       }
     ],
     "menus": {
-      "view/title": [
+      "explorer/context": [
         {
-          "command": "agentPeers.refreshPeers",
-          "when": "view == agentPeers.peerList",
-          "group": "navigation"
-        },
-        {
-          "command": "agentPeers.sendMessage",
-          "when": "view == agentPeers.messages",
-          "group": "navigation"
-        },
-        {
-          "command": "agentPeers.shareContext",
-          "when": "view == agentPeers.context",
-          "group": "navigation"
+          "command": "agentPeers.startBroker",
+          "when": "explorerResourceIsFolder",
+          "group": "agentPeers@1"
         }
-      ]
+      ],
+      "commandPalette": [
+        {
+          "command": "agentPeers.startBroker"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "agentPeers.disconnectPeer",
+          "when": "view == agentPeers.peerList && viewItem == peerActive",
+          "group": "inline"
+        },
+        {
+          "command": "agentPeers.disconnectPeer",
+          "when": "view == agentPeers.peerList && viewItem == peerActive"
+        },
+        {
+          "command": "agentPeers.connectPeer",
+          "when": "view == agentPeers.peerList && viewItem == peerSuspended",
+          "group": "inline"
+        },
+        {
+          "command": "agentPeers.connectPeer",
+          "when": "view == agentPeers.peerList && viewItem == peerSuspended"
+        }
+      ],
+      "view/title": []
     },
     "configuration": {
       "title": "Agent Peers",
@@ -102,7 +157,7 @@
         },
         "agentPeers.autoStartBroker": {
           "type": "boolean",
-          "default": true,
+          "default": false,
           "description": "Automatically start the broker daemon when the extension activates"
         },
         "agentPeers.pollIntervalMs": {
@@ -115,24 +170,26 @@
   },
   "scripts": {
     "build": "npm run build:broker && npm run build:server && npm run build:extension",
-    "build:broker": "bun build src/broker/index.ts --outdir out/broker --target node",
-    "build:server": "bun build src/server/index.ts --outdir out/server --target node",
-    "build:extension": "bun build src/extension/index.ts --outdir out/extension --target node --external vscode",
-    "dev:broker": "bun src/broker/index.ts",
-    "dev:server": "bun src/server/index.ts",
-    "watch": "bun build src/extension/index.ts --outdir out/extension --target node --external vscode --watch",
+    "build:broker": "esbuild src/broker/index.ts --bundle --outfile=out/broker/index.js --platform=node --format=cjs",
+    "build:server": "esbuild src/server/index.ts --bundle --outfile=out/server/index.js --platform=node --format=cjs",
+    "build:extension": "esbuild src/extension/index.ts --bundle --outfile=out/extension/index.js --platform=node --format=cjs --external:vscode",
+    "dev:broker": "npm run build:broker && node out/broker/index.js",
+    "dev:server": "npm run build:server && node out/server/index.js",
+    "watch": "esbuild src/extension/index.ts --bundle --outfile=out/extension/index.js --platform=node --format=cjs --external:vscode --watch",
     "package": "vsce package",
-    "test": "bun test"
+    "test": "node --test"
   },
   "devDependencies": {
-    "@types/bun": "latest",
     "@types/node": "^22.0.0",
-    "@types/vscode": "^1.95.0"
+    "@types/vscode": "^1.95.0",
+    "@types/ws": "^8.5.0",
+    "esbuild": "^0.25.0"
   },
   "peerDependencies": {
     "typescript": "^5"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.27.1"
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "ws": "^8.18.0"
   }
 }

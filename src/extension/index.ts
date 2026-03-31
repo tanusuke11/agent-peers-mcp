@@ -10,8 +10,7 @@
 import * as vscode from "vscode";
 import { BrokerClient } from "./broker-client";
 import { PeerListProvider } from "./views/peer-list";
-import { MessagesProvider } from "./views/messages";
-import { ContextProvider } from "./views/context";
+import { ControlProvider } from "./views/control";
 
 let brokerClient: BrokerClient;
 
@@ -24,34 +23,23 @@ export function activate(extensionContext: vscode.ExtensionContext) {
   brokerClient = new BrokerClient(brokerPort, wsPort);
 
   // Initialize tree data providers
+  const controlProvider = new ControlProvider(brokerClient);
   const peerListProvider = new PeerListProvider(brokerClient);
-  const messagesProvider = new MessagesProvider(brokerClient);
-  const contextProvider = new ContextProvider(brokerClient);
-
   // Register tree views
   extensionContext.subscriptions.push(
+    vscode.window.registerTreeDataProvider("agentPeers.control", controlProvider),
     vscode.window.registerTreeDataProvider("agentPeers.peerList", peerListProvider),
-    vscode.window.registerTreeDataProvider("agentPeers.messages", messagesProvider),
-    vscode.window.registerTreeDataProvider("agentPeers.context", contextProvider),
   );
 
   // Listen to real-time events
   brokerClient.on("peer-joined", () => peerListProvider.refresh());
   brokerClient.on("peer-left", () => peerListProvider.refresh());
-  brokerClient.on("message", () => messagesProvider.refresh());
   brokerClient.on("context-updated", () => {
     peerListProvider.refresh();
-    contextProvider.refresh();
   });
 
   // Register commands
   extensionContext.subscriptions.push(
-    vscode.commands.registerCommand("agentPeers.refreshPeers", () => {
-      peerListProvider.refresh();
-      messagesProvider.refresh();
-      contextProvider.refresh();
-    }),
-
     vscode.commands.registerCommand("agentPeers.sendMessage", async () => {
       const peers = await brokerClient.listPeers("machine");
       if (peers.length === 0) {
@@ -89,22 +77,229 @@ export function activate(extensionContext: vscode.ExtensionContext) {
       vscode.window.showInformationMessage("Context sharing is handled automatically by the MCP server.");
     }),
 
-    vscode.commands.registerCommand("agentPeers.startBroker", async () => {
-      const terminal = vscode.window.createTerminal("Agent Peers Broker");
-      terminal.sendText("bun " + vscode.Uri.joinPath(extensionContext.extensionUri, "src", "broker", "index.ts").fsPath);
+    vscode.commands.registerCommand("agentPeers.startBroker", async (uri?: vscode.Uri) => {
+      const health = await brokerClient.health();
+      if (health) {
+        vscode.window.showInformationMessage(`Agent Peers broker is already running (${health.peerCount} peers).`);
+        return;
+      }
+      const brokerPath = vscode.Uri.joinPath(extensionContext.extensionUri, "out", "broker", "index.js").fsPath;
+      const cwd = uri?.fsPath ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      const terminal = vscode.window.createTerminal({ name: "Agent Peers Broker", cwd });
+      terminal.sendText(`node "${brokerPath}"`);
       terminal.show();
-      vscode.window.showInformationMessage("Broker daemon starting...");
+      vscode.window.showInformationMessage("Agent Peers broker starting...");
+      // Wait briefly then update status
+      setTimeout(updateBrokerStatus, 2000);
+    }),
+
+    vscode.commands.registerCommand("agentPeers.stopBroker", async () => {
+      // Get broker PID before attempting shutdown (for fallback)
+      const healthBefore = await brokerClient.health();
+      const brokerPid = healthBefore?.pid;
+
+      // Try graceful shutdown via HTTP endpoint
+      try {
+        await fetch(`http://127.0.0.1:${brokerPort}/shutdown`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: "{}",
+          signal: AbortSignal.timeout(3000),
+        });
+      } catch { /* broker may already be gone or unresponsive */ }
+
+      // Wait briefly, then check if it's still alive
+      await new Promise((r) => setTimeout(r, 500));
+      const still = await brokerClient.health();
+      if (still && brokerPid) {
+        // Force kill as fallback (cross-platform)
+        try { process.kill(brokerPid, "SIGKILL"); } catch { /* already dead */ }
+      }
+
+      vscode.window.showInformationMessage("Agent Peers broker stopped.");
+      setTimeout(updateBrokerStatus, 500);
+    }),
+
+    vscode.commands.registerCommand("agentPeers.disconnectPeer", async (item?: { peerId?: string; peer?: { id: string } }) => {
+      const peerId = item?.peerId || item?.peer?.id;
+      if (!peerId) {
+        vscode.window.showWarningMessage("No peer selected.");
+        return;
+      }
+
+      const confirm = await vscode.window.showWarningMessage(
+        `Suspend peer "${peerId}" from context sharing?\n\nThe peer's shared context will be cleared. The session itself will remain active.`,
+        { modal: true },
+        "Suspend",
+      );
+      if (confirm !== "Suspend") return;
+
+      try {
+        await brokerClient.suspendPeer(peerId);
+        vscode.window.showInformationMessage(`Peer "${peerId}" suspended. Shared context cleared.`);
+        peerListProvider.refresh();
+      } catch (e) {
+        vscode.window.showErrorMessage(`Failed to suspend peer: ${e}`);
+      }
+    }),
+
+    vscode.commands.registerCommand("agentPeers.connectPeer", async (item?: { peerId?: string; peer?: { id: string } }) => {
+      const peerId = item?.peerId || item?.peer?.id;
+      if (!peerId) {
+        vscode.window.showWarningMessage("No peer selected.");
+        return;
+      }
+
+      try {
+        await brokerClient.resumePeer(peerId);
+        vscode.window.showInformationMessage(`Peer "${peerId}" resumed. Context sharing is active again.`);
+        peerListProvider.refresh();
+      } catch (e) {
+        vscode.window.showErrorMessage(`Failed to resume peer: ${e}`);
+      }
+    }),
+
+    vscode.commands.registerCommand("agentPeers.addMcpServer", async () => {
+      const serverScript = vscode.Uri.joinPath(extensionContext.extensionUri, "out", "server", "index.js").fsPath;
+      const { exec } = require("child_process") as typeof import("child_process");
+      const isWin = process.platform === "win32";
+
+      // Check if claude CLI is available (cross-platform)
+      const claudeFound = await new Promise<boolean>((resolve) => {
+        exec(isWin ? "where claude" : "which claude", (err) => resolve(!err));
+      });
+      if (!claudeFound) {
+        vscode.window.showErrorMessage(
+          "Claude Code CLI not found. Install it first: https://docs.anthropic.com/en/docs/claude-code",
+          "Open Install Guide",
+        ).then((action) => {
+          if (action) vscode.env.openExternal(vscode.Uri.parse("https://docs.anthropic.com/en/docs/claude-code"));
+        });
+        return;
+      }
+
+      const items = [
+        { label: "Claude Code (user scope)", description: "claude mcp add --scope user", scope: "user" },
+        { label: "Claude Code (project scope)", description: "claude mcp add --scope project", scope: "project" },
+      ];
+
+      const selected = await vscode.window.showQuickPick(items, {
+        placeHolder: "Select scope for MCP server registration",
+      });
+      if (!selected) return;
+
+      const cmd = `claude mcp add --scope ${selected.scope} --transport stdio agent-peers -- node "${serverScript}"`;
+      const terminal = vscode.window.createTerminal({ name: "Agent Peers MCP Setup" });
+      terminal.sendText(cmd);
+      terminal.show();
+      vscode.window.showInformationMessage(`Running: ${cmd}`);
+    }),
+
+    vscode.commands.registerCommand("agentPeers.addMcpServerCodex", async () => {
+      const serverScript = vscode.Uri.joinPath(extensionContext.extensionUri, "out", "server", "index.js").fsPath;
+      const { exec } = require("child_process") as typeof import("child_process");
+      const os = require("os") as typeof import("os");
+      const fs = require("fs") as typeof import("fs");
+      const path = require("path") as typeof import("path");
+      const isWin = process.platform === "win32";
+
+      // Check if codex CLI is available (cross-platform)
+      const codexFound = await new Promise<boolean>((resolve) => {
+        exec(isWin ? "where codex" : "which codex", (err) => resolve(!err));
+      });
+      if (!codexFound) {
+        vscode.window.showErrorMessage(
+          "Codex CLI not found. Install it first: npm install -g @openai/codex",
+          "Copy Install Command",
+        ).then((action) => {
+          if (action) vscode.env.clipboard.writeText("npm install -g @openai/codex");
+        });
+        return;
+      }
+
+      const projectDir = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      const userConfigDir = path.join(os.homedir(), ".codex");
+      const scopeItems = [
+        { label: "Codex (user scope)", description: path.join(userConfigDir, "config.toml"), scope: "user" as const },
+        ...(projectDir ? [{ label: "Codex (project scope)", description: path.join(projectDir, ".codex", "config.toml"), scope: "project" as const }] : []),
+      ];
+
+      const selectedScope = await vscode.window.showQuickPick(scopeItems, {
+        placeHolder: "Select scope for Codex MCP server registration",
+      });
+      if (!selectedScope) return;
+
+      const configDir = selectedScope.scope === "user"
+        ? userConfigDir
+        : path.join(projectDir!, ".codex");
+      const configFile = path.join(configDir, "config.toml");
+
+      // Codex expects TOML config under [mcp_servers]
+      // Use forward slashes in TOML even on Windows (TOML strings, not paths)
+      const serverScriptToml = serverScript.replace(/\\/g, "/");
+      const mcpBlock = `
+[mcp_servers.agent-peers]
+command = "node"
+args = ["${serverScriptToml}"]
+[mcp_servers.agent-peers.env]
+AGENT_PEERS_AGENT_TYPE = "codex"
+`;
+
+      try {
+        if (fs.existsSync(configDir) && !fs.statSync(configDir).isDirectory()) {
+          vscode.window.showErrorMessage(
+            `Cannot create config directory: "${configDir}" exists as a file. Please remove it manually, then retry.`
+          );
+          return;
+        }
+        if (!fs.existsSync(configDir)) fs.mkdirSync(configDir, { recursive: true });
+
+        let contents = "";
+        if (fs.existsSync(configFile)) {
+          contents = fs.readFileSync(configFile, "utf-8");
+        }
+
+        // Remove all existing agent-peers entries (main table + sub-tables like .env)
+        // Use line-aware pattern: match section header + all following lines that don't start a new section
+        contents = contents.replace(/\n*\[mcp_servers\.agent-peers(?:\.[^\]]+)?\][^\n]*(?:\n(?!\[)[^\n]*)*/g, "");
+        contents = `${contents.trimEnd()}\n\n${mcpBlock.trim()}\n`;
+
+        fs.writeFileSync(configFile, contents);
+        vscode.window.showInformationMessage(`Codex MCP server added to ${configFile}`);
+      } catch (e) {
+        vscode.window.showErrorMessage(`Failed to configure Codex: ${e}`);
+      }
     }),
 
     vscode.commands.registerCommand("agentPeers.showDashboard", () => {
       vscode.window.showInformationMessage("Dashboard coming soon!");
     }),
+
+    vscode.commands.registerCommand("agentPeers.toggleAutoStart", async () => {
+      const cfg = vscode.workspace.getConfiguration("agentPeers");
+      const current = cfg.get<boolean>("autoStartBroker", false);
+      await cfg.update("autoStartBroker", !current, vscode.ConfigurationTarget.Global);
+      controlProvider.refresh();
+    }),
   );
 
-  // Auto-refresh periodically
-  const refreshInterval = setInterval(() => {
+  // Track broker connection state and auto-refresh
+  let brokerConnected = false;
+  async function updateBrokerStatus() {
+    const health = await brokerClient.health();
+    const connected = health !== null;
+    if (connected !== brokerConnected) {
+      brokerConnected = connected;
+      controlProvider.brokerConnected = connected;
+      controlProvider.refresh();
+      vscode.commands.executeCommand("setContext", "agentPeers.brokerConnected", connected);
+    }
     peerListProvider.refresh();
-  }, 5000);
+  }
+  vscode.commands.executeCommand("setContext", "agentPeers.brokerConnected", false);
+
+  // Fallback polling at a relaxed interval — WS events handle the fast path
+  const refreshInterval = setInterval(updateBrokerStatus, 15_000);
 
   extensionContext.subscriptions.push({
     dispose: () => {
@@ -116,14 +311,15 @@ export function activate(extensionContext: vscode.ExtensionContext) {
   // Connect WebSocket for real-time updates
   brokerClient.connectWs();
 
-  // Auto-start broker if configured
-  if (config.get<boolean>("autoStartBroker", true)) {
-    brokerClient.ensureBroker(extensionContext.extensionUri).catch(() => {
-      // Broker may already be running, that's fine
-    });
+  // Auto-start broker if configured, then do the first status check
+  if (config.get<boolean>("autoStartBroker", false)) {
+    brokerClient.ensureBroker(extensionContext.extensionUri)
+      .catch(() => { /* Broker may already be running, that's fine */ })
+      .finally(() => updateBrokerStatus());
+  } else {
+    // Defer initial status check so extension activation isn't blocked
+    setTimeout(updateBrokerStatus, 2000);
   }
-
-  vscode.window.showInformationMessage("Agent Peers activated");
 }
 
 export function deactivate() {

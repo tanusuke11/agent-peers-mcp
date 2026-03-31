@@ -5,4 +5,4 @@ build:
 
 vsix: build
     npx --yes @vscode/vsce package --allow-missing-repository
-    code --install-extension agent-peers-mcp-0.1.0.vsix
+    code --install-extension agent-peers-mcp-0.1.0.vsix --force

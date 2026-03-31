@@ -26,60 +26,67 @@ export class ContextProvider implements vscode.TreeDataProvider<ContextItem> {
       return element.children ?? [];
     }
 
-    const peers = await this.client.listPeers("machine");
-    if (peers.length === 0) {
-      return [new ContextItem("No peers sharing context", "info")];
-    }
+    const projectName = vscode.workspace.workspaceFolders?.[0]?.name ?? "current project";
+    const peers = await this.client.listPeers("repo");
 
-    return peers
-      .filter((p) => p.context.summary || p.context.activeFiles?.length || p.context.git)
-      .map((p) => this.buildPeerContextItem(p));
+    const contextPeers = peers
+      .filter((p) => !p.suspended && p.connected !== false)
+      .filter((p) => p.context.summary || p.context.activeFiles?.length || p.context.git);
+
+    const header = ContextItem.projectHeader(projectName, peers.length);
+    return [header, ...contextPeers.map((p) => this.buildPeerContextItem(p))];
   }
 
   private buildPeerContextItem(peer: Peer): ContextItem {
     const label = `${agentIcon(peer.agentType)} ${peer.agentType} (${peer.id})`;
-    const item = new ContextItem(label, "peer-context");
+    const color = agentColor(peer.agentType);
+    const item = new ContextItem(label, "symbol-namespace", color);
     item.description = peer.context.summary || "";
     item.collapsibleState = vscode.TreeItemCollapsibleState.Expanded;
 
     const children: ContextItem[] = [];
 
-    // Summary
     if (peer.context.summary) {
-      const s = new ContextItem(`📝 ${peer.context.summary}`, "detail");
-      children.push(s);
+      children.push(new ContextItem(
+        peer.context.summary, "note", new vscode.ThemeColor("charts.green"),
+      ));
     }
 
-    // Current task
     if (peer.context.currentTask) {
-      const t = new ContextItem(`🎯 Task: ${peer.context.currentTask}`, "detail");
-      children.push(t);
+      children.push(new ContextItem(
+        `Task: ${peer.context.currentTask}`, "target", new vscode.ThemeColor("charts.red"),
+      ));
     }
 
-    // Git info
     if (peer.context.git) {
       const git = peer.context.git;
-      const gitItem = new ContextItem(`🔀 Git: ${git.branch ?? "detached"}`, "git");
+      const gitItem = new ContextItem(
+        `Git: ${git.branch ?? "detached"}`, "git-branch", new vscode.ThemeColor("charts.purple"),
+      );
       gitItem.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
       const gitChildren: ContextItem[] = [];
 
       if (git.modifiedFiles?.length) {
         for (const f of git.modifiedFiles.slice(0, 10)) {
-          gitChildren.push(new ContextItem(`  M ${f}`, "file-modified"));
+          gitChildren.push(new ContextItem(f, "diff-modified", new vscode.ThemeColor("charts.yellow")));
         }
         if (git.modifiedFiles.length > 10) {
-          gitChildren.push(new ContextItem(`  ... and ${git.modifiedFiles.length - 10} more`, "detail"));
+          gitChildren.push(new ContextItem(`... and ${git.modifiedFiles.length - 10} more`, "ellipsis"));
         }
       }
       if (git.stagedFiles?.length) {
         for (const f of git.stagedFiles.slice(0, 10)) {
-          gitChildren.push(new ContextItem(`  S ${f}`, "file-staged"));
+          gitChildren.push(new ContextItem(f, "diff-added", new vscode.ThemeColor("charts.green")));
         }
       }
       if (git.recentCommits?.length) {
-        const commitsItem = new ContextItem("Recent commits", "commits");
+        const commitsItem = new ContextItem(
+          "Recent commits", "git-commit", new vscode.ThemeColor("charts.foreground"),
+        );
         commitsItem.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
-        commitsItem.children = git.recentCommits.map((c) => new ContextItem(`  ${c}`, "detail"));
+        commitsItem.children = git.recentCommits.map((c) =>
+          new ContextItem(c, "circle-small-filled", new vscode.ThemeColor("charts.foreground")),
+        );
         gitChildren.push(commitsItem);
       }
 
@@ -87,12 +94,17 @@ export class ContextProvider implements vscode.TreeDataProvider<ContextItem> {
       children.push(gitItem);
     }
 
-    // Active files
     if (peer.context.activeFiles?.length) {
-      const filesItem = new ContextItem(`📂 Active files (${peer.context.activeFiles.length})`, "files");
+      const filesItem = new ContextItem(
+        `Active files (${peer.context.activeFiles.length})`, "folder-opened", new vscode.ThemeColor("charts.orange"),
+      );
       filesItem.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
       filesItem.children = peer.context.activeFiles.map((f) =>
-        new ContextItem(`  ${f.relativePath || f.path}${f.isDirty ? " •" : ""}`, "file"),
+        new ContextItem(
+          `${f.relativePath || f.path}${f.isDirty ? " •" : ""}`,
+          "file",
+          new vscode.ThemeColor("charts.blue"),
+        ),
       );
       children.push(filesItem);
     }
@@ -112,42 +124,28 @@ function agentIcon(agentType: string): string {
   }
 }
 
+function agentColor(agentType: string): vscode.ThemeColor {
+  switch (agentType) {
+    case "claude-code": return new vscode.ThemeColor("charts.orange");
+    case "codex": return new vscode.ThemeColor("charts.green");
+    case "copilot-chat": return new vscode.ThemeColor("charts.blue");
+    case "cursor": return new vscode.ThemeColor("charts.purple");
+    default: return new vscode.ThemeColor("charts.foreground");
+  }
+}
+
 class ContextItem extends vscode.TreeItem {
   children?: ContextItem[];
 
-  constructor(
-    label: string,
-    private itemType: string,
-  ) {
-    super(label, vscode.TreeItemCollapsibleState.None);
+  static projectHeader(projectName: string, peerCount: number): ContextItem {
+    const item = new ContextItem(projectName, "root-folder", new vscode.ThemeColor("charts.blue"));
+    item.description = `${peerCount} peer${peerCount !== 1 ? "s" : ""}`;
+    item.contextValue = "projectHeader";
+    return item;
+  }
 
-    switch (itemType) {
-      case "info":
-        this.iconPath = new vscode.ThemeIcon("info");
-        break;
-      case "peer-context":
-        this.iconPath = new vscode.ThemeIcon("symbol-namespace");
-        break;
-      case "git":
-        this.iconPath = new vscode.ThemeIcon("git-branch");
-        break;
-      case "file-modified":
-        this.iconPath = new vscode.ThemeIcon("diff-modified");
-        break;
-      case "file-staged":
-        this.iconPath = new vscode.ThemeIcon("diff-added");
-        break;
-      case "file":
-        this.iconPath = new vscode.ThemeIcon("file");
-        break;
-      case "files":
-        this.iconPath = new vscode.ThemeIcon("folder-opened");
-        break;
-      case "commits":
-        this.iconPath = new vscode.ThemeIcon("git-commit");
-        break;
-      default:
-        break;
-    }
+  constructor(label: string, iconId: string, iconColor?: vscode.ThemeColor) {
+    super(label, vscode.TreeItemCollapsibleState.None);
+    this.iconPath = new vscode.ThemeIcon(iconId, iconColor);
   }
 }

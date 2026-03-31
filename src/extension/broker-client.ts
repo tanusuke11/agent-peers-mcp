@@ -20,6 +20,7 @@ export class BrokerClient {
   private ws: WebSocket | null = null;
   private listeners = new Map<string, Set<EventHandler>>();
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private cachedGitRoot: string | null | undefined = undefined; // undefined = not yet resolved
 
   constructor(
     private httpPort: number,
@@ -56,10 +57,27 @@ export class BrokerClient {
   async listPeers(scope: "machine" | "directory" | "repo" = "machine"): Promise<Peer[]> {
     try {
       const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+      let gitRoot: string | null = null;
+      if (scope === "repo") {
+        // Resolve git root once and cache — avoids execSync on every call
+        if (this.cachedGitRoot === undefined) {
+          try {
+            const { execFile } = require("child_process") as typeof import("child_process");
+            gitRoot = await new Promise<string | null>((resolve) => {
+              execFile("git", ["rev-parse", "--show-toplevel"], { cwd: workspaceFolder, timeout: 3000 }, (err, stdout) => {
+                resolve(err ? null : stdout.trim());
+              });
+            });
+          } catch { gitRoot = null; }
+          this.cachedGitRoot = gitRoot;
+        } else {
+          gitRoot = this.cachedGitRoot;
+        }
+      }
       return await this.post<Peer[]>("/list-peers", {
         scope,
         cwd: workspaceFolder,
-        gitRoot: null,
+        gitRoot,
       });
     } catch {
       return [];
@@ -70,24 +88,73 @@ export class BrokerClient {
     await this.post("/send-message", { fromId, toId, type, text });
   }
 
+  async unregisterPeer(id: string): Promise<void> {
+    await this.post("/unregister", { id });
+  }
+
+  async suspendPeer(id: string): Promise<void> {
+    await this.post("/suspend-peer", { id });
+  }
+
+  async resumePeer(id: string): Promise<void> {
+    await this.post("/resume-peer", { id });
+  }
+
+  async cleanup(): Promise<{ removed: number; remaining: number } | null> {
+    try {
+      return await this.post<{ removed: number; remaining: number }>("/cleanup", {});
+    } catch {
+      return null;
+    }
+  }
+
+  async purge(): Promise<{ purged: number } | null> {
+    try {
+      return await this.post<{ purged: number }>("/purge", {});
+    } catch {
+      return null;
+    }
+  }
+
+  async registerPeer(agentType: string, pid: number, cwd: string, gitRoot: string | null): Promise<{ id: string }> {
+    const now = new Date().toISOString();
+    return await this.post<{ id: string }>("/register", {
+      agentType,
+      pid,
+      cwd,
+      gitRoot,
+      tty: null,
+      context: { summary: "", activeFiles: [], git: null, updatedAt: now },
+    });
+  }
+
+  /**
+   * Ensure the broker is running. Non-blocking: spawns the process and polls
+   * in the background without blocking extension activation.
+   */
   async ensureBroker(extensionUri: vscode.Uri): Promise<void> {
     const h = await this.health();
     if (h) return; // Already running
 
-    // Try to start it
-    const brokerPath = vscode.Uri.joinPath(extensionUri, "src", "broker", "index.ts").fsPath;
-    const terminal = vscode.window.createTerminal({
-      name: "Agent Peers Broker",
-      hideFromUser: true,
+    // Start broker as a detached background process (no terminal needed)
+    const brokerPath = vscode.Uri.joinPath(extensionUri, "out", "broker", "index.js").fsPath;
+    const { spawn } = require("child_process") as typeof import("child_process");
+    const proc = spawn("node", [brokerPath], {
+      stdio: "ignore",
+      detached: true,
     });
-    terminal.sendText(`bun "${brokerPath}" &`);
+    proc.unref();
 
-    // Wait for it to come up
-    for (let i = 0; i < 15; i++) {
-      await new Promise((r) => setTimeout(r, 400));
+    // Poll in the background — fewer retries with longer gaps
+    for (let i = 0; i < 5; i++) {
+      await new Promise((r) => setTimeout(r, 500));
       const h2 = await this.health();
       if (h2) return;
     }
+
+    vscode.window.showWarningMessage(
+      "Agent Peers: Broker failed to start within timeout. Check the terminal output or start it manually.",
+    );
   }
 
   // ─── WebSocket ─────────────────────────────────────────

@@ -8,10 +8,11 @@ export const BROKER_HOST = "127.0.0.1";
 
 export const POLL_INTERVAL_MS = 1000;
 export const HEARTBEAT_INTERVAL_MS = 15_000;
-export const STALE_PEER_CLEANUP_MS = 30_000;
-export const PEER_TIMEOUT_MS = 60_000;
+export const STALE_PEER_CLEANUP_MS = 10_000;
+export const PEER_TIMEOUT_MS = 30_000;
 
-export const BROKER_DB_PATH = `${process.env.HOME}/.agent-peers.db`;
+import os from "os";
+export const BROKER_DB_PATH = `${os.homedir()}/.agent-peers.db`;
 
 export function getBrokerUrl(port?: number): string {
   return `http://${BROKER_HOST}:${port ?? DEFAULT_BROKER_PORT}`;
