@@ -4,6 +4,8 @@
  */
 
 import { execFile } from "child_process";
+import fs from "fs";
+import path from "path";
 import { promisify } from "util";
 import type { ActiveFile, GitContext } from "./types.ts";
 
@@ -52,9 +54,29 @@ export async function getAbbreviatedDiff(cwd: string, maxLines = 50): Promise<st
   return out;
 }
 
+// Cache for gatherGitContext — skip git commands if .git/index hasn't changed
+let _cachedGitContext: GitContext | null = null;
+let _cachedGitRoot: string | null = null;
+let _cachedIndexMtimeMs = 0;
+let _cachedHeadMtimeMs = 0;
+
 export async function gatherGitContext(cwd: string): Promise<GitContext | null> {
   const root = await getGitRoot(cwd);
   if (!root) return null;
+
+  // Check if .git/index or .git/HEAD changed since last call
+  try {
+    const indexMtime = fs.statSync(path.join(root, ".git", "index")).mtimeMs;
+    const headMtime = fs.statSync(path.join(root, ".git", "HEAD")).mtimeMs;
+    if (root === _cachedGitRoot && indexMtime === _cachedIndexMtimeMs && headMtime === _cachedHeadMtimeMs && _cachedGitContext) {
+      return _cachedGitContext;
+    }
+    _cachedGitRoot = root;
+    _cachedIndexMtimeMs = indexMtime;
+    _cachedHeadMtimeMs = headMtime;
+  } catch {
+    // .git/index might not exist yet — proceed without cache
+  }
 
   const [branch, modifiedFiles, stagedFiles, recentCommits, diff] = await Promise.all([
     getGitBranch(cwd),
@@ -64,7 +86,7 @@ export async function gatherGitContext(cwd: string): Promise<GitContext | null> 
     getAbbreviatedDiff(cwd),
   ]);
 
-  return {
+  _cachedGitContext = {
     root,
     branch,
     modifiedFiles,
@@ -72,6 +94,7 @@ export async function gatherGitContext(cwd: string): Promise<GitContext | null> 
     recentCommits,
     diff: diff ?? undefined,
   };
+  return _cachedGitContext;
 }
 
 /** Get a session identifier for the current process (cross-platform) */

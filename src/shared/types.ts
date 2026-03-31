@@ -35,6 +35,13 @@ export interface GitContext {
   diff?: string; // abbreviated diff
 }
 
+/** A recent conversation exchange (truncated) */
+export interface RecentExchange {
+  role: "human" | "assistant";
+  text: string;
+  timestamp: string;
+}
+
 /** The structured context an agent shares */
 export interface AgentContext {
   /** Free-text summary of current work */
@@ -45,6 +52,8 @@ export interface AgentContext {
   git: GitContext | null;
   /** Current task description (if any) */
   currentTask?: string;
+  /** Recent conversation exchanges (truncated, last N turns) */
+  recentExchanges?: RecentExchange[];
   /** Key-value metadata (extensible) */
   metadata?: Record<string, string>;
   /** Timestamp when context was last updated */

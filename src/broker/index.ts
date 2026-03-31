@@ -94,19 +94,32 @@ db.exec(`
 
 // ─── WebSocket clients ─────────────────────────────────────────
 
+/** Anonymous clients (e.g. VSCode extension) */
 const wsClients = new Set<WebSocket>();
+/** Peer-identified clients (MCP servers that sent {"type":"identify","id":"..."}) */
+const wsPeerClients = new Map<string, WebSocket>();
 
 function broadcast(event: WsEvent) {
   const json = JSON.stringify(event);
   for (const ws of wsClients) {
     if (ws.readyState === WebSocket.OPEN) {
-      try {
-        ws.send(json);
-      } catch {
-        wsClients.delete(ws);
-      }
+      try { ws.send(json); } catch { wsClients.delete(ws); }
     }
   }
+  for (const [id, ws] of wsPeerClients) {
+    if (ws.readyState === WebSocket.OPEN) {
+      try { ws.send(json); } catch { wsPeerClients.delete(id); }
+    }
+  }
+}
+
+/** Send an event to a specific peer (if connected via WS) */
+function sendToPeer(peerId: string, event: WsEvent): boolean {
+  const ws = wsPeerClients.get(peerId);
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try { ws.send(JSON.stringify(event)); return true; } catch { wsPeerClients.delete(peerId); }
+  }
+  return false;
 }
 
 // ─── Stale peer cleanup ────────────────────────────────────────
@@ -369,16 +382,30 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
   const payloadJson = body.payload ? JSON.stringify(body.payload) : null;
   insertMessage.run(body.fromId, body.toId, body.type, body.text, payloadJson, now);
 
-  // Get the inserted message for broadcast
+  // Get the inserted message
   const lastId = db.prepare("SELECT last_insert_rowid() as id").get() as unknown as { id: number };
   const msgRow = db.prepare("SELECT * FROM messages WHERE id = ?").get(lastId.id) as unknown as RawMessageRow;
   const msg = rowToMessage(msgRow);
 
-  broadcast({
+  const event = {
     type: "message",
     data: msg,
     timestamp: now,
-  } satisfies WsMessageEvent);
+  } satisfies WsMessageEvent;
+
+  // Try targeted delivery to the recipient peer via WS
+  const delivered = sendToPeer(body.toId, event);
+  if (delivered) {
+    markDelivered.run(msgRow.id);
+  }
+
+  // Also broadcast to anonymous clients (VSCode extension UI etc.)
+  const broadcastJson = JSON.stringify(event);
+  for (const ws of wsClients) {
+    if (ws.readyState === WebSocket.OPEN) {
+      try { ws.send(broadcastJson); } catch { wsClients.delete(ws); }
+    }
+  }
 
   return { ok: true };
 }
@@ -395,13 +422,20 @@ function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
   return { found: true, messages: rows.map(rowToMessage) };
 }
 
-function handleUnregister(body: { id: string }): void {
-  deletePeer.run(body.id);
+function removePeer(id: string): void {
+  const row = selectPeerById.get(id) as unknown as RawPeerRow | undefined;
+  if (!row) return;
+  deletePeer.run(id);
   broadcast({
     type: "peer-left",
-    data: { id: body.id },
+    data: { id },
     timestamp: new Date().toISOString(),
   } satisfies WsPeerLeftEvent);
+  log(`Peer ${id} removed`);
+}
+
+function handleUnregister(body: { id: string }): void {
+  removePeer(body.id);
 }
 
 function handleSuspendPeer(body: { id: string }): { ok: boolean } {
@@ -614,15 +648,40 @@ http.createServer(async (nodeReq, nodeRes) => {
 
 const wss = new WebSocketServer({ host: "127.0.0.1", port: WS_PORT });
 wss.on("connection", (ws) => {
+  // Start as anonymous client; promoted to peer client on "identify" message
   wsClients.add(ws);
-  log(`WebSocket client connected (total: ${wsClients.size})`);
+  let identifiedPeerId: string | null = null;
+  log(`WebSocket client connected (anonymous: ${wsClients.size}, peers: ${wsPeerClients.size})`);
+
+  ws.on("message", (data) => {
+    try {
+      const msg = JSON.parse(String(data)) as { type?: string; id?: string };
+      if (msg.type === "identify" && msg.id) {
+        // Promote from anonymous to peer-identified
+        wsClients.delete(ws);
+        identifiedPeerId = msg.id;
+        wsPeerClients.set(msg.id, ws);
+        log(`WebSocket peer identified: ${msg.id} (anonymous: ${wsClients.size}, peers: ${wsPeerClients.size})`);
+      }
+    } catch { /* ignore malformed messages */ }
+  });
+
   ws.on("close", () => {
     wsClients.delete(ws);
-    log(`WebSocket client disconnected (total: ${wsClients.size})`);
+    if (identifiedPeerId) {
+      wsPeerClients.delete(identifiedPeerId);
+      // Peer WS disconnected — remove from DB immediately
+      removePeer(identifiedPeerId);
+    }
+    log(`WebSocket client disconnected (anonymous: ${wsClients.size}, peers: ${wsPeerClients.size})`);
   });
   ws.on("error", (err) => {
     log(`WebSocket client error: ${err.message}`);
     wsClients.delete(ws);
+    if (identifiedPeerId) {
+      wsPeerClients.delete(identifiedPeerId);
+      removePeer(identifiedPeerId);
+    }
   });
 });
 wss.on("error", (err: NodeJS.ErrnoException) => {

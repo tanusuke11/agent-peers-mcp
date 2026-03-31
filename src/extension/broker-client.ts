@@ -180,6 +180,7 @@ export class BrokerClient {
 
       this.ws.onopen = () => {
         console.log("[agent-peers] WebSocket connected");
+        this.emit("broker-connected", null);
       };
 
       this.ws.onmessage = (event) => {
@@ -191,6 +192,7 @@ export class BrokerClient {
 
       this.ws.onclose = () => {
         console.log("[agent-peers] WebSocket disconnected, reconnecting...");
+        this.emit("broker-disconnected", null);
         this.scheduleReconnect();
       };
 
@@ -198,6 +200,7 @@ export class BrokerClient {
         this.ws?.close();
       };
     } catch {
+      this.emit("broker-disconnected", null);
       this.scheduleReconnect();
     }
   }

@@ -4,6 +4,7 @@
  * Includes inline context: git state (with modified/staged file trees), active files, etc.
  */
 
+import * as path from "path";
 import * as vscode from "vscode";
 import type { BrokerClient } from "../broker-client";
 import type { Peer } from "../../shared/types";
@@ -35,7 +36,7 @@ export class PeerListProvider implements vscode.TreeDataProvider<PeerItem> {
     for (const p of peers) {
       const key = p.gitRoot ?? p.cwd;
       if (!groups.has(key)) {
-        const dirName = key.split("/").pop() || key;
+        const dirName = path.basename(key) || key;
         groups.set(key, { label: dirName, isLocal: key === workspaceGitRoot, peers: [] });
       }
       groups.get(key)!.peers.push(p);
@@ -49,8 +50,8 @@ export class PeerListProvider implements vscode.TreeDataProvider<PeerItem> {
 
     const items: PeerItem[] = [];
     for (const [, group] of sortedGroups) {
-      items.push(PeerItem.projectHeader(group.label, group.peers.length));
-      const sorted = group.peers
+      const header = PeerItem.projectHeader(group.label, group.peers.length);
+      header.children = group.peers
         .map((p) => {
           const displayType = agentDisplayName(p.agentType);
           const label = p.suspended
@@ -62,7 +63,7 @@ export class PeerListProvider implements vscode.TreeDataProvider<PeerItem> {
           const rank = (p: Peer | undefined) => (p?.suspended ? 2 : 1);
           return rank(a.peer) - rank(b.peer);
         });
-      items.push(...sorted);
+      items.push(header);
     }
 
     return items;
@@ -136,34 +137,28 @@ function buildContextItems(peer: Peer): PeerItem[] {
   const dim = isSuspended ? DIM_COLOR : undefined;
   const items: PeerItem[] = [];
 
-  items.push(detail(`PID: ${peer.pid}`, "terminal", dim ?? new vscode.ThemeColor("charts.foreground")));
-  items.push(detail(peer.cwd, "folder", dim ?? new vscode.ThemeColor("charts.blue")));
+  items.push(leaf("PID", String(peer.pid), "terminal", dim ?? new vscode.ThemeColor("charts.foreground")));
+  items.push(leaf("Dir", peer.cwd, "folder", dim ?? new vscode.ThemeColor("charts.blue")));
 
   if (!isSuspended) {
     if (peer.context.currentTask) {
-      items.push(detail(peer.context.currentTask, "target", new vscode.ThemeColor("charts.red")));
+      items.push(leaf(peer.context.currentTask, undefined, "target", new vscode.ThemeColor("charts.red")));
     }
 
     if (peer.context.git) {
       const git = peer.context.git;
-      const gitItem = detail(
-        `Git: ${git.branch ?? "detached"}`,
-        "git-branch",
-        new vscode.ThemeColor("charts.purple"),
-      );
+      const gitItem = leaf("Git", git.branch ?? "detached", "git-branch", new vscode.ThemeColor("charts.purple"));
 
       const gitChildren: PeerItem[] = [];
       // Show only files changed by this agent (exclude pre-existing modifications)
       const baseline = new Set(git.baselineModifiedFiles ?? []);
       const agentModified = (git.modifiedFiles ?? []).filter((f) => !baseline.has(f));
-      if (agentModified.length) {
-        for (const f of agentModified) {
-          gitChildren.push(detail(f, "diff-modified", new vscode.ThemeColor("charts.yellow")));
-        }
+      for (const f of agentModified) {
+        gitChildren.push(leaf(f, undefined, "diff-modified", new vscode.ThemeColor("charts.yellow")));
       }
       if (git.stagedFiles?.length) {
         for (const f of git.stagedFiles) {
-          gitChildren.push(detail(f, "diff-added", new vscode.ThemeColor("charts.green")));
+          gitChildren.push(leaf(f, undefined, "diff-added", new vscode.ThemeColor("charts.green")));
         }
       }
 
@@ -173,34 +168,53 @@ function buildContextItems(peer: Peer): PeerItem[] {
       }
       items.push(gitItem);
     } else {
-      // Keep indentation aligned even when the peer isn't inside a git repo
-      items.push(detail("Git: (not a repo)", "git-branch", dim ?? new vscode.ThemeColor("charts.foreground")));
+      items.push(leaf("Git", "(not a repo)", "git-branch", dim ?? new vscode.ThemeColor("charts.foreground")));
     }
 
     if (peer.context.activeFiles?.length) {
-      const filesItem = detail(
-        `Active files (${peer.context.activeFiles.length})`,
-        "folder-opened",
-        new vscode.ThemeColor("charts.orange"),
-      );
+      const filesItem = leaf(`Active files (${peer.context.activeFiles.length})`, undefined, "folder-opened", new vscode.ThemeColor("charts.orange"));
       filesItem.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
       filesItem.children = peer.context.activeFiles.map((f) =>
-        detail(
+        leaf(
           `${f.relativePath || f.path}${f.isDirty ? " •" : ""}`,
+          undefined,
           "file",
           new vscode.ThemeColor("charts.blue"),
         ),
       );
       items.push(filesItem);
     }
+
+    const exchanges = peer.context.recentExchanges ?? [];
+    const chatItem = leaf(
+      `Recent conversation (${exchanges.length})`,
+      undefined,
+      "comment-discussion",
+      new vscode.ThemeColor("charts.foreground"),
+    );
+    chatItem.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
+    chatItem.children = exchanges.map((ex) => {
+      const icon = ex.role === "human" ? "account" : "hubot";
+      const color = ex.role === "human"
+        ? new vscode.ThemeColor("charts.blue")
+        : new vscode.ThemeColor("charts.green");
+      const item = leaf(ex.text, undefined, icon, color);
+      item.tooltip = `[${ex.role}] ${ex.timestamp}\n\n${ex.text}`;
+      return item;
+    });
+    items.push(chatItem);
   }
 
   return items;
 }
 
-/** Shorthand: create a leaf/branch detail PeerItem. */
-function detail(label: string, iconId: string, iconColor?: vscode.ThemeColor): PeerItem {
-  return new PeerItem(label, "", "detail", undefined, iconId, iconColor);
+/** Shorthand: create a leaf detail PeerItem with optional description. */
+function leaf(label: string, value: string | undefined, iconId: string, iconColor?: vscode.ThemeColor): PeerItem {
+  const item = new PeerItem(label, "", "detail", undefined, iconId, iconColor);
+  if (value !== undefined) {
+    item.description = value;
+  }
+  return item;
 }
 
 class PeerItem extends vscode.TreeItem {
@@ -211,6 +225,7 @@ class PeerItem extends vscode.TreeItem {
     item.description = `${peerCount} peer${peerCount !== 1 ? "s" : ""}`;
     item.iconPath = new vscode.ThemeIcon("root-folder", new vscode.ThemeColor("charts.blue"));
     item.contextValue = "projectHeader";
+    item.collapsibleState = vscode.TreeItemCollapsibleState.Expanded;
     return item;
   }
 

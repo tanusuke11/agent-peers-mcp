@@ -88,7 +88,7 @@ export function activate(extensionContext: vscode.ExtensionContext) {
       const proc = spawn("node", [brokerPath], { stdio: "ignore", detached: true });
       proc.unref();
       vscode.window.showInformationMessage("Agent Peers broker starting...");
-      setTimeout(updateBrokerStatus, 2000);
+      // WS reconnect will detect the broker automatically
     }),
 
     vscode.commands.registerCommand("agentPeers.stopBroker", async () => {
@@ -115,7 +115,7 @@ export function activate(extensionContext: vscode.ExtensionContext) {
       }
 
       vscode.window.showInformationMessage("Agent Peers broker stopped.");
-      setTimeout(updateBrokerStatus, 500);
+      // WS onclose will detect disconnection automatically
     }),
 
     vscode.commands.registerCommand("agentPeers.disconnectPeer", async (item?: { peerId?: string; peer?: { id: string } }) => {
@@ -281,27 +281,32 @@ AGENT_PEERS_AGENT_TYPE = "codex"
     }),
   );
 
-  // Track broker connection state and auto-refresh
+  // Track broker connection state via WebSocket events
   let brokerConnected = false;
-  async function updateBrokerStatus() {
-    const health = await brokerClient.health();
-    const connected = health !== null;
-    if (connected !== brokerConnected) {
-      brokerConnected = connected;
-      controlProvider.brokerConnected = connected;
-      controlProvider.refresh();
-      vscode.commands.executeCommand("setContext", "agentPeers.brokerConnected", connected);
-    }
+  function setBrokerConnected(connected: boolean) {
+    if (connected === brokerConnected) return;
+    brokerConnected = connected;
+    controlProvider.brokerConnected = connected;
+    controlProvider.refresh();
+    vscode.commands.executeCommand("setContext", "agentPeers.brokerConnected", connected);
     peerListProvider.refresh();
   }
   vscode.commands.executeCommand("setContext", "agentPeers.brokerConnected", false);
 
-  // Refresh every 5s so relative timestamps stay current
-  const refreshInterval = setInterval(updateBrokerStatus, 5_000);
+  // React to WebSocket connection state changes
+  brokerClient.on("broker-connected", () => setBrokerConnected(true));
+  brokerClient.on("broker-disconnected", () => setBrokerConnected(false));
+
+  // Periodic health check + timestamp refresh (fallback in case WS events are missed)
+  const statusRefreshInterval = setInterval(async () => {
+    const h = await brokerClient.health();
+    setBrokerConnected(h !== null);
+    if (h) peerListProvider.refresh();
+  }, 30_000);
 
   extensionContext.subscriptions.push({
     dispose: () => {
-      clearInterval(refreshInterval);
+      clearInterval(statusRefreshInterval);
       brokerClient.dispose();
     },
   });
@@ -309,14 +314,22 @@ AGENT_PEERS_AGENT_TYPE = "codex"
   // Connect WebSocket for real-time updates
   brokerClient.connectWs();
 
-  // Auto-start broker if configured, then do the first status check
+  // Auto-start broker if configured, then do initial status check
   if (config.get<boolean>("autoStartBroker", false)) {
     brokerClient.ensureBroker(extensionContext.extensionUri)
       .catch(() => { /* Broker may already be running, that's fine */ })
-      .finally(() => updateBrokerStatus());
+      .finally(() => {
+        // Initial status check after broker is ready
+        brokerClient.health().then((h) => {
+          if (h) setBrokerConnected(true);
+        });
+      });
   } else {
-    // Defer initial status check so extension activation isn't blocked
-    setTimeout(updateBrokerStatus, 2000);
+    // Deferred initial status check (WS may not have connected yet)
+    setTimeout(async () => {
+      const h = await brokerClient.health();
+      if (h) setBrokerConnected(true);
+    }, 2000);
   }
 }
 

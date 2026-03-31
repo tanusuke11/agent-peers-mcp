@@ -29,15 +29,19 @@ import type {
   Peer,
   AgentType,
   AgentContext,
+  Message,
   RegisterResponse,
   PollMessagesResponse,
   MessageType,
+  WsEvent,
+  WsMessageEvent,
 } from "../shared/types.ts";
 import path from "path";
+import WebSocket from "ws";
 import {
   DEFAULT_BROKER_PORT,
+  DEFAULT_WS_PORT,
   BROKER_HOST,
-  POLL_INTERVAL_MS,
   HEARTBEAT_INTERVAL_MS,
 } from "../shared/constants.ts";
 import {
@@ -49,7 +53,9 @@ import {
 // ─── Configuration ─────────────────────────────────────────────
 
 const BROKER_PORT = parseInt(process.env.AGENT_PEERS_PORT ?? String(DEFAULT_BROKER_PORT), 10);
+const WS_PORT = parseInt(process.env.AGENT_PEERS_WS_PORT ?? String(DEFAULT_WS_PORT), 10);
 const BROKER_URL = `http://${BROKER_HOST}:${BROKER_PORT}`;
+const BROKER_WS_URL = `ws://${BROKER_HOST}:${WS_PORT}`;
 const AGENT_TYPE = (process.env.AGENT_PEERS_AGENT_TYPE ?? "claude-code") as AgentType;
 const BROKER_SCRIPT = path.join(__dirname, "..", "broker", "index.js");
 
@@ -133,9 +139,9 @@ function getParentPid(pid: number): number {
   } catch { return 0; }
 }
 
-async function getClaudeSessionTitle(): Promise<string | null> {
+/** Find the Claude Code session JSONL file path by walking up the process tree. */
+function findSessionFile(): string | null {
   try {
-    // Walk up the process tree (up to 5 levels) to find --resume <sessionId>
     let pid = process.ppid;
     let sessionId: string | null = null;
 
@@ -148,32 +154,79 @@ async function getClaudeSessionTitle(): Promise<string | null> {
         sessionId = cmdArgs[resumeIdx + 1]!;
         break;
       }
-
       pid = getParentPid(pid);
     }
 
     if (!sessionId) return null;
 
-    // Try multiple project path patterns (gitRoot-based and cwd-based)
-    // Claude Code uses the absolute path with separators replaced by "-"
     const candidates = [myGitRoot, myCwd].filter(Boolean) as string[];
     for (const base of candidates) {
       const projectHash = base.replace(/[\\/]/g, "-");
       const sessionFile = path.join(os.homedir(), ".claude", "projects", projectHash, `${sessionId}.jsonl`);
-      if (!fs.existsSync(sessionFile)) continue;
-
-      const content = fs.readFileSync(sessionFile, "utf8");
-      for (const line of content.split("\n").filter(Boolean)) {
-        try {
-          const obj = JSON.parse(line) as { type?: string; aiTitle?: string };
-          if (obj.type === "ai-title" && obj.aiTitle) return obj.aiTitle;
-        } catch { /* skip malformed lines */ }
-      }
+      if (fs.existsSync(sessionFile)) return sessionFile;
     }
     return null;
-  } catch {
+  } catch { return null; }
+}
+
+async function getClaudeSessionTitle(): Promise<string | null> {
+  try {
+    const file = findSessionFile();
+    if (!file) return null;
+
+    const content = fs.readFileSync(file, "utf8");
+    for (const line of content.split("\n").filter(Boolean)) {
+      try {
+        const obj = JSON.parse(line) as { type?: string; aiTitle?: string };
+        if (obj.type === "ai-title" && obj.aiTitle) return obj.aiTitle;
+      } catch { /* skip */ }
+    }
     return null;
-  }
+  } catch { return null; }
+}
+
+const EXCHANGE_MAX_CHARS = 200;
+const EXCHANGE_MAX_COUNT = 5;
+
+/** Read recent human/assistant exchanges from the Claude Code session JSONL. */
+function getRecentExchanges(): import("../shared/types.ts").RecentExchange[] {
+  try {
+    const file = findSessionFile();
+    if (!file) return [];
+
+    const lines = fs.readFileSync(file, "utf8").split("\n").filter(Boolean);
+    const exchanges: import("../shared/types.ts").RecentExchange[] = [];
+
+    for (const line of lines) {
+      try {
+        const obj = JSON.parse(line);
+        if ((obj.type === "user" || obj.type === "assistant") && obj.message) {
+          const msg = obj.message;
+          const role = msg.role as "human" | "assistant" | undefined;
+          if (role !== "human" && role !== "assistant") continue;
+
+          let text = "";
+          if (typeof msg.content === "string") {
+            text = msg.content;
+          } else if (Array.isArray(msg.content)) {
+            text = msg.content
+              .filter((b: { type?: string }) => b.type === "text")
+              .map((b: { text?: string }) => b.text ?? "")
+              .join(" ");
+          }
+          if (!text) continue;
+
+          exchanges.push({
+            role,
+            text: text.length > EXCHANGE_MAX_CHARS ? text.slice(0, EXCHANGE_MAX_CHARS) + "…" : text,
+            timestamp: obj.timestamp ?? new Date().toISOString(),
+          });
+        }
+      } catch { /* skip */ }
+    }
+
+    return exchanges.slice(-EXCHANGE_MAX_COUNT);
+  } catch { return []; }
 }
 
 async function ensureBroker(): Promise<void> {
@@ -356,6 +409,12 @@ mcp.registerTool("request_context", {
       if (ctx.git.stagedFiles?.length) parts.push(`Staged files:\n  ${ctx.git.stagedFiles.join("\n  ")}`);
       if (ctx.git.diff) parts.push(`Diff summary:\n${ctx.git.diff}`);
     }
+    if (ctx.recentExchanges?.length) {
+      parts.push(`\nRecent conversation (last ${ctx.recentExchanges.length} exchanges):`);
+      for (const ex of ctx.recentExchanges) {
+        parts.push(`  [${ex.role}] ${ex.text}`);
+      }
+    }
     if (ctx.metadata) parts.push(`Metadata: ${JSON.stringify(ctx.metadata)}`);
     parts.push(`Last updated: ${ctx.updatedAt}`);
     return { content: [{ type: "text" as const, text: parts.join("\n") }] };
@@ -391,9 +450,96 @@ mcp.registerTool("check_messages", {
   }
 });
 
-// ─── Polling loop ──────────────────────────────────────────────
+// ─── WebSocket connection to broker ────────────────────────────
 
-async function pollAndPushMessages() {
+let brokerWs: WebSocket | null = null;
+let wsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+async function handleIncomingMessage(msg: Message) {
+  let fromSummary = "";
+  let fromCwd = "";
+  let fromAgent = "";
+  try {
+    const peers = await brokerFetch<Peer[]>("/list-peers", { scope: "machine", cwd: myCwd, gitRoot: myGitRoot });
+    const sender = peers.find((p) => p.id === msg.fromId);
+    if (sender) {
+      fromSummary = sender.context.summary;
+      fromCwd = sender.cwd;
+      fromAgent = sender.agentType;
+    }
+  } catch { /* non-critical */ }
+
+  await mcp.server.notification({
+    method: "notifications/claude/channel",
+    params: {
+      content: msg.text,
+      meta: {
+        from_id: msg.fromId,
+        from_agent: fromAgent,
+        from_summary: fromSummary,
+        from_cwd: fromCwd,
+        message_type: msg.type,
+        sent_at: msg.sentAt,
+      },
+    },
+  });
+  log(`Pushed message from ${msg.fromId} (${fromAgent}): ${msg.text.slice(0, 80)}`);
+}
+
+function connectBrokerWs() {
+  if (brokerWs) {
+    try { brokerWs.close(); } catch { /* */ }
+  }
+
+  try {
+    brokerWs = new WebSocket(BROKER_WS_URL);
+
+    brokerWs.on("open", () => {
+      log("WebSocket connected to broker");
+      // Identify ourselves so the broker can deliver messages directly
+      if (myId) {
+        brokerWs!.send(JSON.stringify({ type: "identify", id: myId }));
+      }
+      // Drain any messages that arrived while disconnected
+      drainUndeliveredMessages();
+    });
+
+    brokerWs.on("message", (data) => {
+      try {
+        const event = JSON.parse(String(data)) as WsEvent;
+        if (event.type === "message") {
+          const msg = (event as WsMessageEvent).data;
+          // Only handle messages targeted at us
+          if (msg.toId === myId) {
+            handleIncomingMessage(msg);
+          }
+        }
+      } catch { /* ignore malformed messages */ }
+    });
+
+    brokerWs.on("close", () => {
+      log("WebSocket disconnected from broker, reconnecting...");
+      scheduleWsReconnect();
+    });
+
+    brokerWs.on("error", () => {
+      try { brokerWs?.close(); } catch { /* */ }
+    });
+  } catch {
+    scheduleWsReconnect();
+  }
+}
+
+function scheduleWsReconnect() {
+  if (wsReconnectTimer) return;
+  wsReconnectTimer = setTimeout(() => {
+    wsReconnectTimer = null;
+    connectBrokerWs();
+  }, 3000);
+}
+
+/** Drain any undelivered messages (e.g. sent while WS was disconnected) */
+async function drainUndeliveredMessages() {
   if (!myId) return;
   try {
     const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
@@ -403,37 +549,10 @@ async function pollAndPushMessages() {
       return;
     }
     for (const msg of result.messages) {
-      let fromSummary = "";
-      let fromCwd = "";
-      let fromAgent = "";
-      try {
-        const peers = await brokerFetch<Peer[]>("/list-peers", { scope: "machine", cwd: myCwd, gitRoot: myGitRoot });
-        const sender = peers.find((p) => p.id === msg.fromId);
-        if (sender) {
-          fromSummary = sender.context.summary;
-          fromCwd = sender.cwd;
-          fromAgent = sender.agentType;
-        }
-      } catch { /* non-critical */ }
-
-      await mcp.server.notification({
-        method: "notifications/claude/channel",
-        params: {
-          content: msg.text,
-          meta: {
-            from_id: msg.fromId,
-            from_agent: fromAgent,
-            from_summary: fromSummary,
-            from_cwd: fromCwd,
-            message_type: msg.type,
-            sent_at: msg.sentAt,
-          },
-        },
-      });
-      log(`Pushed message from ${msg.fromId} (${fromAgent}): ${msg.text.slice(0, 80)}`);
+      await handleIncomingMessage(msg);
     }
   } catch (e) {
-    log(`Poll error: ${e instanceof Error ? e.message : String(e)}`);
+    log(`Drain error: ${e instanceof Error ? e.message : String(e)}`);
   }
 }
 
@@ -561,20 +680,28 @@ async function main() {
     }
   }
 
-  // Start polling & heartbeat
+  // Start WebSocket connection & heartbeat
+  connectBrokerWs();
   let lastGitJson = ""; // Cache to avoid redundant context updates
-  const pollTimer = setInterval(pollAndPushMessages, POLL_INTERVAL_MS);
+  let lastExchangesJson = ""; // Cache to avoid redundant exchange updates
   const heartbeatTimer = setInterval(async () => {
     if (!myId) return;
     try {
       const result = await brokerFetch<{ ok: boolean }>("/heartbeat", { id: myId });
       if (!result.ok) {
-        // Broker restarted and lost our entry — re-register
+        // Broker restarted and lost our entry — re-register and re-identify on WS
         log("Peer entry gone from broker, re-registering...");
         await ensureBroker();
         await registerWithBroker();
+        if (brokerWs?.readyState === WebSocket.OPEN && myId) {
+          brokerWs.send(JSON.stringify({ type: "identify", id: myId }));
+        } else {
+          connectBrokerWs();
+        }
         return;
       }
+      const contextUpdate: Record<string, unknown> = {};
+
       // Only send git context update if something actually changed
       const gitCtx = await gatherGitContext(myCwd);
       if (gitCtx) {
@@ -583,7 +710,19 @@ async function main() {
       const gitJson = JSON.stringify(gitCtx);
       if (gitJson !== lastGitJson) {
         lastGitJson = gitJson;
-        await brokerFetch("/update-context", { id: myId, context: { git: gitCtx } });
+        contextUpdate.git = gitCtx;
+      }
+
+      // Update recent exchanges (only if changed)
+      const exchanges = getRecentExchanges();
+      const exchangesJson = JSON.stringify(exchanges);
+      if (exchangesJson !== lastExchangesJson) {
+        lastExchangesJson = exchangesJson;
+        contextUpdate.recentExchanges = exchanges;
+      }
+
+      if (Object.keys(contextUpdate).length > 0) {
+        await brokerFetch("/update-context", { id: myId, context: contextUpdate });
       }
     } catch {
       // Broker temporarily down — will retry next heartbeat
@@ -596,7 +735,8 @@ async function main() {
   const cleanup = async () => {
     if (cleanedUp) return;
     cleanedUp = true;
-    clearInterval(pollTimer);
+    if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
+    try { brokerWs?.close(); } catch { /* */ }
     clearInterval(heartbeatTimer);
     if (titleWatchTimer) clearTimeout(titleWatchTimer);
     gitWatcher?.close();
