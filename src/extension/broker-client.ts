@@ -54,6 +54,21 @@ export class BrokerClient {
     return null;
   }
 
+  async getGitRoot(): Promise<string | null> {
+    if (this.cachedGitRoot === undefined) {
+      const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+      try {
+        const { execFile } = require("child_process") as typeof import("child_process");
+        this.cachedGitRoot = await new Promise<string | null>((resolve) => {
+          execFile("git", ["rev-parse", "--show-toplevel"], { cwd: workspaceFolder, timeout: 3000 }, (err, stdout) => {
+            resolve(err ? null : stdout.trim());
+          });
+        });
+      } catch { this.cachedGitRoot = null; }
+    }
+    return this.cachedGitRoot;
+  }
+
   async listPeers(scope: "machine" | "directory" | "repo" = "machine"): Promise<Peer[]> {
     try {
       const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();

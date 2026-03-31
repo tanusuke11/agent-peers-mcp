@@ -27,26 +27,45 @@ export class PeerListProvider implements vscode.TreeDataProvider<PeerItem> {
       return element.children ?? [];
     }
 
-    const projectName = vscode.workspace.workspaceFolders?.[0]?.name ?? "current project";
-    const peers = await this.client.listPeers("repo");
+    const workspaceGitRoot = await this.client.getGitRoot();
+    const peers = await this.client.listPeers("machine");
 
-    const sorted = peers
-      .map((p) => {
-        const displayType = agentDisplayName(p.agentType);
-        const label = p.suspended
-          ? `${displayType} (${p.id})`
-          : `${agentEmoji(p.agentType)} ${displayType} (${animalEmoji(p.id)}${p.id})`;
-        return new PeerItem(label, p.id, "peer", p);
-      })
-      .sort((a, b) => {
-        const rank = (p: Peer | undefined) => (p?.suspended ? 2 : 1);
-        return rank(a.peer) - rank(b.peer);
-      });
+    // Group peers by git root (or cwd if no git root)
+    const groups = new Map<string, { label: string; isLocal: boolean; peers: Peer[] }>();
+    for (const p of peers) {
+      const key = p.gitRoot ?? p.cwd;
+      if (!groups.has(key)) {
+        const dirName = key.split("/").pop() || key;
+        groups.set(key, { label: dirName, isLocal: key === workspaceGitRoot, peers: [] });
+      }
+      groups.get(key)!.peers.push(p);
+    }
 
-    return [
-      PeerItem.projectHeader(projectName, peers.length),
-      ...sorted,
-    ];
+    // Sort groups: local repo first, then alphabetical
+    const sortedGroups = [...groups.entries()].sort(([, a], [, b]) => {
+      if (a.isLocal !== b.isLocal) return a.isLocal ? -1 : 1;
+      return a.label.localeCompare(b.label);
+    });
+
+    const items: PeerItem[] = [];
+    for (const [, group] of sortedGroups) {
+      items.push(PeerItem.projectHeader(group.label, group.peers.length));
+      const sorted = group.peers
+        .map((p) => {
+          const displayType = agentDisplayName(p.agentType);
+          const label = p.suspended
+            ? `${displayType} (${p.id})`
+            : `${agentEmoji(p.agentType)} ${displayType} (${animalEmoji(p.id)}${p.id})`;
+          return new PeerItem(label, p.id, "peer", p);
+        })
+        .sort((a, b) => {
+          const rank = (p: Peer | undefined) => (p?.suspended ? 2 : 1);
+          return rank(a.peer) - rank(b.peer);
+        });
+      items.push(...sorted);
+    }
+
+    return items;
   }
 }
 
@@ -76,7 +95,6 @@ function animalEmoji(id: string): string {
 function agentDisplayName(agentType: string): string {
   switch (agentType) {
     case "claude-code": return "claude";
-    case "copilot-chat": return "copilot";
     default: return agentType;
   }
 }
@@ -85,8 +103,6 @@ function agentEmoji(agentType: string): string {
   switch (agentType) {
     case "claude-code": return "🟠";
     case "codex": return "🟢";
-    case "copilot-chat": return "🔵";
-    case "cursor": return "🟣";
     default: return "⚪";
   }
 }
@@ -95,10 +111,21 @@ function agentColor(agentType: string): vscode.ThemeColor {
   switch (agentType) {
     case "claude-code": return new vscode.ThemeColor("charts.orange");
     case "codex": return new vscode.ThemeColor("charts.green");
-    case "copilot-chat": return new vscode.ThemeColor("charts.blue");
-    case "cursor": return new vscode.ThemeColor("charts.purple");
     default: return new vscode.ThemeColor("charts.foreground");
   }
+}
+
+function relativeTime(iso: string): string {
+  const diff = Date.now() - new Date(iso).getTime();
+  if (diff < 0) return "just now";
+  const sec = Math.floor(diff / 1000);
+  if (sec < 10) return "just now";
+  if (sec < 60) return `${sec}s ago`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  return `${Math.floor(hr / 24)}d ago`;
 }
 
 const DIM_COLOR = new vscode.ThemeColor("disabledForeground");
@@ -126,8 +153,11 @@ function buildContextItems(peer: Peer): PeerItem[] {
       );
 
       const gitChildren: PeerItem[] = [];
-      if (git.modifiedFiles?.length) {
-        for (const f of git.modifiedFiles) {
+      // Show only files changed by this agent (exclude pre-existing modifications)
+      const baseline = new Set(git.baselineModifiedFiles ?? []);
+      const agentModified = (git.modifiedFiles ?? []).filter((f) => !baseline.has(f));
+      if (agentModified.length) {
+        for (const f of agentModified) {
           gitChildren.push(detail(f, "diff-modified", new vscode.ThemeColor("charts.yellow")));
         }
       }
@@ -142,6 +172,9 @@ function buildContextItems(peer: Peer): PeerItem[] {
         gitItem.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
       }
       items.push(gitItem);
+    } else {
+      // Keep indentation aligned even when the peer isn't inside a git repo
+      items.push(detail("Git: (not a repo)", "git-branch", dim ?? new vscode.ThemeColor("charts.foreground")));
     }
 
     if (peer.context.activeFiles?.length) {
@@ -200,9 +233,10 @@ class PeerItem extends vscode.TreeItem {
         this.contextValue = "peerSuspended";
         this.iconPath = new vscode.ThemeIcon("circle-outline", DIM_COLOR);
       } else {
-        this.description = peer.context.summary || peer.context.currentTask || peer.cwd;
+        const summary = peer.context.summary && peer.context.summary !== "Untitled" ? peer.context.summary : "";
+        const ago = relativeTime(peer.context.updatedAt || peer.registeredAt);
+        this.description = summary ? `${summary} · ${ago}` : ago;
         this.contextValue = "peerActive";
-        // emoji in label provides vivid agent-type color; no redundant ThemeIcon needed
       }
       this.tooltip = new vscode.MarkdownString(this.buildTooltip(peer));
       this.children = buildContextItems(peer);

@@ -11,7 +11,7 @@
 export type PeerId = string;
 
 /** The type of AI agent tool */
-export type AgentType = "claude-code" | "codex" | "copilot-chat" | "cursor" | "generic";
+export type AgentType = "claude-code" | "codex" | "generic";
 
 // ─── Structured Context ────────────────────────────────────────
 
@@ -30,6 +30,8 @@ export interface GitContext {
   recentCommits?: string[];
   stagedFiles?: string[];
   modifiedFiles?: string[];
+  /** Files that were already modified when the agent registered (baseline) */
+  baselineModifiedFiles?: string[];
   diff?: string; // abbreviated diff
 }
 

@@ -66,12 +66,15 @@ export class ContextProvider implements vscode.TreeDataProvider<ContextItem> {
       gitItem.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
       const gitChildren: ContextItem[] = [];
 
-      if (git.modifiedFiles?.length) {
-        for (const f of git.modifiedFiles.slice(0, 10)) {
+      // Show only files changed by this agent (exclude pre-existing modifications)
+      const baseline = new Set(git.baselineModifiedFiles ?? []);
+      const agentModified = (git.modifiedFiles ?? []).filter((f) => !baseline.has(f));
+      if (agentModified.length) {
+        for (const f of agentModified.slice(0, 10)) {
           gitChildren.push(new ContextItem(f, "diff-modified", new vscode.ThemeColor("charts.yellow")));
         }
-        if (git.modifiedFiles.length > 10) {
-          gitChildren.push(new ContextItem(`... and ${git.modifiedFiles.length - 10} more`, "ellipsis"));
+        if (agentModified.length > 10) {
+          gitChildren.push(new ContextItem(`... and ${agentModified.length - 10} more`, "ellipsis"));
         }
       }
       if (git.stagedFiles?.length) {
@@ -118,8 +121,6 @@ function agentIcon(agentType: string): string {
   switch (agentType) {
     case "claude-code": return "🟠";
     case "codex": return "🟢";
-    case "copilot-chat": return "🔵";
-    case "cursor": return "🟣";
     default: return "⚪";
   }
 }
@@ -128,8 +129,6 @@ function agentColor(agentType: string): vscode.ThemeColor {
   switch (agentType) {
     case "claude-code": return new vscode.ThemeColor("charts.orange");
     case "codex": return new vscode.ThemeColor("charts.green");
-    case "copilot-chat": return new vscode.ThemeColor("charts.blue");
-    case "cursor": return new vscode.ThemeColor("charts.purple");
     default: return new vscode.ThemeColor("charts.foreground");
   }
 }

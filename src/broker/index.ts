@@ -7,7 +7,7 @@
  * Broadcasts real-time events via WebSocket for VSCode extension and other listeners.
  *
  * Enhancements over claude-peers:
- *   - Multi-agent support (Claude Code, Codex, Copilot Chat, Cursor, etc.)
+ *   - Multi-agent support (Claude Code, Codex, etc.)
  *   - Structured context sharing (active files, git state, tasks)
  *   - WebSocket for real-time push (peer join/leave, messages, context updates)
  *
@@ -301,10 +301,14 @@ function handleUpdateContext(body: UpdateContextRequest): void {
   if (!row) return;
 
   const existing = JSON.parse(row.context_json) as AgentContext;
+  // Only bump updatedAt when summary or currentTask actually changes
+  const meaningfulChange =
+    (body.context.summary !== undefined && body.context.summary !== existing.summary) ||
+    (body.context.currentTask !== undefined && body.context.currentTask !== existing.currentTask);
   const merged: AgentContext = {
     ...existing,
     ...body.context,
-    updatedAt: new Date().toISOString(),
+    updatedAt: meaningfulChange ? new Date().toISOString() : existing.updatedAt,
   };
 
   const now = new Date().toISOString();

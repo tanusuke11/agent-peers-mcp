@@ -36,3 +36,8 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 # Custom directories
 .sample
 *.vsix
+
+# Agent Config
+.claude
+.codex
+.mcp.json

@@ -77,19 +77,17 @@ export function activate(extensionContext: vscode.ExtensionContext) {
       vscode.window.showInformationMessage("Context sharing is handled automatically by the MCP server.");
     }),
 
-    vscode.commands.registerCommand("agentPeers.startBroker", async (uri?: vscode.Uri) => {
+    vscode.commands.registerCommand("agentPeers.startBroker", async () => {
       const health = await brokerClient.health();
       if (health) {
         vscode.window.showInformationMessage(`Agent Peers broker is already running (${health.peerCount} peers).`);
         return;
       }
       const brokerPath = vscode.Uri.joinPath(extensionContext.extensionUri, "out", "broker", "index.js").fsPath;
-      const cwd = uri?.fsPath ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-      const terminal = vscode.window.createTerminal({ name: "Agent Peers Broker", cwd });
-      terminal.sendText(`node "${brokerPath}"`);
-      terminal.show();
+      const { spawn } = require("child_process") as typeof import("child_process");
+      const proc = spawn("node", [brokerPath], { stdio: "ignore", detached: true });
+      proc.unref();
       vscode.window.showInformationMessage("Agent Peers broker starting...");
-      // Wait briefly then update status
       setTimeout(updateBrokerStatus, 2000);
     }),
 
@@ -298,8 +296,8 @@ AGENT_PEERS_AGENT_TYPE = "codex"
   }
   vscode.commands.executeCommand("setContext", "agentPeers.brokerConnected", false);
 
-  // Fallback polling at a relaxed interval — WS events handle the fast path
-  const refreshInterval = setInterval(updateBrokerStatus, 15_000);
+  // Refresh every 5s so relative timestamps stay current
+  const refreshInterval = setInterval(updateBrokerStatus, 5_000);
 
   extensionContext.subscriptions.push({
     dispose: () => {

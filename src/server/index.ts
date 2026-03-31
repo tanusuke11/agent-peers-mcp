@@ -2,7 +2,7 @@
 /**
  * agent-peers MCP server
  *
- * Spawned by AI tools (Claude Code, Codex, Copilot Chat, etc.) as a stdio MCP server.
+ * Spawned by AI tools (Claude Code, Codex, etc.) as a stdio MCP server.
  * Connects to the shared broker daemon for peer discovery, messaging, and context sharing.
  *
  * Key differences from claude-peers:
@@ -14,7 +14,7 @@
  *   claude mcp add --scope user --transport stdio agent-peers -- node ~/.vscode/extensions/agent-peers.agent-peers-mcp-0.1.0/out/server/index.js
  *
  * Environment:
- *   AGENT_PEERS_AGENT_TYPE  — "claude-code" | "codex" | "copilot-chat" | "cursor" | "generic"
+ *   AGENT_PEERS_AGENT_TYPE  — "claude-code" | "codex" | "generic"
  *   AGENT_PEERS_PORT        — broker HTTP port (default 7899)
  */
 
@@ -227,11 +227,15 @@ function log(msg: string) {
   console.error(`[agent-peers] ${msg}`);
 }
 
+
+
 // ─── State ─────────────────────────────────────────────────────
 
 let myId: PeerId | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
+/** Files already modified at registration time — used to compute agent-only changes */
+let baselineModifiedFiles: string[] = [];
 
 // ─── MCP Server ────────────────────────────────────────────────
 
@@ -239,7 +243,7 @@ const mcp = new McpServer(
   { name: "agent-peers", version: "0.1.0" },
   {
     capabilities: { experimental: { "claude/channel": {} } },
-    instructions: `You are connected to the agent-peers network. Other AI agent instances (Claude Code, Codex, GitHub Copilot Chat, Cursor, etc.) on this machine can discover you, send you messages, and share structured context.
+    instructions: `You are connected to the agent-peers network. Other AI agent instances (Claude Code, Codex, etc.) on this machine can discover you, send you messages, and share structured context.
 
 IMPORTANT: When you receive a <channel source="agent-peers" ...> message, RESPOND IMMEDIATELY. Pause what you are doing, reply using send_message, then resume your work.
 
@@ -258,7 +262,7 @@ When you start, proactively call share_context to publish your current state. Th
 // ─── Tool handlers ─────────────────────────────────────────────
 
 mcp.registerTool("list_peers", {
-  description: "List other AI agent instances running on this machine. Returns their ID, agent type (claude-code/codex/copilot-chat/cursor), working directory, git repo, and current context summary.",
+  description: "List other AI agent instances running on this machine. Returns their ID, agent type (claude-code/codex), working directory, git repo, and current context summary.",
   inputSchema: { scope: z.enum(["machine", "directory", "repo"]).describe('"machine" = all instances. "directory" = same working directory. "repo" = same git repository.') },
 }, async ({ scope }) => {
   try {
@@ -311,6 +315,9 @@ mcp.registerTool("share_context", {
   if (!myId) return { content: [{ type: "text" as const, text: "Not registered yet" }], isError: true };
   try {
     const gitCtx = await gatherGitContext(myCwd);
+    if (gitCtx) {
+      gitCtx.baselineModifiedFiles = baselineModifiedFiles;
+    }
     const activeFiles = (active_files ?? []).map((f) => ({ path: f, relativePath: path.relative(myCwd, f) }));
     const resolvedSummary = summary
       ?? (activeFiles.length
@@ -436,6 +443,11 @@ let myTty: string | null = null;
 
 async function registerWithBroker(): Promise<void> {
   const gitCtx = await gatherGitContext(myCwd);
+  // Capture baseline: files already modified before this agent session started
+  baselineModifiedFiles = gitCtx?.modifiedFiles ?? [];
+  if (gitCtx) {
+    gitCtx.baselineModifiedFiles = baselineModifiedFiles;
+  }
   const initialSummary = "Untitled";
   const context: AgentContext = {
     summary: initialSummary,
@@ -453,6 +465,17 @@ async function registerWithBroker(): Promise<void> {
   });
   myId = reg.id;
   log(`Registered as peer ${myId}`);
+
+  // Try to restore session title immediately after (re-)registration
+  if (AGENT_TYPE === "claude-code") {
+    try {
+      const title = await getClaudeSessionTitle();
+      if (title) {
+        await brokerFetch("/update-context", { id: myId, context: { summary: title } });
+        log(`Session title restored: ${title}`);
+      }
+    } catch { /* non-critical */ }
+  }
 }
 
 async function main() {
@@ -495,6 +518,19 @@ async function main() {
     };
     // First attempt after 5s (session file needs time to be written)
     titleWatchTimer = setTimeout(() => trySetTitle(0), 5000);
+  } else {
+    // For other agents (e.g., Codex), set a reasonable summary once after startup.
+    const desiredTitle = myGitRoot ? path.basename(myGitRoot) : path.basename(myCwd);
+    const setOnce = async () => {
+      if (!myId || !desiredTitle || desiredTitle === "home" || desiredTitle === "Untitled") return;
+      try {
+        await brokerFetch("/update-context", { id: myId, context: { summary: desiredTitle } });
+        log(`Session title set (auto): ${desiredTitle}`);
+      } catch {
+        /* non-critical */
+      }
+    };
+    setTimeout(setOnce, 3000);
   }
 
   // Watch .git/HEAD for instant branch-change detection
@@ -511,6 +547,9 @@ async function main() {
           gitUpdatePending = false;
           try {
             const gitCtx = await gatherGitContext(myCwd);
+            if (gitCtx) {
+              gitCtx.baselineModifiedFiles = baselineModifiedFiles;
+            }
             await brokerFetch("/update-context", { id: myId, context: { git: gitCtx } });
             log("Git context updated (branch change detected)");
           } catch { /* broker may be down */ }
@@ -523,6 +562,7 @@ async function main() {
   }
 
   // Start polling & heartbeat
+  let lastGitJson = ""; // Cache to avoid redundant context updates
   const pollTimer = setInterval(pollAndPushMessages, POLL_INTERVAL_MS);
   const heartbeatTimer = setInterval(async () => {
     if (!myId) return;
@@ -535,9 +575,16 @@ async function main() {
         await registerWithBroker();
         return;
       }
-      // Refresh git context on each heartbeat so branch changes are reflected
+      // Only send git context update if something actually changed
       const gitCtx = await gatherGitContext(myCwd);
-      await brokerFetch("/update-context", { id: myId, context: { git: gitCtx } });
+      if (gitCtx) {
+        gitCtx.baselineModifiedFiles = baselineModifiedFiles;
+      }
+      const gitJson = JSON.stringify(gitCtx);
+      if (gitJson !== lastGitJson) {
+        lastGitJson = gitJson;
+        await brokerFetch("/update-context", { id: myId, context: { git: gitCtx } });
+      }
     } catch {
       // Broker temporarily down — will retry next heartbeat
     }

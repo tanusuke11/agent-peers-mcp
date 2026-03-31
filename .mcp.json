@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "agent-peers": {
-      "command": "bun",
-      "args": ["./src/server/index.ts"]
-    }
-  }
-}
