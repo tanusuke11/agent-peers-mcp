@@ -413,7 +413,6 @@ let cachedSessionTitle: string | null = null;
 const mcp = new McpServer(
   { name: "agent-peers", version: "0.1.0" },
   {
-    capabilities: { experimental: { "claude/channel": {} } },
     instructions: `You are connected to the agent-peers network. Other AI agent instances (Claude Code, Codex, etc.) on this machine can discover you, send you messages, and share structured context.
 
 IMPORTANT: When you receive a <channel source="agent-peers" ...> message, RESPOND IMMEDIATELY. Pause what you are doing, reply using send_message, then resume your work.
@@ -637,34 +636,9 @@ let brokerWs: WebSocket | null = null;
 let wsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
 async function handleIncomingMessage(msg: Message) {
-  let fromSummary = "";
-  let fromCwd = "";
-  let fromAgent = "";
-  try {
-    const peers = await brokerFetch<Peer[]>("/list-peers", { scope: "machine", cwd: myCwd, gitRoot: myGitRoot });
-    const sender = peers.find((p) => p.id === msg.fromId);
-    if (sender) {
-      fromSummary = sender.context.summary;
-      fromCwd = sender.cwd;
-      fromAgent = sender.agentType;
-    }
-  } catch { /* non-critical */ }
-
-  await mcp.server.notification({
-    method: "notifications/claude/channel",
-    params: {
-      content: msg.text,
-      meta: {
-        from_id: msg.fromId,
-        from_agent: fromAgent,
-        from_summary: fromSummary,
-        from_cwd: fromCwd,
-        message_type: msg.type,
-        sent_at: msg.sentAt,
-      },
-    },
-  });
-  log(`Pushed message from ${msg.fromId} (${fromAgent}): ${msg.text.slice(0, 80)}`);
+  // Messages are delivered to agent terminals by the VSCode extension
+  // via terminal.sendText(). The MCP server just logs receipt here.
+  log(`Received message from ${msg.fromId}: ${msg.text.slice(0, 80)}`);
 }
 
 function connectBrokerWs() {
