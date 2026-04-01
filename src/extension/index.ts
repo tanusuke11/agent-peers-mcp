@@ -18,6 +18,24 @@ import * as os from "os";
 
 let brokerClient: BrokerClient;
 
+// ─── Message batching ─────────────────────────────────────
+// Debounce rapid-fire messages per direction (fromId→toId) so that
+// multi-part completion reports are delivered as a single sendText().
+
+interface PendingDelivery {
+  fromId: string;
+  toId: string;
+  type: string;
+  texts: string[];
+  timer: ReturnType<typeof setTimeout>;
+}
+
+/** Map key = `${fromId}\0${toId}` */
+const pendingDeliveries = new Map<string, PendingDelivery>();
+
+/** How long to wait for additional messages before flushing (ms). */
+const MESSAGE_BATCH_DELAY_MS = 600;
+
 // ─── Terminal lookup helpers ──────────────────────────────
 
 /** Get the parent PID of a process. Linux reads /proc, others use ps/wmic. */
@@ -157,15 +175,118 @@ export function activate(extensionContext: vscode.ExtensionContext) {
   brokerClient.on("context-updated", () => {
     peerListProvider.refresh();
   });
+  /**
+   * Deliver a prompt string to a terminal, accounting for agent-type differences.
+   *
+   * Claude Code uses a raw-mode TUI (Ink) that expects `\r` (carriage return)
+   * for Enter. The default `terminal.sendText()` appends `\n` (line feed),
+   * which raw-mode processes do NOT interpret as Enter — so the text appears
+   * in the input but is never submitted.
+   *
+   * For claude-code peers we disable the automatic newline and explicitly
+   * send `\r` to trigger submission. Other agent types use the default behaviour.
+   */
+  function deliverToTerminal(terminal: vscode.Terminal, text: string, agentType: string) {
+    if (agentType === "claude-code") {
+      // Raw-mode TUI: send text without trailing LF, then CR to submit
+      terminal.sendText(text, false);
+      terminal.sendText("\r", false);
+    } else {
+      terminal.sendText(text);
+    }
+  }
+
+  // Flush a batched delivery: combine all queued texts into one sendText().
+  async function flushDelivery(key: string) {
+    const pending = pendingDeliveries.get(key);
+    if (!pending) return;
+    pendingDeliveries.delete(key);
+
+    const combined = pending.texts.join("\n\n");
+    const prompt = `[Message from ${pending.fromId} (${pending.type})] ${combined}`;
+
+    const autoDeliver = vscode.workspace.getConfiguration("agentPeers").get<boolean>("autoDeliveryMessage", true);
+
+    if (!autoDeliver) {
+      const typeLabel = pending.type === "task-handoff" ? "🔄 Task handoff" : pending.type === "context-request" ? "📋 Context request" : "💬 Message";
+      const preview = combined.length > 200 ? combined.slice(0, 200) + "…" : combined;
+      const choice = await vscode.window.showInformationMessage(
+        `${typeLabel} from ${pending.fromId} → ${pending.toId}:\n${preview}`,
+        { modal: false },
+        "Deliver to Terminal",
+        "Dismiss",
+      );
+      if (choice === "Deliver to Terminal") {
+        const peers = await brokerClient.listPeers("machine");
+        const peer = peers.find(p => p.id === pending.toId);
+        if (peer) {
+          const terminal = await findTerminalForPid(peer.pid);
+          if (terminal) {
+            deliverToTerminal(terminal, prompt, peer.agentType);
+            terminal.show(true);
+            await brokerClient.markRead(peer.id);
+          }
+        }
+      }
+      peerListProvider.refresh();
+      updateMessageBadge();
+      return;
+    }
+
+    const peers = await brokerClient.listPeers("machine");
+    const peer = peers.find(p => p.id === pending.toId);
+    if (peer) {
+      const terminal = await findTerminalForPid(peer.pid);
+      if (terminal) {
+        deliverToTerminal(terminal, prompt, peer.agentType);
+        terminal.show(true);
+        await brokerClient.markRead(peer.id);
+        peerListProvider.refresh();
+        updateMessageBadge();
+        return;
+      }
+    }
+
+    // Fallback: toast
+    const preview = combined.length > 120 ? combined.slice(0, 120) + "…" : combined;
+    vscode.window.showInformationMessage(`💬 ${pending.fromId}: ${preview}`);
+  }
+
   brokerClient.on("message", (data) => {
     peerListProvider.refresh();
     updateMessageBadge();
 
-    // Show a toast notification for the incoming message
-    const msg = data as { fromId?: string; text?: string; type?: string } | undefined;
-    if (msg?.fromId && msg?.text) {
-      const preview = msg.text.length > 120 ? msg.text.slice(0, 120) + "…" : msg.text;
-      vscode.window.showInformationMessage(`💬 ${msg.fromId}: ${preview}`);
+    const msg = data as { fromId?: string; toId?: string; text?: string; type?: string } | undefined;
+
+    // Report messages are NOT delivered to terminal — they only update the
+    // sidebar (peer list refresh + badge update above is sufficient).
+    if (msg?.type === "report") return;
+
+    if (!msg?.toId || !msg?.fromId || !msg?.text) {
+      // No target — show toast immediately
+      if (msg?.fromId && msg?.text) {
+        const preview = msg.text.length > 120 ? msg.text.slice(0, 120) + "…" : msg.text;
+        vscode.window.showInformationMessage(`💬 ${msg.fromId}: ${preview}`);
+      }
+      return;
+    }
+
+    // Batch messages per direction: accumulate texts, reset timer each time.
+    const key = `${msg.fromId}\0${msg.toId}`;
+    const existing = pendingDeliveries.get(key);
+    if (existing) {
+      clearTimeout(existing.timer);
+      existing.texts.push(msg.text);
+      existing.timer = setTimeout(() => flushDelivery(key), MESSAGE_BATCH_DELAY_MS);
+    } else {
+      const timer = setTimeout(() => flushDelivery(key), MESSAGE_BATCH_DELAY_MS);
+      pendingDeliveries.set(key, {
+        fromId: msg.fromId,
+        toId: msg.toId,
+        type: msg.type ?? "text",
+        texts: [msg.text],
+        timer,
+      });
     }
   });
 
@@ -178,17 +299,28 @@ export function activate(extensionContext: vscode.ExtensionContext) {
         return;
       }
 
-      const items = peers.map((p) => ({
-        label: `${p.agentType} — ${p.id}`,
-        description: p.context.summary || p.cwd,
-        detail: `CWD: ${p.cwd}${p.context.git?.branch ? ` | Branch: ${p.context.git.branch}` : ""}`,
-        peerId: p.id,
-      }));
+      const items = peers.map((p) => {
+        const sourceLabel = p.source === "extension" ? "[ext]" : "[term]";
+        return {
+          label: `${p.agentType} — ${p.id} ${sourceLabel}`,
+          description: p.context.summary || p.cwd,
+          detail: `CWD: ${p.cwd}${p.context.git?.branch ? ` | Branch: ${p.context.git.branch}` : ""}`,
+          peerId: p.id,
+          source: p.source,
+        };
+      });
 
       const selected = await vscode.window.showQuickPick(items, {
         placeHolder: "Select a peer to message",
       });
       if (!selected) return;
+
+      if (selected.source === "extension") {
+        vscode.window.showWarningMessage(
+          "Extension peers cannot receive general messages. Only report replies to task-handoffs are allowed.",
+        );
+        return;
+      }
 
       const message = await vscode.window.showInputBox({
         placeHolder: "Enter your message...",
@@ -264,19 +396,22 @@ export function activate(extensionContext: vscode.ExtensionContext) {
         return;
       }
 
-      const confirm = await vscode.window.showWarningMessage(
-        `Suspend peer "${peerId}" from context sharing?\n\nThe peer's shared context will be cleared. The session itself will remain active.`,
-        { modal: true },
-        "Suspend",
-      );
-      if (confirm !== "Suspend") return;
+      // Suspend functionality has been removed; command kept for compatibility.
+      vscode.window.showInformationMessage("Suspend is no longer available.");
+    }),
 
+    vscode.commands.registerCommand("agentPeers.markReportsRead", async (item?: { peerId?: string; peer?: { id: string } }) => {
+      const peerId = item?.peerId || item?.peer?.id;
+      if (!peerId) {
+        vscode.window.showWarningMessage("No peer selected.");
+        return;
+      }
       try {
-        await brokerClient.suspendPeer(peerId);
-        vscode.window.showInformationMessage(`Peer "${peerId}" suspended. Shared context cleared.`);
+        await brokerClient.markReportsRead(peerId);
         peerListProvider.refresh();
+        updateMessageBadge();
       } catch (e) {
-        vscode.window.showErrorMessage(`Failed to suspend peer: ${e}`);
+        vscode.window.showErrorMessage(`Failed to mark reports as read: ${e}`);
       }
     }),
 
@@ -424,6 +559,13 @@ AGENT_PEERS_AGENT_TYPE = "codex"
       controlProvider.refresh();
     }),
 
+    vscode.commands.registerCommand("agentPeers.toggleAutoDelivery", async () => {
+      const cfg = vscode.workspace.getConfiguration("agentPeers");
+      const current = cfg.get<boolean>("autoDeliveryMessage", true);
+      await cfg.update("autoDeliveryMessage", !current, vscode.ConfigurationTarget.Global);
+      controlProvider.refresh();
+    }),
+
     vscode.commands.registerCommand("agentPeers.configConflictHook", async () => {
       const result = configureConflictHook(extensionContext.extensionUri);
       if (result.configured) {
@@ -435,101 +577,6 @@ AGENT_PEERS_AGENT_TYPE = "codex"
       }
     }),
 
-    vscode.commands.registerCommand("agentPeers.checkMessages", async (item?: { peerId?: string; peer?: { id: string; pid?: number } }) => {
-      const peerId = item?.peerId || item?.peer?.id;
-      if (!peerId) {
-        vscode.window.showWarningMessage("No peer selected.");
-        return;
-      }
-
-      // Get peer info (need PID to locate terminal)
-      const peers = await brokerClient.listPeers("machine");
-      const peer = peers.find(p => p.id === peerId);
-      if (!peer) {
-        vscode.window.showWarningMessage(`Peer "${peerId}" not found.`);
-        return;
-      }
-
-      // Poll unread messages for this peer
-      const poll = await brokerClient.pollMessages(peerId);
-      if (!poll || !poll.found || poll.messages.length === 0) {
-        vscode.window.showInformationMessage(`No pending messages for ${peerId}.`);
-        return;
-      }
-
-      // Build a prompt from all pending messages
-      const promptLines = poll.messages.map(m =>
-        `[Message from ${m.fromId} (${m.type})] ${m.text}`
-      );
-      const prompt = promptLines.join("\n");
-
-      // Deliver via terminal.sendText() — works for terminal-based sessions
-      // (Claude Code in terminal, Codex, etc.)
-      const terminal = await findTerminalForPid(peer.pid);
-      if (terminal) {
-        terminal.sendText(prompt);
-        terminal.show(/* preserveFocus */ true);
-        await brokerClient.markRead(peerId);
-        vscode.window.showInformationMessage(
-          `Injected ${poll.messages.length} message(s) into ${peerId}'s terminal.`,
-        );
-      } else {
-        // No terminal found — this peer is running inside the VSCode extension
-        // (sidebar/editor panel), which cannot receive terminal input.
-        vscode.window.showWarningMessage(
-          `Cannot deliver to ${peerId}: no terminal session found. ` +
-          `This peer is running inside the VSCode extension panel. ` +
-          `Open it in a terminal ("Claude Code: Open in Terminal") to receive messages.`,
-        );
-      }
-
-      peerListProvider.refresh();
-      updateMessageBadge();
-    }),
-
-    vscode.commands.registerCommand("agentPeers.checkAllMessages", async () => {
-      const peers = await brokerClient.listPeers("machine");
-      if (peers.length === 0) {
-        vscode.window.showInformationMessage("No peers found.");
-        return;
-      }
-      let totalDelivered = 0;
-      let deliveredPeerCount = 0;
-      const noTerminalPeers: string[] = [];
-      for (const peer of peers) {
-        const poll = await brokerClient.pollMessages(peer.id);
-        if (!poll || !poll.found || poll.messages.length === 0) continue;
-
-        const promptLines = poll.messages.map(m =>
-          `[Message from ${m.fromId} (${m.type})] ${m.text}`
-        );
-        const prompt = promptLines.join("\n");
-
-        const terminal = await findTerminalForPid(peer.pid);
-        if (terminal) {
-          terminal.sendText(prompt);
-          terminal.show(/* preserveFocus */ true);
-          await brokerClient.markRead(peer.id);
-          totalDelivered += poll.messages.length;
-          deliveredPeerCount++;
-        } else {
-          noTerminalPeers.push(peer.id);
-        }
-      }
-      if (totalDelivered > 0) {
-        vscode.window.showInformationMessage(
-          `Injected ${totalDelivered} message(s) into ${deliveredPeerCount} peer(s)' terminals.`,
-        );
-      } else if (noTerminalPeers.length > 0) {
-        vscode.window.showWarningMessage(
-          `No terminal sessions found for peers with pending messages: ${noTerminalPeers.join(", ")}`,
-        );
-      } else {
-        vscode.window.showInformationMessage("No pending messages for any peer.");
-      }
-      peerListProvider.refresh();
-      updateMessageBadge();
-    }),
   );
 
   // Track broker connection state via WebSocket events
@@ -564,6 +611,11 @@ AGENT_PEERS_AGENT_TYPE = "codex"
   extensionContext.subscriptions.push({
     dispose: () => {
       clearInterval(statusRefreshInterval);
+      // Flush any pending batched deliveries immediately
+      for (const [key, pending] of pendingDeliveries) {
+        clearTimeout(pending.timer);
+        pendingDeliveries.delete(key);
+      }
       brokerClient.dispose();
     },
   });

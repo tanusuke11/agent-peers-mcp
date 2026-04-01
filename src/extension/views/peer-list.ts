@@ -7,7 +7,7 @@
 import * as path from "path";
 import * as vscode from "vscode";
 import type { BrokerClient } from "../broker-client";
-import type { Peer } from "../../shared/types";
+import type { Peer, Message } from "../../shared/types";
 
 export class PeerListProvider implements vscode.TreeDataProvider<PeerItem> {
   private _onDidChangeTreeData = new vscode.EventEmitter<PeerItem | undefined>();
@@ -25,6 +25,30 @@ export class PeerListProvider implements vscode.TreeDataProvider<PeerItem> {
 
   async getChildren(element?: PeerItem): Promise<PeerItem[]> {
     if (element) {
+      // Lazily load report items when a "reports" node is expanded
+      if (element.reportsForPeerId) {
+        const reports = await this.client.listReports(element.reportsForPeerId);
+        return reports.map((r) => {
+          const preview = r.text.length > 80 ? r.text.slice(0, 80) + "…" : r.text;
+          const item = leaf(`${r.fromId}: ${preview}`, undefined, "mail-read", new vscode.ThemeColor("charts.green"));
+          item.tooltip = `[report] from ${r.fromId}\nSent: ${r.sentAt}\n\n${r.text}`;
+          return item;
+        });
+      }
+      // Lazily load unread message items when a "messages" node is expanded
+      if (element.messagesForPeerId) {
+        const messages = await this.client.peekMessages(element.messagesForPeerId);
+        return messages.map((m) => {
+          const preview = m.text.length > 80 ? m.text.slice(0, 80) + "…" : m.text;
+          const icon = m.type === "task-handoff" ? "arrow-swap" : "comment";
+          const color = m.type === "task-handoff"
+            ? new vscode.ThemeColor("charts.red")
+            : new vscode.ThemeColor("charts.blue");
+          const item = leaf(`${m.fromId}: ${preview}`, undefined, icon, color);
+          item.tooltip = `[${m.type}] from ${m.fromId}\nSent: ${m.sentAt}\n\n${m.text}`;
+          return item;
+        });
+      }
       return element.children ?? [];
     }
 
@@ -54,9 +78,10 @@ export class PeerListProvider implements vscode.TreeDataProvider<PeerItem> {
       header.children = group.peers
         .map((p) => {
           const displayType = agentDisplayName(p.agentType);
+          const tag = sourceTag(p.source);
           const label = p.suspended
-            ? `${displayType} (${p.id})`
-            : `${agentEmoji(p.agentType)} ${displayType} (${animalEmoji(p.id)}${p.id})`;
+            ? `${displayType} (${p.id})${tag}`
+            : `${agentEmoji(p.agentType)} ${displayType} (${animalEmoji(p.id)}${p.id})${tag}`;
           return new PeerItem(label, p.id, "peer", p);
         })
         .sort((a, b) => {
@@ -116,18 +141,59 @@ function agentColor(agentType: string): vscode.ThemeColor {
   }
 }
 
-function relativeTime(iso: string): string {
-  const diff = Date.now() - new Date(iso).getTime();
-  if (diff < 0) return "just now";
-  const sec = Math.floor(diff / 1000);
-  if (sec < 10) return "just now";
-  if (sec < 60) return `${sec}s ago`;
-  const min = Math.floor(sec / 60);
-  if (min < 60) return `${min}m ago`;
-  const hr = Math.floor(min / 60);
-  if (hr < 24) return `${hr}h ago`;
-  return `${Math.floor(hr / 24)}d ago`;
+function sourceTag(source: string | undefined): string {
+  return source === "extension" ? " [ext]" : " [term]";
 }
+
+function defaultTitles(peer: Peer): Set<string> {
+  const titles = new Set<string>([path.basename(peer.cwd), "Untitled"]);
+  if (peer.gitRoot) titles.add(path.basename(peer.gitRoot));
+  return titles;
+}
+
+function isInformativeSummary(summary: string | undefined, peer: Peer): boolean {
+  if (!summary) return false;
+  const trimmed = summary.trim();
+  if (!trimmed) return false;
+  return !defaultTitles(peer).has(trimmed);
+}
+
+/**
+ * Returns true if the peer's context was updated recently (within `thresholdMs`).
+ * Uses `context.updatedAt` as the primary signal (set when the agent shares new context),
+ * falling back to `lastSeen` (heartbeat timestamp).
+ */
+function isRecentlyActive(peer: Peer, thresholdMs: number): boolean {
+  const ts = peer.context.updatedAt || peer.lastSeen;
+  if (!ts) return false;
+  const age = Date.now() - new Date(ts).getTime();
+  return age < thresholdMs;
+}
+
+function preferredConversationCue(peer: Peer): string | undefined {
+  const digest = peer.context.conversationDigest?.trim();
+  const summary = peer.context.summary?.trim();
+  if (digest && digest !== summary) return digest;
+  return undefined;
+}
+
+function formatPeerDescription(peer: Peer): string {
+  const parts: string[] = [];
+  const task = peer.context.currentTask?.trim();
+  const summary = peer.context.summary?.trim();
+
+  if (task) parts.push(`🎯 ${task}`);
+
+  if (isInformativeSummary(summary, peer)) {
+    parts.push(summary!);
+  } else {
+    const digest = preferredConversationCue(peer);
+    if (digest) parts.push(digest);
+  }
+
+  return parts.join(" · ");
+}
+
 
 const DIM_COLOR = new vscode.ThemeColor("disabledForeground");
 
@@ -186,23 +252,82 @@ function buildContextItems(peer: Peer): PeerItem[] {
     }
 
     const exchanges = peer.context.recentExchanges ?? [];
-    const chatItem = leaf(
-      `Recent conversation (${exchanges.length})`,
-      undefined,
-      "comment-discussion",
-      new vscode.ThemeColor("charts.foreground"),
-    );
-    chatItem.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
-    chatItem.children = exchanges.map((ex) => {
-      const icon = ex.role === "human" ? "account" : "hubot";
-      const color = ex.role === "human"
-        ? new vscode.ThemeColor("charts.blue")
-        : new vscode.ThemeColor("charts.green");
-      const item = leaf(ex.text, undefined, icon, color);
-      item.tooltip = `[${ex.role}] ${ex.timestamp}\n\n${ex.text}`;
-      return item;
-    });
-    items.push(chatItem);
+    const digest = peer.context.conversationDigest;
+    const chatChildren: PeerItem[] = [];
+
+    // Show AI-generated digest prominently at top
+    if (digest) {
+      const digestItem = leaf(`📋 ${digest}`, undefined, "lightbulb", new vscode.ThemeColor("charts.yellow"));
+      digestItem.tooltip = `Conversation digest:\n\n${digest}`;
+      chatChildren.push(digestItem);
+    }
+
+    // Raw exchanges beneath, grouped as a collapsible sub-tree
+    if (exchanges.length > 0) {
+      const rawItem = leaf(
+        `Recent Context (${exchanges.length})`,
+        undefined,
+        "history",
+        new vscode.ThemeColor("charts.foreground"),
+      );
+      rawItem.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
+      rawItem.children = exchanges.map((ex) => {
+        const icon = ex.role === "human" ? "account" : "hubot";
+        const color = ex.role === "human"
+          ? new vscode.ThemeColor("charts.blue")
+          : new vscode.ThemeColor("charts.green");
+        const item = leaf(ex.text, undefined, icon, color);
+        item.tooltip = `[${ex.role}] ${ex.timestamp}\n\n${ex.text}`;
+        return item;
+      });
+      chatChildren.push(rawItem);
+    }
+
+    if (chatChildren.length === 1) {
+      items.push(chatChildren[0]!);
+    } else if (chatChildren.length > 1) {
+      const chatItem = leaf(
+        "Conversation",
+        undefined,
+        "comment-discussion",
+        new vscode.ThemeColor("charts.foreground"),
+      );
+      chatItem.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
+      chatItem.children = chatChildren;
+      items.push(chatItem);
+    }
+
+    // Messages subtree — lazily loaded when expanded
+    const messageCount = peer.pendingMessages ?? 0;
+    if (messageCount > 0) {
+      const messagesItem = new PeerItem(
+        `💬 Messages (${messageCount} unread)`,
+        peer.id,
+        "detail",
+        undefined,
+        "mail",
+        new vscode.ThemeColor("notificationsInfoIcon.foreground"),
+      );
+      messagesItem.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
+      messagesItem.messagesForPeerId = peer.id;
+      items.push(messagesItem);
+    }
+
+    // Reports subtree — lazily loaded when expanded
+    const reportCount = peer.pendingReports ?? 0;
+    if (reportCount > 0) {
+      const reportsItem = new PeerItem(
+        `📨 Reports (${reportCount} unread)`,
+        peer.id,
+        "detail",
+        undefined,
+        "inbox",
+        new vscode.ThemeColor("charts.orange"),
+      );
+      reportsItem.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
+      reportsItem.reportsForPeerId = peer.id;
+      items.push(reportsItem);
+    }
   }
 
   return items;
@@ -219,6 +344,10 @@ function leaf(label: string, value: string | undefined, iconId: string, iconColo
 
 class PeerItem extends vscode.TreeItem {
   children?: PeerItem[];
+  /** When set, getChildren will lazily fetch reports for this peer ID */
+  reportsForPeerId?: string;
+  /** When set, getChildren will lazily fetch unread messages for this peer ID */
+  messagesForPeerId?: string;
 
   static projectHeader(projectName: string, peerCount: number): PeerItem {
     const item = new PeerItem(projectName, "", "header");
@@ -245,17 +374,27 @@ class PeerItem extends vscode.TreeItem {
 
       if (isSuspended) {
         this.description = "(suspended)";
-        this.contextValue = "peerSuspended";
         this.iconPath = new vscode.ThemeIcon("circle-outline", DIM_COLOR);
       } else {
-        const summary = peer.context.summary && peer.context.summary !== "Untitled" ? peer.context.summary : "";
-        const ago = relativeTime(peer.context.updatedAt || peer.registeredAt);
+        const summary = peer.context.summary ?? "";
+        const task = peer.context.currentTask ?? "";
         const pending = peer.pendingMessages ?? 0;
-        const pendingBadge = pending > 0 ? ` 💬${pending}` : "";
-        this.description = summary ? `${summary} · ${ago}${pendingBadge}` : `${ago}${pendingBadge}`;
-        this.contextValue = pending > 0 ? "peerHasMessages" : "peerActive";
-        if (pending > 0) {
+        const reports = peer.pendingReports ?? 0;
+        let description = formatPeerDescription(peer);
+        if (pending > 0) description += ` 💬${pending}`;
+        if (reports > 0) description += ` 📨${reports}`;
+        if (description) this.description = description;
+        this.contextValue = "peer";
+        const hasInformativeSummary = isInformativeSummary(summary, peer);
+        const hasConversationCue = !!preferredConversationCue(peer);
+        const recentlyActive = isRecentlyActive(peer, 2 * 60_000);
+        const isWorking = !!task || hasInformativeSummary || hasConversationCue || recentlyActive;
+        if (reports > 0) {
+          this.iconPath = new vscode.ThemeIcon("inbox", new vscode.ThemeColor("notificationsInfoIcon.foreground"));
+        } else if (pending > 0) {
           this.iconPath = new vscode.ThemeIcon("mail", new vscode.ThemeColor("notificationsInfoIcon.foreground"));
+        } else if (isWorking) {
+          this.iconPath = new vscode.ThemeIcon("sync~spin", agentColor(peer.agentType));
         } else {
           this.iconPath = new vscode.ThemeIcon("circle-filled", agentColor(peer.agentType));
         }
@@ -280,9 +419,12 @@ class PeerItem extends vscode.TreeItem {
     const parts = [
       `**${p.agentType}** — \`${p.id}\``,
       `- Status: ${p.suspended ? "Suspended" : "Active"}`,
+      `- Source: ${p.source === "extension" ? "VSCode extension" : "Terminal (MCP)"}`,
       `- CWD: \`${p.cwd}\``,
     ];
-    if (p.context.summary) parts.push(`- Summary: ${p.context.summary}`);
+    if (isInformativeSummary(p.context.summary, p)) parts.push(`- Summary: ${p.context.summary}`);
+    const digest = preferredConversationCue(p);
+    if (digest) parts.push(`- Digest: ${digest}`);
     if (p.context.currentTask) parts.push(`- Task: ${p.context.currentTask}`);
     if (p.context.git?.branch) parts.push(`- Branch: \`${p.context.git.branch}\``);
     if (p.context.activeFiles?.length) {

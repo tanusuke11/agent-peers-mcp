@@ -63,6 +63,7 @@ function messageTypeIcon(type: string): string {
     case "context-request": return "📋";
     case "context-response": return "📄";
     case "task-handoff": return "🔄";
+    case "report": return "📨";
     default: return "💬";
   }
 }
@@ -73,6 +74,7 @@ function messageThemeIcon(type: string): string {
     case "context-request": return "search";
     case "context-response": return "file-code";
     case "task-handoff": return "arrow-swap";
+    case "report": return "inbox";
     default: return "comment";
   }
 }
@@ -83,6 +85,7 @@ function messageThemeColor(type: string): vscode.ThemeColor {
     case "context-request": return new vscode.ThemeColor("charts.yellow");
     case "context-response": return new vscode.ThemeColor("charts.green");
     case "task-handoff": return new vscode.ThemeColor("charts.red");
+    case "report": return new vscode.ThemeColor("charts.orange");
     default: return new vscode.ThemeColor("charts.foreground");
   }
 }

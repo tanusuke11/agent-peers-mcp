@@ -71,6 +71,8 @@ export interface AgentContext {
   taskIntent?: TaskIntent;
   /** Recent conversation exchanges (truncated, last N turns) */
   recentExchanges?: RecentExchange[];
+  /** AI-generated 1-2 sentence digest of the recent conversation */
+  conversationDigest?: string;
   /** Key-value metadata (extensible) */
   metadata?: Record<string, string>;
   /** Timestamp when context was last updated */
@@ -105,11 +107,13 @@ export interface Peer {
   suspended?: boolean;
   /** Number of undelivered messages waiting for this peer */
   pendingMessages?: number;
+  /** Number of unread report messages for this peer (replies to task-handoffs) */
+  pendingReports?: number;
 }
 
 // ─── Messages ──────────────────────────────────────────────────
 
-export type MessageType = "text" | "context-request" | "context-response" | "task-handoff";
+export type MessageType = "text" | "context-request" | "context-response" | "task-handoff" | "report";
 
 export interface Message {
   id: number;
@@ -119,6 +123,8 @@ export interface Message {
   text: string;
   /** Structured payload (e.g. context snapshot for context-response) */
   payload?: Record<string, unknown>;
+  /** ID of the message this is a reply to (used by "report" type to link to original task-handoff) */
+  replyTo?: number;
   sentAt: string;
   delivered: boolean;
 }
@@ -164,6 +170,29 @@ export interface SendMessageRequest {
   type: MessageType;
   text: string;
   payload?: Record<string, unknown>;
+  /** ID of the message this is a reply to (used by "report" type to link to original task-handoff) */
+  replyTo?: number;
+  /** When true, skip duplicate task-handoff detection and send anyway */
+  force?: boolean;
+}
+
+/** A duplicate task-handoff that was detected */
+export interface DuplicateTaskInfo {
+  /** The peer already working on a similar task */
+  peerId: PeerId;
+  agentType: string;
+  /** That peer's current task or the task-handoff message text */
+  taskDescription: string;
+  /** Why this was flagged as duplicate */
+  reason: string;
+  confidence: "high" | "medium" | "low";
+}
+
+export interface SendMessageResponse {
+  ok: boolean;
+  error?: string;
+  /** Present when a task-handoff was blocked due to duplicates (use force to override) */
+  duplicates?: DuplicateTaskInfo[];
 }
 
 export interface PollMessagesRequest {

@@ -118,15 +118,15 @@
         "category": "Agent Peers"
       },
       {
-        "command": "agentPeers.checkMessages",
-        "title": "Deliver Messages to Terminal",
-        "icon": "$(send)",
+        "command": "agentPeers.toggleAutoDelivery",
+        "title": "Toggle Auto Delivery Message",
+        "icon": "$(debug-pause)",
         "category": "Agent Peers"
       },
       {
-        "command": "agentPeers.checkAllMessages",
-        "title": "Deliver Messages (All Peers)",
-        "icon": "$(send)",
+        "command": "agentPeers.markReportsRead",
+        "title": "Mark Reports as Read",
+        "icon": "$(check-all)",
         "category": "Agent Peers"
       }
     ],
@@ -143,41 +143,8 @@
           "command": "agentPeers.startBroker"
         }
       ],
-      "view/item/context": [
-        {
-          "command": "agentPeers.disconnectPeer",
-          "when": "view == agentPeers.peerList && viewItem =~ /^peer(Active|HasMessages)$/",
-          "group": "inline"
-        },
-        {
-          "command": "agentPeers.disconnectPeer",
-          "when": "view == agentPeers.peerList && viewItem =~ /^peer(Active|HasMessages)$/"
-        },
-        {
-          "command": "agentPeers.connectPeer",
-          "when": "view == agentPeers.peerList && viewItem == peerSuspended",
-          "group": "inline"
-        },
-        {
-          "command": "agentPeers.connectPeer",
-          "when": "view == agentPeers.peerList && viewItem == peerSuspended"
-        },
-        {
-          "command": "agentPeers.checkMessages",
-          "when": "view == agentPeers.peerList && viewItem == peerHasMessages",
-          "group": "inline"
-        },
-        {
-          "command": "agentPeers.checkMessages",
-          "when": "view == agentPeers.peerList && viewItem == peerHasMessages"
-        }
-      ],
+      "view/item/context": [],
       "view/title": [
-        {
-          "command": "agentPeers.checkAllMessages",
-          "when": "view == agentPeers.peerList",
-          "group": "navigation"
-        }
       ]
     },
     "configuration": {
@@ -197,6 +164,11 @@
           "type": "number",
           "default": 1000,
           "description": "Polling interval for messages (milliseconds)"
+        },
+        "agentPeers.autoDeliveryMessage": {
+          "type": "boolean",
+          "default": true,
+          "description": "When enabled, incoming peer messages (text, task-handoff, context-request, etc.) are auto-delivered to the terminal. When disabled, messages are shown as notifications for manual approval before delivery."
         }
       }
     }

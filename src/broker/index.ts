@@ -25,12 +25,14 @@ import type {
   UpdateContextRequest,
   ListPeersRequest,
   SendMessageRequest,
+  SendMessageResponse,
   PollMessagesRequest,
   PollMessagesResponse,
   Peer,
   Message,
   AgentContext,
   TaskIntent,
+  DuplicateTaskInfo,
   BrokerHealthResponse,
   CheckConflictsRequest,
   ConflictResult,
@@ -44,6 +46,7 @@ import type {
 import {
   DEFAULT_BROKER_PORT,
   DEFAULT_WS_PORT,
+  DEFAULT_MAX_MESSAGES_PER_DIRECTION,
   BROKER_DB_PATH,
   STALE_PEER_CLEANUP_MS,
   PEER_TIMEOUT_MS,
@@ -53,6 +56,9 @@ import { terminateProcess } from "../shared/process.ts";
 const PORT = parseInt(process.env.AGENT_PEERS_PORT ?? String(DEFAULT_BROKER_PORT), 10);
 const WS_PORT = parseInt(process.env.AGENT_PEERS_WS_PORT ?? String(DEFAULT_WS_PORT), 10);
 const DB_PATH = process.env.AGENT_PEERS_DB ?? BROKER_DB_PATH;
+const MAX_MESSAGES_PER_DIRECTION = Math.max(1,
+  parseInt(process.env.AGENT_PEERS_MAX_MESSAGES_PER_DIRECTION ?? String(DEFAULT_MAX_MESSAGES_PER_DIRECTION), 10) || DEFAULT_MAX_MESSAGES_PER_DIRECTION,
+);
 const startTime = Date.now();
 
 // ─── Database setup ────────────────────────────────────────────
@@ -91,6 +97,11 @@ try {
 // Migration: add read column to messages (distinguishes "ws-pushed" from "agent-polled")
 try {
   db.exec("ALTER TABLE messages ADD COLUMN read INTEGER NOT NULL DEFAULT 0");
+} catch { /* column already exists */ }
+
+// Migration: add reply_to column (links report messages to original task-handoff)
+try {
+  db.exec("ALTER TABLE messages ADD COLUMN reply_to INTEGER REFERENCES messages(id)");
 } catch { /* column already exists */ }
 
 db.exec(`
@@ -141,14 +152,17 @@ function sendToPeer(peerId: string, event: WsEvent): boolean {
 // ─── Stale peer cleanup ────────────────────────────────────────
 
 function cleanStalePeers() {
-  const peers = db.prepare("SELECT id, pid, last_seen FROM peers").all() as unknown as { id: string; pid: number; last_seen: string }[];
+  const peers = db.prepare("SELECT id, pid, last_seen, suspended FROM peers").all() as unknown as { id: string; pid: number; last_seen: string; suspended: number }[];
   const now = Date.now();
   for (const peer of peers) {
+    // Skip already-suspended peers — they have no active session, so stale checks don't apply
+    if (peer.suspended) continue;
+
     const staleByTime = now - new Date(peer.last_seen).getTime() > PEER_TIMEOUT_MS;
     let deadByPid = false;
     // Only use PID check when the stored PID is not the broker's own PID
     // (MCP peers are registered with process.pid which is always alive)
-    if (peer.pid !== process.pid) {
+    if (peer.pid !== process.pid && peer.pid !== 0) {
       try {
         process.kill(peer.pid, 0);
       } catch {
@@ -156,13 +170,7 @@ function cleanStalePeers() {
       }
     }
     if (staleByTime || deadByPid) {
-      db.prepare("DELETE FROM peers WHERE id = ?").run(peer.id);
-      db.prepare("DELETE FROM messages WHERE to_id = ? OR from_id = ?").run(peer.id, peer.id);
-      broadcast({
-        type: "peer-left",
-        data: { id: peer.id },
-        timestamp: new Date().toISOString(),
-      } satisfies WsPeerLeftEvent);
+      detachPeer(peer.id);
     }
   }
 }
@@ -183,10 +191,11 @@ const deletePeer = db.prepare(`DELETE FROM peers WHERE id = ?`);
 const selectAllPeers = db.prepare(`SELECT * FROM peers`);
 const selectPeersByDirectory = db.prepare(`SELECT * FROM peers WHERE cwd = ?`);
 const selectPeerById = db.prepare(`SELECT * FROM peers WHERE id = ?`);
+const selectMessageById = db.prepare(`SELECT * FROM messages WHERE id = ?`);
 
 const insertMessage = db.prepare(`
-  INSERT INTO messages (from_id, to_id, type, text, payload_json, sent_at, delivered)
-  VALUES (?, ?, ?, ?, ?, ?, 0)
+  INSERT INTO messages (from_id, to_id, type, text, payload_json, sent_at, delivered, reply_to)
+  VALUES (?, ?, ?, ?, ?, ?, 0, ?)
 `);
 const selectUndelivered = db.prepare(`
   SELECT * FROM messages WHERE to_id = ? AND delivered = 0 ORDER BY sent_at ASC
@@ -242,7 +251,9 @@ interface RawPeerRow {
   suspended: number;
 }
 
-const countUndelivered = db.prepare(`SELECT COUNT(*) as cnt FROM messages WHERE to_id = ? AND read = 0`);
+const countUndelivered = db.prepare(`SELECT COUNT(*) as cnt FROM messages WHERE to_id = ? AND read = 0 AND type != 'report'`);
+const countUnreadReports = db.prepare(`SELECT COUNT(*) as cnt FROM messages WHERE to_id = ? AND read = 0 AND type = 'report'`);
+const countPerDirection = db.prepare(`SELECT COUNT(*) as cnt FROM messages WHERE from_id = ? AND to_id = ?`);
 
 function rowToPeer(row: RawPeerRow): Peer {
   const pending = (countUndelivered.get(row.id) as unknown as { cnt: number })?.cnt ?? 0;
@@ -257,9 +268,13 @@ function rowToPeer(row: RawPeerRow): Peer {
     context: JSON.parse(row.context_json) as AgentContext,
     registeredAt: row.registered_at,
     lastSeen: row.last_seen,
-    connected: true,
+    connected: !row.suspended,
     suspended: !!row.suspended,
     pendingMessages: pending > 0 ? pending : undefined,
+    pendingReports: (() => {
+      const cnt = (countUnreadReports.get(row.id) as unknown as { cnt: number })?.cnt ?? 0;
+      return cnt > 0 ? cnt : undefined;
+    })(),
   };
 }
 
@@ -270,6 +285,7 @@ interface RawMessageRow {
   type: string;
   text: string;
   payload_json: string | null;
+  reply_to: number | null;
   sent_at: string;
   delivered: number;
 }
@@ -282,6 +298,7 @@ function rowToMessage(row: RawMessageRow): Message {
     type: row.type as Message["type"],
     text: row.text,
     payload: row.payload_json ? JSON.parse(row.payload_json) : undefined,
+    replyTo: row.reply_to ?? undefined,
     sentAt: row.sent_at,
     delivered: !!row.delivered,
   };
@@ -342,23 +359,52 @@ function clearSessionContext(peer: Peer): void {
 function handleRegister(body: RegisterRequest): RegisterResponse {
   const now = new Date().toISOString();
   const contextJson = JSON.stringify(body.context);
+  const source = body.source ?? "terminal";
 
   // Wrap in a transaction so the read-delete-insert is atomic.
-  // Without this, two processes starting simultaneously (e.g. Codex probing + real session)
-  // can both find no existing peer and both insert, resulting in duplicate registrations.
   db.exec("BEGIN");
   let id: string;
   try {
-    db.prepare("DELETE FROM peers WHERE pid = ?").run(body.pid);
-    const existingIds = new Set((selectAllPeers.all() as unknown as unknown as RawPeerRow[]).map((r) => r.id));
-    // Honor preferredId if provided and not already taken
-    if (body.preferredId && !existingIds.has(body.preferredId)) {
-      id = body.preferredId;
+    // Clean up any existing peer with the same PID (process reuse)
+    db.prepare("DELETE FROM peers WHERE pid = ? AND suspended = 0").run(body.pid);
+
+    // Check if preferredId matches an existing peer we can resume
+    const existingRow = body.preferredId
+      ? (selectPeerById.get(body.preferredId) as unknown as RawPeerRow | undefined)
+      : undefined;
+
+    if (existingRow) {
+      // Resume existing peer: reassign session, unsuspend, update connection info
+      id = existingRow.id;
+      // Merge context: keep existing context but overlay with new session's fresh data
+      const existingContext = JSON.parse(existingRow.context_json) as AgentContext;
+      const mergedContext: AgentContext = {
+        ...existingContext,
+        ...body.context,
+        // Preserve summary from previous session if new one is empty/placeholder
+        summary: (!body.context.summary || body.context.summary === "Untitled") && existingContext.summary
+          ? existingContext.summary
+          : body.context.summary,
+        updatedAt: now,
+      };
+      db.prepare(`
+        UPDATE peers
+        SET pid = ?, cwd = ?, git_root = ?, tty = ?, source = ?,
+            agent_type = ?, context_json = ?, last_seen = ?, suspended = 0
+        WHERE id = ?
+      `).run(body.pid, body.cwd, body.gitRoot, body.tty, source,
+             body.agentType, JSON.stringify(mergedContext), now, id);
+      log(`Peer ${id} resumed (was suspended=${!!existingRow.suspended})`);
     } else {
-      id = generateId(existingIds);
+      // No existing peer to resume — create new one
+      const existingIds = new Set((selectAllPeers.all() as unknown as RawPeerRow[]).map((r) => r.id));
+      if (body.preferredId && !existingIds.has(body.preferredId)) {
+        id = body.preferredId;
+      } else {
+        id = generateId(existingIds);
+      }
+      insertPeer.run(id, body.agentType, source, body.pid, body.cwd, body.gitRoot, body.tty, contextJson, now, now);
     }
-    const source = body.source ?? "terminal";
-    insertPeer.run(id, body.agentType, source, body.pid, body.cwd, body.gitRoot, body.tty, contextJson, now, now);
     db.exec("COMMIT");
   } catch (e) {
     db.exec("ROLLBACK");
@@ -435,14 +481,7 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
     rows = rows.filter((r) => r.id !== body.excludeId);
   }
 
-  // Filter out dead peers
-  const peers = rows
-    .filter((r) => {
-      if (isAlive(r.pid)) return true;
-      deletePeer.run(r.id);
-      return false;
-    })
-    .map(rowToPeer);
+  const peers = rows.map(rowToPeer);
 
   // Deduplicate recentExchanges: when multiple peers report identical conversation
   // histories (caused by MCP servers reading the same session file), keep the
@@ -453,21 +492,133 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
   return peers;
 }
 
-function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: string } {
+// ─── Duplicate task-handoff detection ─────────────────────────
+
+/** Find recent task-handoff messages from this sender that are still unread by recipients */
+const selectRecentTaskHandoffs = db.prepare(`
+  SELECT m.*, p.context_json, p.agent_type
+  FROM messages m
+  JOIN peers p ON p.id = m.to_id
+  WHERE m.from_id = ? AND m.type = 'task-handoff' AND m.read = 0
+  ORDER BY m.sent_at DESC
+  LIMIT 20
+`);
+
+function checkDuplicateTaskHandoff(fromId: string, text: string): DuplicateTaskInfo[] {
+  const duplicates: DuplicateTaskInfo[] = [];
+  const textTokens = extractTokens(text);
+  if (textTokens.length < 2) return duplicates;
+
+  // Check 1: Recent unread task-handoff messages from the same sender
+  const recentHandoffs = selectRecentTaskHandoffs.all(fromId) as unknown as (RawMessageRow & { context_json: string; agent_type: string })[];
+  for (const row of recentHandoffs) {
+    const handoffTokens = extractTokens(row.text);
+    const commonTokens = textTokens.filter(t => handoffTokens.includes(t));
+    if (commonTokens.length < 3) continue;
+
+    const ratio = commonTokens.length / Math.max(textTokens.length, handoffTokens.length);
+    if (ratio < 0.3) continue;
+
+    const confidence = ratio >= 0.6 ? "high" : ratio >= 0.4 ? "medium" : "low";
+    duplicates.push({
+      peerId: row.to_id,
+      agentType: row.agent_type,
+      taskDescription: row.text.slice(0, 200),
+      reason: `Similar task-handoff already sent to ${row.to_id} (shared keywords: ${commonTokens.slice(0, 5).join(", ")})`,
+      confidence,
+    });
+  }
+
+  // Check 2: Peers whose currentTask/taskIntent overlaps with this handoff
+  const allPeers = (selectAllPeers.all() as unknown as RawPeerRow[])
+    .filter(r => r.id !== fromId);
+
+  for (const row of allPeers) {
+    // Skip peers we already flagged from message check
+    if (duplicates.some(d => d.peerId === row.id)) continue;
+
+    const ctx = JSON.parse(row.context_json) as AgentContext;
+    const peerTaskText = [ctx.currentTask, ctx.taskIntent?.description].filter(Boolean).join(" ");
+    if (!peerTaskText) continue;
+
+    const peerTokens = extractTokens(peerTaskText);
+    const commonTokens = textTokens.filter(t => peerTokens.includes(t));
+    if (commonTokens.length < 3) continue;
+
+    const ratio = commonTokens.length / Math.max(textTokens.length, peerTokens.length);
+    if (ratio < 0.3) continue;
+
+    const confidence = ratio >= 0.6 ? "high" : ratio >= 0.4 ? "medium" : "low";
+    duplicates.push({
+      peerId: row.id,
+      agentType: row.agent_type,
+      taskDescription: (ctx.currentTask ?? ctx.taskIntent?.description ?? "").slice(0, 200),
+      reason: `Peer is already working on similar task (shared keywords: ${commonTokens.slice(0, 5).join(", ")})`,
+      confidence,
+    });
+  }
+
+  return duplicates;
+}
+
+function handleSendMessage(body: SendMessageRequest): SendMessageResponse {
   const target = selectPeerById.get(body.toId) as unknown as RawPeerRow | undefined;
   if (!target) {
     return { ok: false, error: `Peer ${body.toId} not found` };
   }
 
-  // Only allow sending messages to terminal peers; block extension peers
+  // Extension peers do not accept general messages.
+  // The only allowed inbound message is a report that is explicitly linked
+  // to a prior task-handoff sent by that extension peer.
   const targetSource = target.source ?? "terminal";
   if (targetSource !== "terminal") {
-    return { ok: false, error: `Cannot send messages to ${targetSource} peer ${body.toId}. Only terminal peers accept messages.` };
+    if (body.type !== "report") {
+      return { ok: false, error: `Cannot send ${body.type} messages to ${targetSource} peer ${body.toId}. Extension peers only accept report replies to prior task-handoffs.` };
+    }
+
+    if (!body.replyTo) {
+      return { ok: false, error: `Report to ${targetSource} peer ${body.toId} must include replyTo for the original task-handoff.` };
+    }
+
+    const original = selectMessageById.get(body.replyTo) as unknown as RawMessageRow | undefined;
+    if (!original) {
+      return { ok: false, error: `Original message ${body.replyTo} not found.` };
+    }
+
+    if (original.type !== "task-handoff") {
+      return { ok: false, error: `replyTo ${body.replyTo} must reference a task-handoff when sending a report to an extension peer.` };
+    }
+
+    if (original.from_id !== body.toId || original.to_id !== body.fromId) {
+      return { ok: false, error: `Report to extension peer ${body.toId} must reply to a task-handoff originally sent from that peer to ${body.fromId}.` };
+    }
+  }
+
+  // Duplicate task-handoff detection (skip if force flag is set)
+  if (body.type === "task-handoff" && !body.force) {
+    const duplicates = checkDuplicateTaskHandoff(body.fromId, body.text);
+    if (duplicates.length > 0) {
+      return {
+        ok: false,
+        error: `Duplicate task detected: similar work is already assigned or in progress. Use force=true to send anyway.`,
+        duplicates,
+      };
+    }
+  }
+
+  // Enforce per-direction message limit
+  const dirCount = (countPerDirection.get(body.fromId, body.toId) as unknown as { cnt: number }).cnt;
+  if (dirCount >= MAX_MESSAGES_PER_DIRECTION) {
+    return {
+      ok: false,
+      error: `Message limit reached: ${body.fromId} → ${body.toId} already has ${dirCount} messages (max ${MAX_MESSAGES_PER_DIRECTION}). Set AGENT_PEERS_MAX_MESSAGES_PER_DIRECTION to adjust.`,
+    };
   }
 
   const now = new Date().toISOString();
   const payloadJson = body.payload ? JSON.stringify(body.payload) : null;
-  insertMessage.run(body.fromId, body.toId, body.type, body.text, payloadJson, now);
+  const replyTo = body.replyTo ?? null;
+  insertMessage.run(body.fromId, body.toId, body.type, body.text, payloadJson, now, replyTo);
 
   // Get the inserted message
   const lastId = db.prepare("SELECT last_insert_rowid() as id").get() as unknown as { id: number };
@@ -480,17 +631,29 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
     timestamp: now,
   } satisfies WsMessageEvent;
 
-  // Try targeted delivery to the recipient peer via WS
-  const delivered = sendToPeer(body.toId, event);
-  if (delivered) {
-    markDelivered.run(msgRow.id);
-  }
+  if (body.type === "report") {
+    // Reports are NOT delivered to the recipient's terminal.
+    // They accumulate silently — only broadcast to anonymous WS clients (extension UI)
+    // so the sidebar can refresh and show report badges.
+    const broadcastJson = JSON.stringify(event);
+    for (const ws of wsClients) {
+      if (ws.readyState === WebSocket.OPEN) {
+        try { ws.send(broadcastJson); } catch { wsClients.delete(ws); }
+      }
+    }
+  } else {
+    // Normal messages: try targeted delivery to the recipient peer via WS
+    const delivered = sendToPeer(body.toId, event);
+    if (delivered) {
+      markDelivered.run(msgRow.id);
+    }
 
-  // Also broadcast to anonymous clients (VSCode extension UI etc.)
-  const broadcastJson = JSON.stringify(event);
-  for (const ws of wsClients) {
-    if (ws.readyState === WebSocket.OPEN) {
-      try { ws.send(broadcastJson); } catch { wsClients.delete(ws); }
+    // Also broadcast to anonymous clients (VSCode extension UI etc.)
+    const broadcastJson = JSON.stringify(event);
+    for (const ws of wsClients) {
+      if (ws.readyState === WebSocket.OPEN) {
+        try { ws.send(broadcastJson); } catch { wsClients.delete(ws); }
+      }
     }
   }
 
@@ -538,6 +701,22 @@ function handleMarkRead(body: { id: string }): { ok: boolean; marked: number } {
   return { ok: true, marked: rows.length };
 }
 
+/** Detach a session from a peer: mark suspended, clear PID, but keep data & messages. */
+function detachPeer(id: string): void {
+  const row = selectPeerById.get(id) as unknown as RawPeerRow | undefined;
+  if (!row) return;
+  if (row.suspended) return; // already detached
+  db.prepare("UPDATE peers SET suspended = 1, pid = 0 WHERE id = ?").run(id);
+  const now = new Date().toISOString();
+  broadcast({
+    type: "context-updated",
+    data: { id, context: { ...JSON.parse(row.context_json), updatedAt: now } },
+    timestamp: now,
+  } satisfies WsContextUpdatedEvent);
+  log(`Peer ${id} detached (suspended)`);
+}
+
+/** Hard-remove a peer and its messages (used by purge only). */
 function removePeer(id: string): void {
   const row = selectPeerById.get(id) as unknown as RawPeerRow | undefined;
   if (!row) return;
@@ -551,40 +730,28 @@ function removePeer(id: string): void {
 }
 
 function handleUnregister(body: { id: string }): void {
-  removePeer(body.id);
+  detachPeer(body.id);
 }
 
 function handleSuspendPeer(body: { id: string }): { ok: boolean } {
   const row = selectPeerById.get(body.id) as unknown as RawPeerRow | undefined;
   if (!row) return { ok: false };
-
-  // Clear context and mark as suspended
-  const emptyContext: AgentContext = { summary: "", activeFiles: [], git: null, updatedAt: new Date().toISOString() };
-  const now = new Date().toISOString();
-  db.prepare("UPDATE peers SET suspended = 1, context_json = ?, last_seen = ? WHERE id = ?").run(JSON.stringify(emptyContext), now, body.id);
-
-  broadcast({
-    type: "context-updated",
-    data: { id: body.id, context: emptyContext },
-    timestamp: now,
-  } satisfies WsContextUpdatedEvent);
-
+  detachPeer(body.id);
   return { ok: true };
 }
 
 function handleResumePeer(body: { id: string }): { ok: boolean } {
   const row = selectPeerById.get(body.id) as unknown as RawPeerRow | undefined;
   if (!row) return { ok: false };
-
-  const now = new Date().toISOString();
-  db.prepare("UPDATE peers SET suspended = 0, last_seen = ? WHERE id = ?").run(now, body.id);
-
+  if (!row.suspended) return { ok: true }; // already active
+  db.prepare("UPDATE peers SET suspended = 0, last_seen = ? WHERE id = ?").run(new Date().toISOString(), body.id);
+  const peer = rowToPeer(selectPeerById.get(body.id) as unknown as RawPeerRow);
   broadcast({
-    type: "context-updated",
-    data: { id: body.id, context: JSON.parse(row.context_json) },
-    timestamp: now,
-  } satisfies WsContextUpdatedEvent);
-
+    type: "peer-joined",
+    data: peer,
+    timestamp: new Date().toISOString(),
+  } satisfies WsPeerJoinedEvent);
+  log(`Peer ${body.id} resumed`);
   return { ok: true };
 }
 
@@ -601,22 +768,21 @@ function handlePurge(): { purged: number } {
   return { purged: peers.length };
 }
 
-function handleCleanup(): { removed: number; remaining: number } {
+function handleCleanup(): { suspended: number; remaining: number } {
   const peers = selectAllPeers.all() as unknown as RawPeerRow[];
-  let removed = 0;
+  let suspended = 0;
   for (const peer of peers) {
+    if (peer.suspended) continue; // already suspended
     let dead = false;
-    if (peer.pid !== process.pid) {
+    if (peer.pid !== process.pid && peer.pid !== 0) {
       try { process.kill(peer.pid, 0); } catch { dead = true; }
     }
     if (dead) {
-      db.prepare("DELETE FROM peers WHERE id = ?").run(peer.id);
-      db.prepare("DELETE FROM messages WHERE to_id = ? AND delivered = 0").run(peer.id);
-      broadcast({ type: "peer-left", data: { id: peer.id }, timestamp: new Date().toISOString() } satisfies WsPeerLeftEvent);
-      removed++;
+      detachPeer(peer.id);
+      suspended++;
     }
   }
-  return { removed, remaining: (selectAllPeers.all() as unknown as RawPeerRow[]).length };
+  return { suspended, remaining: (selectAllPeers.all() as unknown as RawPeerRow[]).length };
 }
 
 // ─── Conflict detection ──────────────────────────────────────
@@ -642,7 +808,6 @@ function extractTokens(text: string): string[] {
 function handleCheckConflicts(body: CheckConflictsRequest): CheckConflictsResponse {
   const rows = (selectAllPeers.all() as unknown as RawPeerRow[])
     .filter(r => r.id !== body.callerId)
-    .filter(r => !r.suspended)
     .filter(r => body.gitRoot ? r.git_root === body.gitRoot : false);
 
   const conflicts: ConflictResult[] = [];
@@ -699,6 +864,24 @@ function handleCheckConflicts(body: CheckConflictsRequest): CheckConflictsRespon
   }
 
   return { conflicts };
+}
+
+/** List report messages for a peer (reports sent TO this peer). */
+function handleListReports(body: { id: string; unreadOnly?: boolean }): { reports: Message[] } {
+  const query = body.unreadOnly
+    ? db.prepare("SELECT * FROM messages WHERE to_id = ? AND type = 'report' AND read = 0 ORDER BY sent_at ASC")
+    : db.prepare("SELECT * FROM messages WHERE to_id = ? AND type = 'report' ORDER BY sent_at ASC");
+  const rows = query.all(body.id) as unknown as RawMessageRow[];
+  return { reports: rows.map(rowToMessage) };
+}
+
+/** Mark report messages as read for a peer. */
+function handleMarkReportsRead(body: { id: string }): { ok: boolean; marked: number } {
+  const rows = db.prepare("SELECT * FROM messages WHERE to_id = ? AND type = 'report' AND read = 0").all(body.id) as unknown as RawMessageRow[];
+  for (const row of rows) {
+    markRead.run(row.id);
+  }
+  return { ok: true, marked: rows.length };
 }
 
 function handleWakePeer(body: { id: string }): { ok: boolean; delivered: number } {
@@ -803,6 +986,12 @@ async function handleRequest(req: Request): Promise<Response> {
       case "/check-conflicts":
         result = handleCheckConflicts(body as CheckConflictsRequest);
         break;
+      case "/list-reports":
+        result = handleListReports(body as { id: string; unreadOnly?: boolean });
+        break;
+      case "/mark-reports-read":
+        result = handleMarkReportsRead(body as { id: string });
+        break;
       case "/wake-peer":
         result = handleWakePeer(body as { id: string });
         break;
@@ -899,8 +1088,8 @@ wss.on("connection", (ws) => {
     wsClients.delete(ws);
     if (identifiedPeerId) {
       wsPeerClients.delete(identifiedPeerId);
-      // Peer WS disconnected — remove from DB immediately
-      removePeer(identifiedPeerId);
+      // Peer WS disconnected — detach (suspend) instead of deleting
+      detachPeer(identifiedPeerId);
     }
     log(`WebSocket client disconnected (anonymous: ${wsClients.size}, peers: ${wsPeerClients.size})`);
   });
@@ -909,7 +1098,7 @@ wss.on("connection", (ws) => {
     wsClients.delete(ws);
     if (identifiedPeerId) {
       wsPeerClients.delete(identifiedPeerId);
-      removePeer(identifiedPeerId);
+      detachPeer(identifiedPeerId);
     }
   });
 });

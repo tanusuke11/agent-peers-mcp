@@ -145,6 +145,30 @@ export class BrokerClient {
     } catch { /* best effort */ }
   }
 
+  async peekMessages(id: string): Promise<Message[]> {
+    try {
+      const result = await this.post<{ found: boolean; messages: Message[] }>("/peek-messages", { id });
+      return result.messages;
+    } catch {
+      return [];
+    }
+  }
+
+  async listReports(id: string, unreadOnly = false): Promise<Message[]> {
+    try {
+      const result = await this.post<{ reports: Message[] }>("/list-reports", { id, unreadOnly });
+      return result.reports;
+    } catch {
+      return [];
+    }
+  }
+
+  async markReportsRead(id: string): Promise<void> {
+    try {
+      await this.post("/mark-reports-read", { id });
+    } catch { /* best effort */ }
+  }
+
   async purge(): Promise<{ purged: number } | null> {
     try {
       return await this.post<{ purged: number }>("/purge", {});

@@ -16,6 +16,7 @@
  * Environment:
  *   AGENT_PEERS_AGENT_TYPE  — "claude-code" | "codex" | "generic"
  *   AGENT_PEERS_PORT        — broker HTTP port (default 7899)
+ *   AGENT_PEERS_MAX_MESSAGES_PER_DIRECTION — max messages from A→B (default 50, min 1)
  */
 
 import { spawn } from "child_process";
@@ -41,6 +42,8 @@ import type {
   GitContext,
   CheckConflictsResponse,
   ConflictResult,
+  SendMessageResponse,
+  DuplicateTaskInfo,
 } from "../shared/types.ts";
 import path from "path";
 import WebSocket from "ws";
@@ -179,8 +182,11 @@ function findSessionFile(): string | null {
 
 function findSessionFileUncached(): string | null {
   try {
-    // Resolve session ID once and cache it (process tree won't change).
-    if (cachedSessionId === undefined) {
+    // Resolve session ID from process tree.  The process tree itself won't
+    // change, but the session metadata file (~/.claude/sessions/<pid>.json) may
+    // not exist yet at startup (Claude Code writes it lazily).  So we retry on
+    // each call until we get a non-null result, then cache permanently.
+    if (!cachedSessionId) {
       cachedSessionId = resolveSessionId();
     }
 
@@ -304,6 +310,69 @@ function getRecentExchanges(): import("../shared/types.ts").RecentExchange[] {
 
     return exchanges.slice(-EXCHANGE_MAX_COUNT);
   } catch { return []; }
+}
+
+// ─── Conversation Digest (AI-generated summary) ─────────────
+
+const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
+const DIGEST_MODEL = "claude-haiku-4-5-20251001";
+
+/**
+ * Generate a 1-2 sentence digest of recent conversation exchanges using the
+ * Anthropic Messages API (Haiku for low cost/latency).  Returns null if no
+ * API key is configured or the call fails — callers should treat this as a
+ * best-effort enrichment.
+ */
+async function generateConversationDigest(
+  exchanges: import("../shared/types.ts").RecentExchange[],
+): Promise<string | null> {
+  if (exchanges.length === 0) return null;
+
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return null;
+
+  const conversation = exchanges
+    .map((ex) => `[${ex.role}] ${ex.text}`)
+    .join("\n");
+
+  try {
+    const res = await fetch(ANTHROPIC_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: DIGEST_MODEL,
+        max_tokens: 150,
+        messages: [
+          {
+            role: "user",
+            content: `Summarize this AI agent conversation in 1-2 concise sentences. Focus on what was decided, what is being worked on, and any key outcomes. Write in the same language as the conversation.\n\n${conversation}`,
+          },
+        ],
+      }),
+      signal: AbortSignal.timeout(5000),
+    });
+
+    if (!res.ok) {
+      log(`Digest API error: ${res.status}`);
+      return null;
+    }
+
+    const data = (await res.json()) as {
+      content?: Array<{ type: string; text?: string }>;
+    };
+    const text = data.content
+      ?.filter((b) => b.type === "text")
+      .map((b) => b.text ?? "")
+      .join("");
+    return text || null;
+  } catch (err) {
+    log(`Digest generation failed: ${err}`);
+    return null;
+  }
 }
 
 // ─── Task Intent computation ────────────────────────────────
@@ -456,19 +525,30 @@ mcp.registerTool("list_peers", {
 });
 
 mcp.registerTool("send_message", {
-  description: "Send a message to another AI agent instance. Supports types: 'text' (general), 'context-request' (ask for context), 'task-handoff' (delegate a task).",
+  description: "Send a message to another AI agent instance. Supports types: 'text' (general), 'context-request' (ask for context), 'task-handoff' (delegate a task), 'report' (reply to a task-handoff with a work report — NOT delivered to the requester's terminal, only visible in their UI). Extension peers do not accept general messages, but they do accept 'report' messages when reply_to points to their original task-handoff. For task-handoff, the broker checks for duplicate/similar tasks already in progress and blocks if found — use force=true to override.",
   inputSchema: {
     to_id: z.string().describe("The peer ID of the target agent (from list_peers)"),
     message: z.string().describe("The message text"),
-    type: z.enum(["text", "context-request", "task-handoff"]).optional().describe("Message type (default: text)"),
+    type: z.enum(["text", "context-request", "task-handoff", "report"]).optional().describe("Message type (default: text). Use 'report' to reply to a task-handoff with a work report."),
+    reply_to: z.number().optional().describe("Message ID this is a reply to (used with type='report' to link back to original task-handoff; required when sending a report to an extension peer)"),
+    force: z.boolean().optional().describe("Force send even if duplicate task-handoff is detected (default: false)"),
   },
-}, async ({ to_id, message, type: msgType }) => {
+}, async ({ to_id, message, type: msgType, reply_to, force }) => {
   if (!myId) return { content: [{ type: "text" as const, text: "Not registered yet" }], isError: true };
   try {
-    const result = await brokerFetch<{ ok: boolean; error?: string }>("/send-message", {
-      fromId: myId, toId: to_id, type: (msgType ?? "text") as MessageType, text: message,
+    const result = await brokerFetch<SendMessageResponse>("/send-message", {
+      fromId: myId, toId: to_id, type: (msgType ?? "text") as MessageType, text: message, replyTo: reply_to, force: !!force,
     });
-    if (!result.ok) return { content: [{ type: "text" as const, text: `Failed: ${result.error}` }], isError: true };
+    if (!result.ok) {
+      // Format duplicate task warnings
+      if (result.duplicates && result.duplicates.length > 0) {
+        const lines = result.duplicates.map((d: DuplicateTaskInfo) =>
+          `⚠ ${d.peerId} (${d.agentType}): "${d.taskDescription}"\n  → ${d.reason} [${d.confidence}]`
+        );
+        return { content: [{ type: "text" as const, text: `Blocked: duplicate task-handoff detected.\n\n${lines.join("\n\n")}\n\nTo send anyway, set force=true.` }], isError: true };
+      }
+      return { content: [{ type: "text" as const, text: `Failed: ${result.error}` }], isError: true };
+    }
     return { content: [{ type: "text" as const, text: `Message sent to peer ${to_id}` }] };
   } catch (e) {
     return { content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
@@ -550,6 +630,9 @@ mcp.registerTool("request_context", {
       if (ctx.git.modifiedFiles?.length) parts.push(`Modified files:\n  ${ctx.git.modifiedFiles.join("\n  ")}`);
       if (ctx.git.stagedFiles?.length) parts.push(`Staged files:\n  ${ctx.git.stagedFiles.join("\n  ")}`);
       if (ctx.git.diff) parts.push(`Diff summary:\n${ctx.git.diff}`);
+    }
+    if (ctx.conversationDigest) {
+      parts.push(`\nConversation digest: ${ctx.conversationDigest}`);
     }
     if (ctx.recentExchanges?.length) {
       parts.push(`\nRecent conversation (last ${ctx.recentExchanges.length} exchanges):`);
@@ -756,7 +839,7 @@ async function registerWithBroker(): Promise<void> {
   if (gitCtx) {
     gitCtx.baselineModifiedFiles = baselineModifiedFiles;
   }
-  const initialSummary = "Untitled";
+  const initialSummary = "";
   const context: AgentContext = {
     summary: initialSummary,
     activeFiles: [],
@@ -825,19 +908,8 @@ async function main() {
       }
     }, 5000);
   } else {
-    // For other agents (e.g., Codex), set a reasonable summary once after startup.
-    const desiredTitle = myGitRoot ? path.basename(myGitRoot) : path.basename(myCwd);
-    const setOnce = async () => {
-      if (!myId || !desiredTitle || desiredTitle === "home" || desiredTitle === "Untitled") return;
-      try {
-        cachedSessionTitle = desiredTitle;
-        await brokerFetch("/update-context", { id: myId, context: { summary: desiredTitle } });
-        log(`Session title set (auto): ${desiredTitle}`);
-      } catch {
-        /* non-critical */
-      }
-    };
-    setTimeout(setOnce, 3000);
+    // Non-Claude agents: summary stays empty until the agent calls set_summary
+    // with actual work content. Do NOT auto-set repo/cwd name as summary.
   }
 
   // Watch .git/HEAD for instant branch-change detection
@@ -902,12 +974,21 @@ async function main() {
         contextUpdate.git = gitCtx;
       }
 
-      // Update recent exchanges (only if changed)
+      // Update recent exchanges (only if changed) and regenerate digest
       const exchanges = getRecentExchanges();
       const exchangesJson = JSON.stringify(exchanges);
       if (exchangesJson !== lastExchangesJson) {
         lastExchangesJson = exchangesJson;
         contextUpdate.recentExchanges = exchanges;
+        // Generate digest asynchronously — don't block heartbeat
+        generateConversationDigest(exchanges).then((digest) => {
+          if (digest && myId) {
+            brokerFetch("/update-context", {
+              id: myId,
+              context: { conversationDigest: digest },
+            }).catch((err) => log(`Failed to push digest: ${err}`));
+          }
+        });
       }
 
       // Update taskIntent (only if changed)
@@ -958,7 +1039,7 @@ async function main() {
     gitWatcher?.close();
     clearInterval(parentWatchTimer);
     if (myId) {
-      try { await brokerFetch("/unregister", { id: myId }); log("Unregistered"); } catch { /* */ }
+      try { await brokerFetch("/suspend-peer", { id: myId }); log("Suspended (session detached)"); } catch { /* */ }
     }
     process.exit(0);
   };

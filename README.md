@@ -99,7 +99,7 @@ claude --dangerously-skip-permissions --dangerously-load-development-channels se
 | Tool | Description |
 |------|-------------|
 | `list_peers` | Discover all AI agent instances (scope: machine/directory/repo) |
-| `send_message` | Send text, context-request, or task-handoff messages |
+| `send_message` | Send text, context-request, task-handoff, or report messages (extension peers accept only report replies to prior task-handoffs) |
 | `share_context` | Publish your structured context (files, git, task) |
 | `request_context` | Get another peer's full structured context |
 | `set_summary` | Set a brief summary of your current work |

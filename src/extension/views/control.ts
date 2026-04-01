@@ -33,6 +33,15 @@ export class ControlProvider implements vscode.TreeDataProvider<ControlItem> {
       autoStart ? "ON" : "OFF",
     ));
 
+    // Auto delivery message toggle
+    const autoDeliver = vscode.workspace.getConfiguration("agentPeers").get<boolean>("autoDeliveryMessage", true);
+    items.push(ControlItem.action(
+      "Auto Delivery Message", "agentPeers.toggleAutoDelivery",
+      autoDeliver ? "pass-filled" : "circle-large-outline",
+      autoDeliver ? "charts.green" : "disabledForeground",
+      autoDeliver ? "ON — auto-delivered" : "OFF — messages held for review",
+    ));
+
     // Broker actions — disable the irrelevant one based on state
     const status = this.brokerConnected ? "Broker is running" : "Broker is stopped";
     items.push(ControlItem.action(

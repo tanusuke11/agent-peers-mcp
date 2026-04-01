@@ -3,6 +3,7 @@
  * Shows structured context from all peers: active files, git state, tasks
  */
 
+import * as path from "path";
 import * as vscode from "vscode";
 import type { BrokerClient } from "../broker-client";
 import type { Peer } from "../../shared/types";
@@ -30,8 +31,8 @@ export class ContextProvider implements vscode.TreeDataProvider<ContextItem> {
     const peers = await this.client.listPeers("repo");
 
     const contextPeers = peers
-      .filter((p) => !p.suspended && p.connected !== false)
-      .filter((p) => p.context.summary || p.context.activeFiles?.length || p.context.git);
+      .filter((p) => p.connected !== false)
+      .filter((p) => isInformativeSummary(p.context.summary, p) || p.context.activeFiles?.length || p.context.git);
 
     const header = ContextItem.projectHeader(projectName, peers.length);
     return [header, ...contextPeers.map((p) => this.buildPeerContextItem(p))];
@@ -41,14 +42,15 @@ export class ContextProvider implements vscode.TreeDataProvider<ContextItem> {
     const label = `${agentIcon(peer.agentType)} ${peer.agentType} (${peer.id})`;
     const color = agentColor(peer.agentType);
     const item = new ContextItem(label, "symbol-namespace", color);
-    item.description = peer.context.summary || "";
+    const summary = isInformativeSummary(peer.context.summary, peer) ? peer.context.summary! : "";
+    item.description = summary;
     item.collapsibleState = vscode.TreeItemCollapsibleState.Expanded;
 
     const children: ContextItem[] = [];
 
-    if (peer.context.summary) {
+    if (summary) {
       children.push(new ContextItem(
-        peer.context.summary, "note", new vscode.ThemeColor("charts.green"),
+        summary, "note", new vscode.ThemeColor("charts.green"),
       ));
     }
 
@@ -123,6 +125,16 @@ function agentIcon(agentType: string): string {
     case "codex": return "🟢";
     default: return "⚪";
   }
+}
+
+/** Returns true if summary is a real work description, not a placeholder/default. */
+function isInformativeSummary(summary: string | undefined, peer: Peer): boolean {
+  if (!summary) return false;
+  const trimmed = summary.trim();
+  if (!trimmed || trimmed === "Untitled") return false;
+  const defaults = new Set<string>([path.basename(peer.cwd)]);
+  if (peer.gitRoot) defaults.add(path.basename(peer.gitRoot));
+  return !defaults.has(trimmed);
 }
 
 function agentColor(agentType: string): vscode.ThemeColor {
