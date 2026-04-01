@@ -615,21 +615,13 @@ http.createServer(async (nodeReq, nodeRes) => {
     const webRes = await handleRequest(webReq);
 
     webRes.headers.forEach((v, k) => nodeRes.setHeader(k, v));
-    nodeRes.writeHead(webRes.status);
 
-    if (webRes.body) {
-      const reader = webRes.body.getReader();
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          await new Promise<void>((res, rej) => nodeRes.write(value, (e) => e ? rej(e) : res()));
-        }
-      } finally {
-        reader.releaseLock();
-      }
-    }
-    if (!nodeRes.writableEnded) nodeRes.end();
+    // Buffer the full response body instead of streaming via ReadableStream reader.
+    // The previous while(true) { reader.read() } loop could spin at 100% CPU
+    // due to Node.js 22's experimental Web Response ReadableStream edge cases.
+    const responseBody = await webRes.text();
+    nodeRes.writeHead(webRes.status);
+    nodeRes.end(responseBody);
   } catch (e) {
     if (!nodeRes.headersSent) nodeRes.writeHead(500);
     if (!nodeRes.writableEnded) nodeRes.end(JSON.stringify({ error: String(e) }));

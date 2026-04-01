@@ -44,10 +44,10 @@ export class BrokerClient {
     return res.json() as Promise<T>;
   }
 
-  async health(): Promise<BrokerHealthResponse | null> {
+  async health(timeoutMs = 2000): Promise<BrokerHealthResponse | null> {
     try {
       const res = await fetch(`${this.baseUrl}/health`, {
-        signal: AbortSignal.timeout(2000),
+        signal: AbortSignal.timeout(timeoutMs),
       });
       if (res.ok) return res.json() as Promise<BrokerHealthResponse>;
     } catch { /* broker not running */ }
@@ -148,7 +148,7 @@ export class BrokerClient {
    * in the background without blocking extension activation.
    */
   async ensureBroker(extensionUri: vscode.Uri): Promise<void> {
-    const h = await this.health();
+    const h = await this.health(500);
     if (h) return; // Already running
 
     // Start broker as a detached background process (no terminal needed)
@@ -160,11 +160,14 @@ export class BrokerClient {
     });
     proc.unref();
 
-    // Poll in the background — fewer retries with longer gaps
-    for (let i = 0; i < 5; i++) {
-      await new Promise((r) => setTimeout(r, 500));
-      const h2 = await this.health();
-      if (h2) return;
+    // Poll with short intervals — broker typically starts in <500ms
+    for (let i = 0; i < 10; i++) {
+      await new Promise((r) => setTimeout(r, 200));
+      const h2 = await this.health(500);
+      if (h2) {
+        this.connectWs();
+        return;
+      }
     }
 
     vscode.window.showWarningMessage(

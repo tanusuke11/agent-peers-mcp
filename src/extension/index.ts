@@ -78,7 +78,7 @@ export function activate(extensionContext: vscode.ExtensionContext) {
     }),
 
     vscode.commands.registerCommand("agentPeers.startBroker", async () => {
-      const health = await brokerClient.health();
+      const health = await brokerClient.health(500);
       if (health) {
         vscode.window.showInformationMessage(`Agent Peers broker is already running (${health.peerCount} peers).`);
         return;
@@ -87,8 +87,16 @@ export function activate(extensionContext: vscode.ExtensionContext) {
       const { spawn } = require("child_process") as typeof import("child_process");
       const proc = spawn("node", [brokerPath], { stdio: "ignore", detached: true });
       proc.unref();
-      vscode.window.showInformationMessage("Agent Peers broker starting...");
-      // WS reconnect will detect the broker automatically
+      // Poll until broker is ready, then immediately reconnect WS
+      for (let i = 0; i < 10; i++) {
+        await new Promise((r) => setTimeout(r, 200));
+        if (await brokerClient.health(500)) {
+          brokerClient.connectWs();
+          vscode.window.showInformationMessage("Agent Peers broker started.");
+          return;
+        }
+      }
+      vscode.window.showWarningMessage("Agent Peers broker may not have started. Check logs.");
     }),
 
     vscode.commands.registerCommand("agentPeers.stopBroker", async () => {
