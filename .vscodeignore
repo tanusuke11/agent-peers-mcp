@@ -6,7 +6,6 @@
 .mcp.json
 AGENT.md
 CLAUDE.md
-LICENSE.md
 bun.lock
 package-lock.json
 tsconfig.json

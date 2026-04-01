@@ -147,7 +147,7 @@ function findSessionFile(): string | null {
 
     for (let depth = 0; depth < 5 && pid > 1; depth++) {
       const cmdArgs = getProcessArgs(pid);
-      if (!cmdArgs) return null;
+      if (!cmdArgs) break;
 
       const resumeIdx = cmdArgs.indexOf("--resume");
       if (resumeIdx !== -1 && cmdArgs[resumeIdx + 1]) {
@@ -157,14 +157,50 @@ function findSessionFile(): string | null {
       pid = getParentPid(pid);
     }
 
-    if (!sessionId) return null;
+    // If --resume not found, try ~/.claude/sessions/<PID>.json lookup
+    // Claude Code writes {pid, sessionId, cwd} files there for every session.
+    if (!sessionId) {
+      let searchPid = process.ppid;
+      for (let depth = 0; depth < 5 && searchPid > 1; depth++) {
+        const sessionMeta = path.join(os.homedir(), ".claude", "sessions", `${searchPid}.json`);
+        if (fs.existsSync(sessionMeta)) {
+          try {
+            const meta = JSON.parse(fs.readFileSync(sessionMeta, "utf8")) as { sessionId?: string };
+            if (meta.sessionId) { sessionId = meta.sessionId; break; }
+          } catch { /* skip */ }
+        }
+        searchPid = getParentPid(searchPid);
+      }
+    }
 
     const candidates = [myGitRoot, myCwd].filter(Boolean) as string[];
+
+    // If we found a session ID, look for that specific session file
+    if (sessionId) {
+      for (const base of candidates) {
+        const projectHash = base.replace(/[\\/]/g, "-");
+        const sessionFile = path.join(os.homedir(), ".claude", "projects", projectHash, `${sessionId}.jsonl`);
+        if (fs.existsSync(sessionFile)) return sessionFile;
+      }
+    }
+
+    // Fallback: find the most recently modified JSONL file in the project directory
     for (const base of candidates) {
       const projectHash = base.replace(/[\\/]/g, "-");
-      const sessionFile = path.join(os.homedir(), ".claude", "projects", projectHash, `${sessionId}.jsonl`);
-      if (fs.existsSync(sessionFile)) return sessionFile;
+      const projectDir = path.join(os.homedir(), ".claude", "projects", projectHash);
+      if (!fs.existsSync(projectDir)) continue;
+
+      const files = fs.readdirSync(projectDir)
+        .filter((f: string) => f.endsWith(".jsonl"))
+        .map((f: string) => {
+          const full = path.join(projectDir, f);
+          return { path: full, mtime: fs.statSync(full).mtimeMs };
+        })
+        .sort((a: { mtime: number }, b: { mtime: number }) => b.mtime - a.mtime);
+
+      if (files.length > 0) return files[0]!.path;
     }
+
     return null;
   } catch { return null; }
 }
@@ -190,6 +226,12 @@ const EXCHANGE_MAX_COUNT = 5;
 
 /** Read recent human/assistant exchanges from the Claude Code session JSONL. */
 function getRecentExchanges(): import("../shared/types.ts").RecentExchange[] {
+  // Only Claude Code writes the ~/.claude session JSONL files we inspect below.
+  // Other agent types (e.g., Codex) should not scrape these logs, otherwise they
+  // may accidentally surface another tool's conversation history (as seen when a
+  // Codex peer picked up the latest Claude session file in the same repo).
+  if (AGENT_TYPE !== "claude-code") return [];
+
   try {
     const file = findSessionFile();
     if (!file) return [];
