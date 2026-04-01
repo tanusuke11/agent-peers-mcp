@@ -19,6 +19,7 @@
  */
 
 import { spawn } from "child_process";
+import crypto from "crypto";
 import fs from "fs";
 import os from "os";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -38,6 +39,8 @@ import type {
   WsEvent,
   WsMessageEvent,
   GitContext,
+  CheckConflictsResponse,
+  ConflictResult,
 } from "../shared/types.ts";
 import path from "path";
 import WebSocket from "ws";
@@ -143,70 +146,88 @@ function getParentPid(pid: number): number {
   } catch { return 0; }
 }
 
-/** Find the Claude Code session JSONL file path by walking up the process tree. */
+/**
+ * Find the Claude Code session JSONL file path for THIS MCP server instance.
+ *
+ * Strategy:
+ *  1. Walk the process tree to find a `--resume <sessionId>` arg.
+ *  2. Look up `~/.claude/sessions/<PID>.json` for ancestor PIDs.
+ *  3. If a session ID is found, resolve it to a `.jsonl` file in the project dir.
+ *
+ * A successful (non-null) result is cached permanently so the instance never
+ * drifts to another peer's file.  A null result is NOT cached because the
+ * JSONL file may not exist yet at startup (Claude Code creates it lazily).
+ *
+ * There is intentionally NO "most recent file" fallback.  That heuristic caused
+ * every peer in the same repo to converge on the same file, producing identical
+ * conversation histories across peers.
+ */
+let cachedSessionFile: string | null | undefined;
+/** Session ID detected from process tree (cached even when the JSONL doesn't exist yet) */
+let cachedSessionId: string | null | undefined;
+
 function findSessionFile(): string | null {
+  // If we previously found a concrete file, return it immediately.
+  if (cachedSessionFile) return cachedSessionFile;
+
+  const result = findSessionFileUncached();
+  if (result) {
+    cachedSessionFile = result;
+  }
+  return result;
+}
+
+function findSessionFileUncached(): string | null {
   try {
-    let pid = process.ppid;
-    let sessionId: string | null = null;
-
-    for (let depth = 0; depth < 5 && pid > 1; depth++) {
-      const cmdArgs = getProcessArgs(pid);
-      if (!cmdArgs) break;
-
-      const resumeIdx = cmdArgs.indexOf("--resume");
-      if (resumeIdx !== -1 && cmdArgs[resumeIdx + 1]) {
-        sessionId = cmdArgs[resumeIdx + 1]!;
-        break;
-      }
-      pid = getParentPid(pid);
-    }
-
-    // If --resume not found, try ~/.claude/sessions/<PID>.json lookup
-    // Claude Code writes {pid, sessionId, cwd} files there for every session.
-    if (!sessionId) {
-      let searchPid = process.ppid;
-      for (let depth = 0; depth < 5 && searchPid > 1; depth++) {
-        const sessionMeta = path.join(os.homedir(), ".claude", "sessions", `${searchPid}.json`);
-        if (fs.existsSync(sessionMeta)) {
-          try {
-            const meta = JSON.parse(fs.readFileSync(sessionMeta, "utf8")) as { sessionId?: string };
-            if (meta.sessionId) { sessionId = meta.sessionId; break; }
-          } catch { /* skip */ }
-        }
-        searchPid = getParentPid(searchPid);
-      }
+    // Resolve session ID once and cache it (process tree won't change).
+    if (cachedSessionId === undefined) {
+      cachedSessionId = resolveSessionId();
     }
 
     const candidates = [myGitRoot, myCwd].filter(Boolean) as string[];
 
-    // If we found a session ID, look for that specific session file
-    if (sessionId) {
+    if (cachedSessionId) {
       for (const base of candidates) {
         const projectHash = base.replace(/[\\/]/g, "-");
-        const sessionFile = path.join(os.homedir(), ".claude", "projects", projectHash, `${sessionId}.jsonl`);
+        const sessionFile = path.join(os.homedir(), ".claude", "projects", projectHash, `${cachedSessionId}.jsonl`);
         if (fs.existsSync(sessionFile)) return sessionFile;
       }
     }
 
-    // Fallback: find the most recently modified JSONL file in the project directory
-    for (const base of candidates) {
-      const projectHash = base.replace(/[\\/]/g, "-");
-      const projectDir = path.join(os.homedir(), ".claude", "projects", projectHash);
-      if (!fs.existsSync(projectDir)) continue;
-
-      const files = fs.readdirSync(projectDir)
-        .filter((f: string) => f.endsWith(".jsonl"))
-        .map((f: string) => {
-          const full = path.join(projectDir, f);
-          return { path: full, mtime: fs.statSync(full).mtimeMs };
-        })
-        .sort((a: { mtime: number }, b: { mtime: number }) => b.mtime - a.mtime);
-
-      if (files.length > 0) return files[0]!.path;
-    }
-
+    // No fallback — return null rather than guessing.
     return null;
   } catch { return null; }
+}
+
+/** Walk the process tree to discover the Claude Code session ID. */
+function resolveSessionId(): string | null {
+  // Method 1: look for --resume <sessionId> in ancestor command lines.
+  let pid = process.ppid;
+  for (let depth = 0; depth < 5 && pid > 1; depth++) {
+    const cmdArgs = getProcessArgs(pid);
+    if (!cmdArgs) break;
+
+    const resumeIdx = cmdArgs.indexOf("--resume");
+    if (resumeIdx !== -1 && cmdArgs[resumeIdx + 1]) {
+      return cmdArgs[resumeIdx + 1]!;
+    }
+    pid = getParentPid(pid);
+  }
+
+  // Method 2: look up ~/.claude/sessions/<PID>.json for ancestor PIDs.
+  let searchPid = process.ppid;
+  for (let depth = 0; depth < 5 && searchPid > 1; depth++) {
+    const sessionMeta = path.join(os.homedir(), ".claude", "sessions", `${searchPid}.json`);
+    if (fs.existsSync(sessionMeta)) {
+      try {
+        const meta = JSON.parse(fs.readFileSync(sessionMeta, "utf8")) as { sessionId?: string };
+        if (meta.sessionId) return meta.sessionId;
+      } catch { /* skip */ }
+    }
+    searchPid = getParentPid(searchPid);
+  }
+
+  return null;
 }
 
 async function getClaudeSessionTitle(): Promise<string | null> {
@@ -215,13 +236,23 @@ async function getClaudeSessionTitle(): Promise<string | null> {
     if (!file) return null;
 
     const content = fs.readFileSync(file, "utf8");
+    // Priority: custom-title > agent-name > ai-title (most specific wins)
+    let aiTitle: string | null = null;
+    let customTitle: string | null = null;
+    let agentName: string | null = null;
     for (const line of content.split("\n").filter(Boolean)) {
       try {
-        const obj = JSON.parse(line) as { type?: string; aiTitle?: string };
-        if (obj.type === "ai-title" && obj.aiTitle) return obj.aiTitle;
+        const obj = JSON.parse(line) as Record<string, unknown>;
+        if (obj.type === "ai-title" && typeof obj.aiTitle === "string") {
+          aiTitle = obj.aiTitle;
+        } else if (obj.type === "custom-title" && typeof obj.customTitle === "string") {
+          customTitle = obj.customTitle;
+        } else if (obj.type === "agent-name" && typeof obj.agentName === "string") {
+          agentName = obj.agentName;
+        }
       } catch { /* skip */ }
     }
-    return null;
+    return customTitle ?? agentName ?? aiTitle ?? null;
   } catch { return null; }
 }
 
@@ -390,12 +421,13 @@ IMPORTANT: When you receive a <channel source="agent-peers" ...> message, RESPON
 Available tools:
 - list_peers: Discover other AI agent instances (scope: machine/directory/repo)
 - send_message: Send a message or task handoff to another instance
-- share_context: Share your current structured context (active files, git state, task)
+- share_context: Share your current structured context (active files, git state, task). Also runs an automatic conflict check.
 - request_context: Request another peer's full structured context
 - set_summary: Set a brief summary of what you're working on
 - check_messages: Manually check for new messages
+- check_conflicts: Check if planned work conflicts with other agents before starting
 
-When you start, proactively call share_context to publish your current state. This helps other agents understand what you're working on.`,
+When you start, proactively call share_context to publish your current state. This helps other agents understand what you're working on. Before starting a new task, use check_conflicts to verify no other agents are working on the same files.`,
   }
 );
 
@@ -472,14 +504,31 @@ mcp.registerTool("share_context", {
     );
     const context: Partial<AgentContext> = { summary: resolvedSummary, currentTask: current_task, activeFiles, git: gitCtx, taskIntent, updatedAt: new Date().toISOString() };
     await brokerFetch("/update-context", { id: myId, context });
-    return {
-      content: [{
-        type: "text" as const,
-        text: `Context shared. Summary: "${resolvedSummary ?? ""}"` +
-          (gitCtx ? `\nBranch: ${gitCtx.branch}, Modified: ${gitCtx.modifiedFiles?.length ?? 0} files` : "") +
-          (activeFiles.length ? `\nActive files: ${activeFiles.map((f) => f.relativePath).join(", ")}` : ""),
-      }],
-    };
+
+    let statusText = `Context shared. Summary: "${resolvedSummary ?? ""}"` +
+      (gitCtx ? `\nBranch: ${gitCtx.branch}, Modified: ${gitCtx.modifiedFiles?.length ?? 0} files` : "") +
+      (activeFiles.length ? `\nActive files: ${activeFiles.map((f) => f.relativePath).join(", ")}` : "");
+
+    // Proactive conflict check: warn the agent if their work overlaps with others
+    try {
+      const conflictPrompt = [resolvedSummary, current_task, ...activeFiles.map(f => f.relativePath)].filter(Boolean).join(" ");
+      if (conflictPrompt.length >= 10) {
+        const conflictResult = await brokerFetch<CheckConflictsResponse>("/check-conflicts", {
+          prompt: conflictPrompt,
+          callerId: myId,
+          gitRoot: myGitRoot,
+        });
+        if (conflictResult.conflicts && conflictResult.conflicts.length > 0) {
+          const warnings = conflictResult.conflicts.map(c =>
+            `- Peer "${c.peerId}" (${c.agentType}): ${c.summary}\n  Files: ${c.taskIntent.targetFiles.slice(0, 5).join(", ")}\n  Conflict: ${c.reason} (${c.confidence})`
+          );
+          statusText += `\n\n⚠ Conflict warning — other agent(s) are working on overlapping files/areas:\n${warnings.join("\n")}`;
+          statusText += "\nUse check_conflicts or send_message to coordinate.";
+        }
+      }
+    } catch { /* non-critical: don't fail share_context if conflict check fails */ }
+
+    return { content: [{ type: "text" as const, text: statusText }] };
   } catch (e) {
     return { content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
   }
@@ -541,6 +590,44 @@ mcp.registerTool("check_messages", {
     return { content: [{ type: "text" as const, text: `${result.messages.length} new message(s):\n\n${lines.join("\n\n---\n\n")}` }] };
   } catch (e) {
     return { content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
+  }
+});
+
+mcp.registerTool("check_conflicts", {
+  description: "Check if your current or planned work conflicts with other agents in the same repo. Returns a list of peers whose work overlaps with the given prompt/description. Use this BEFORE starting work on a task to avoid merge conflicts.",
+  inputSchema: {
+    prompt: z.string().describe("Description of what you plan to do, or the user's request text"),
+  },
+}, async ({ prompt }) => {
+  if (!myId) return { content: [{ type: "text" as const, text: "Not registered yet" }], isError: true };
+  if (!prompt || prompt.length < 10) {
+    return { content: [{ type: "text" as const, text: "Prompt too short — provide a description of the planned work (at least 10 characters)." }], isError: true };
+  }
+  try {
+    const result = await brokerFetch<CheckConflictsResponse>("/check-conflicts", {
+      prompt,
+      callerId: myId,
+      gitRoot: myGitRoot,
+    });
+    if (!result.conflicts || result.conflicts.length === 0) {
+      return { content: [{ type: "text" as const, text: "No conflicts detected. Safe to proceed." }] };
+    }
+    const lines = ["⚠ Potential conflict(s) detected:\n"];
+    for (const c of result.conflicts) {
+      lines.push(`- Peer "${c.peerId}" (${c.agentType}): ${c.summary}`);
+      lines.push(`  Working on: ${c.taskIntent.description}`);
+      const files = c.taskIntent.targetFiles.slice(0, 5);
+      lines.push(`  Files: ${files.join(", ")}${c.taskIntent.targetFiles.length > 5 ? " ..." : ""}`);
+      lines.push(`  Conflict: ${c.reason} (confidence: ${c.confidence})`);
+    }
+    lines.push("");
+    lines.push("Consider:");
+    lines.push("1. Coordinate with the other agent (use send_message)");
+    lines.push("2. Revise your approach to avoid overlapping files/areas");
+    lines.push("3. Proceed anyway (risk merge conflicts later)");
+    return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+  } catch (e) {
+    return { content: [{ type: "text" as const, text: `Error checking conflicts: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
   }
 });
 
@@ -607,6 +694,15 @@ function connectBrokerWs() {
           if (msg.toId === myId) {
             handleIncomingMessage(msg);
           }
+        } else if (event.type === "wake") {
+          // Wake signal from extension — re-deliver pending messages as channel notifications
+          const wakeData = event.data as { id: string; messages: Message[] };
+          if (wakeData.id === myId && wakeData.messages?.length) {
+            log(`Wake signal received with ${wakeData.messages.length} pending message(s)`);
+            for (const msg of wakeData.messages) {
+              handleIncomingMessage(msg);
+            }
+          }
         }
       } catch { /* ignore malformed messages */ }
     });
@@ -636,7 +732,9 @@ function scheduleWsReconnect() {
 async function drainUndeliveredMessages() {
   if (!myId) return;
   try {
-    const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
+    // Use peek-messages (not poll-messages) so messages stay unread.
+    // read is only marked when the extension delivers via terminal injection.
+    const result = await brokerFetch<PollMessagesResponse>("/peek-messages", { id: myId });
     if (!result.found) {
       log("Peer entry gone from broker (purged), re-registering...");
       await registerWithBroker();
@@ -654,6 +752,29 @@ async function drainUndeliveredMessages() {
 
 let myTty: string | null = null;
 
+/** Directory for persisting peer IDs across broker restarts. */
+const ID_PERSIST_DIR = path.join(os.homedir(), ".agent-peers", "ids");
+
+/** Deterministic key for this MCP server instance (cwd + agentType). */
+function idPersistKey(): string {
+  return crypto.createHash("sha256").update(`${myCwd}:${AGENT_TYPE}`).digest("hex").slice(0, 12);
+}
+
+function loadPersistedId(): string | null {
+  try {
+    const file = path.join(ID_PERSIST_DIR, `${idPersistKey()}.id`);
+    if (fs.existsSync(file)) return fs.readFileSync(file, "utf8").trim();
+  } catch { /* ignore */ }
+  return null;
+}
+
+function persistId(id: string): void {
+  try {
+    fs.mkdirSync(ID_PERSIST_DIR, { recursive: true });
+    fs.writeFileSync(path.join(ID_PERSIST_DIR, `${idPersistKey()}.id`), id);
+  } catch { /* best effort */ }
+}
+
 async function registerWithBroker(): Promise<void> {
   const gitCtx = await gatherGitContext(myCwd);
   // Capture baseline: files already modified before this agent session started
@@ -668,7 +789,9 @@ async function registerWithBroker(): Promise<void> {
     git: gitCtx,
     updatedAt: new Date().toISOString(),
   };
+  const preferredId = loadPersistedId();
   const reg = await brokerFetch<RegisterResponse>("/register", {
+    preferredId: preferredId ?? undefined,
     agentType: AGENT_TYPE,
     pid: process.pid,
     cwd: myCwd,
@@ -677,7 +800,8 @@ async function registerWithBroker(): Promise<void> {
     context,
   });
   myId = reg.id;
-  log(`Registered as peer ${myId}`);
+  persistId(myId);
+  log(`Registered as peer ${myId}${preferredId && preferredId === myId ? " (restored)" : ""}`);
 
   // Try to restore session title immediately after (re-)registration
   if (AGENT_TYPE === "claude-code") {
@@ -710,12 +834,12 @@ async function main() {
 
   // Watch for Claude Code session title (ai-title) and update summary when found.
   // Other agent types (codex, etc.) stay "Untitled" until they call set_summary.
-  // Uses exponential backoff instead of fixed 3s polling to reduce I/O pressure.
+  // Single early attempt; if missed, the 15s heartbeat loop retries indefinitely.
   let sessionTitleSet = false;
   let titleWatchTimer: ReturnType<typeof setTimeout> | null = null;
   if (AGENT_TYPE === "claude-code") {
-    const trySetTitle = async (attempt: number) => {
-      if (sessionTitleSet || !myId || attempt > 5) return;
+    titleWatchTimer = setTimeout(async () => {
+      if (sessionTitleSet || !myId) return;
       const title = await getClaudeSessionTitle();
       if (title) {
         sessionTitleSet = true;
@@ -724,14 +848,8 @@ async function main() {
           await brokerFetch("/update-context", { id: myId, context: { summary: title } });
           log(`Session title set: ${title}`);
         } catch { /* non-critical */ }
-        return;
       }
-      // Exponential backoff: 5s, 10s, 20s, 40s, 80s
-      const delay = 5000 * Math.pow(2, attempt);
-      titleWatchTimer = setTimeout(() => trySetTitle(attempt + 1), delay);
-    };
-    // First attempt after 5s (session file needs time to be written)
-    titleWatchTimer = setTimeout(() => trySetTitle(0), 5000);
+    }, 5000);
   } else {
     // For other agents (e.g., Codex), set a reasonable summary once after startup.
     const desiredTitle = myGitRoot ? path.basename(myGitRoot) : path.basename(myCwd);
@@ -832,6 +950,17 @@ async function main() {
       if (taskIntentJson !== lastTaskIntentJson) {
         lastTaskIntentJson = taskIntentJson;
         contextUpdate.taskIntent = taskIntent;
+      }
+
+      // Retry title if still unset (ai-title may appear later in the session)
+      if (!sessionTitleSet && AGENT_TYPE === "claude-code") {
+        const title = await getClaudeSessionTitle();
+        if (title) {
+          sessionTitleSet = true;
+          cachedSessionTitle = title;
+          contextUpdate.summary = title;
+          log(`Session title set (heartbeat): ${title}`);
+        }
       }
 
       if (Object.keys(contextUpdate).length > 0) {

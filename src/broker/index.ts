@@ -66,6 +66,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS peers (
     id TEXT PRIMARY KEY,
     agent_type TEXT NOT NULL DEFAULT 'generic',
+    source TEXT NOT NULL DEFAULT 'terminal',
     pid INTEGER NOT NULL,
     cwd TEXT NOT NULL,
     git_root TEXT,
@@ -80,6 +81,16 @@ db.exec(`
 // Migration: add suspended column if missing
 try {
   db.exec("ALTER TABLE peers ADD COLUMN suspended INTEGER NOT NULL DEFAULT 0");
+} catch { /* column already exists */ }
+
+// Migration: add source column if missing
+try {
+  db.exec("ALTER TABLE peers ADD COLUMN source TEXT NOT NULL DEFAULT 'terminal'");
+} catch { /* column already exists */ }
+
+// Migration: add read column to messages (distinguishes "ws-pushed" from "agent-polled")
+try {
+  db.exec("ALTER TABLE messages ADD COLUMN read INTEGER NOT NULL DEFAULT 0");
 } catch { /* column already exists */ }
 
 db.exec(`
@@ -162,8 +173,8 @@ setInterval(cleanStalePeers, STALE_PEER_CLEANUP_MS);
 // ─── Prepared statements ───────────────────────────────────────
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, agent_type, pid, cwd, git_root, tty, context_json, registered_at, last_seen)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, agent_type, source, pid, cwd, git_root, tty, context_json, registered_at, last_seen)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const updateLastSeen = db.prepare(`UPDATE peers SET last_seen = ? WHERE id = ?`);
@@ -180,7 +191,12 @@ const insertMessage = db.prepare(`
 const selectUndelivered = db.prepare(`
   SELECT * FROM messages WHERE to_id = ? AND delivered = 0 ORDER BY sent_at ASC
 `);
+const selectUnread = db.prepare(`
+  SELECT * FROM messages WHERE to_id = ? AND read = 0 ORDER BY sent_at ASC
+`);
 const markDelivered = db.prepare(`UPDATE messages SET delivered = 1 WHERE id = ?`);
+const markRead = db.prepare(`UPDATE messages SET read = 1 WHERE id = ?`);
+const markAllRead = db.prepare(`UPDATE messages SET read = 1 WHERE to_id = ? AND read = 0`);
 
 // ─── Helpers ───────────────────────────────────────────────────
 
@@ -215,6 +231,7 @@ function jsonResponse(body: unknown, init?: { status?: number; headers?: Record<
 interface RawPeerRow {
   id: string;
   agent_type: string;
+  source: string;
   pid: number;
   cwd: string;
   git_root: string | null;
@@ -225,7 +242,10 @@ interface RawPeerRow {
   suspended: number;
 }
 
+const countUndelivered = db.prepare(`SELECT COUNT(*) as cnt FROM messages WHERE to_id = ? AND read = 0`);
+
 function rowToPeer(row: RawPeerRow): Peer {
+  const pending = (countUndelivered.get(row.id) as unknown as { cnt: number })?.cnt ?? 0;
   return {
     id: row.id,
     agentType: row.agent_type as Peer["agentType"],
@@ -233,11 +253,13 @@ function rowToPeer(row: RawPeerRow): Peer {
     cwd: row.cwd,
     gitRoot: row.git_root,
     tty: row.tty,
+    source: (row.source ?? "terminal") as Peer["source"],
     context: JSON.parse(row.context_json) as AgentContext,
     registeredAt: row.registered_at,
     lastSeen: row.last_seen,
     connected: true,
     suspended: !!row.suspended,
+    pendingMessages: pending > 0 ? pending : undefined,
   };
 }
 
@@ -275,6 +297,46 @@ function isAlive(pid: number): boolean {
 }
 
 
+/**
+ * When multiple MCP server instances read the same Claude Code session JSONL file
+ * (e.g. because an older MCP server's fallback picked the most-recent file), they
+ * report identical session-derived context: summary (session title) AND
+ * recentExchanges.  This function detects duplicates and keeps the data only on
+ * the peer that registered earliest (most likely the true session owner).
+ */
+function deduplicateExchanges(peers: Peer[]): void {
+  // Fingerprint each peer's session-derived data (exchanges + summary).
+  // Two peers sharing the same session file will have identical fingerprints.
+  const seen = new Map<string, string>(); // fingerprint → peerId (earliest owner)
+
+  for (const peer of peers) {
+    const exchanges = peer.context.recentExchanges;
+    const hasExchanges = exchanges && exchanges.length > 0;
+    if (!hasExchanges) continue;
+
+    const fp = exchanges.map(e => `${e.role}:${e.text}`).join("|");
+    const existing = seen.get(fp);
+    if (existing === undefined) {
+      seen.set(fp, peer.id);
+    } else {
+      // Duplicate — the later-registered peer is the impostor
+      const existingPeer = peers.find(p => p.id === existing);
+      if (existingPeer && existingPeer.registeredAt <= peer.registeredAt) {
+        clearSessionContext(peer);
+      } else if (existingPeer) {
+        clearSessionContext(existingPeer);
+        seen.set(fp, peer.id);
+      }
+    }
+  }
+}
+
+/** Clear context fields that are derived from reading the Claude Code session file. */
+function clearSessionContext(peer: Peer): void {
+  peer.context.recentExchanges = [];
+  peer.context.summary = "";
+}
+
 // ─── Request handlers ──────────────────────────────────────────
 
 function handleRegister(body: RegisterRequest): RegisterResponse {
@@ -289,8 +351,14 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
   try {
     db.prepare("DELETE FROM peers WHERE pid = ?").run(body.pid);
     const existingIds = new Set((selectAllPeers.all() as unknown as unknown as RawPeerRow[]).map((r) => r.id));
-    id = generateId(existingIds);
-    insertPeer.run(id, body.agentType, body.pid, body.cwd, body.gitRoot, body.tty, contextJson, now, now);
+    // Honor preferredId if provided and not already taken
+    if (body.preferredId && !existingIds.has(body.preferredId)) {
+      id = body.preferredId;
+    } else {
+      id = generateId(existingIds);
+    }
+    const source = body.source ?? "terminal";
+    insertPeer.run(id, body.agentType, source, body.pid, body.cwd, body.gitRoot, body.tty, contextJson, now, now);
     db.exec("COMMIT");
   } catch (e) {
     db.exec("ROLLBACK");
@@ -368,19 +436,33 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
   }
 
   // Filter out dead peers
-  return rows
+  const peers = rows
     .filter((r) => {
       if (isAlive(r.pid)) return true;
       deletePeer.run(r.id);
       return false;
     })
     .map(rowToPeer);
+
+  // Deduplicate recentExchanges: when multiple peers report identical conversation
+  // histories (caused by MCP servers reading the same session file), keep the
+  // exchanges only on the peer that registered earliest (most likely the true owner)
+  // and clear them from the others.
+  deduplicateExchanges(peers);
+
+  return peers;
 }
 
 function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: string } {
   const target = selectPeerById.get(body.toId) as unknown as RawPeerRow | undefined;
   if (!target) {
     return { ok: false, error: `Peer ${body.toId} not found` };
+  }
+
+  // Only allow sending messages to terminal peers; block extension peers
+  const targetSource = target.source ?? "terminal";
+  if (targetSource !== "terminal") {
+    return { ok: false, error: `Cannot send messages to ${targetSource} peer ${body.toId}. Only terminal peers accept messages.` };
   }
 
   const now = new Date().toISOString();
@@ -419,12 +501,41 @@ function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
   const exists = selectPeerById.get(body.id) as unknown as RawPeerRow | undefined;
   if (!exists) return { found: false, messages: [] };
 
-  const rows = selectUndelivered.all(body.id) as unknown as unknown as RawMessageRow[];
+  const rows = selectUnread.all(body.id) as unknown as unknown as RawMessageRow[];
   for (const row of rows) {
-    markDelivered.run(row.id);
+    // Mark both delivered and read when the agent actively polls
+    if (!row.delivered) markDelivered.run(row.id);
+    markRead.run(row.id);
   }
 
   return { found: true, messages: rows.map(rowToMessage) };
+}
+
+/** Return unread messages WITHOUT marking them as read.
+ *  Used by the MCP server's WS-reconnect drain — it sends channel notifications
+ *  but the read flag should only be set when the extension delivers the message
+ *  to the agent's terminal via the bell button. */
+function handlePeekMessages(body: PollMessagesRequest): PollMessagesResponse {
+  const exists = selectPeerById.get(body.id) as unknown as RawPeerRow | undefined;
+  if (!exists) return { found: false, messages: [] };
+
+  const rows = selectUnread.all(body.id) as unknown as unknown as RawMessageRow[];
+  // Mark delivered (broker→MCP server) but NOT read (agent hasn't consumed it yet)
+  for (const row of rows) {
+    if (!row.delivered) markDelivered.run(row.id);
+  }
+
+  return { found: true, messages: rows.map(rowToMessage) };
+}
+
+/** Mark all unread messages for a peer as read. */
+function handleMarkRead(body: { id: string }): { ok: boolean; marked: number } {
+  const exists = selectPeerById.get(body.id) as unknown as RawPeerRow | undefined;
+  if (!exists) return { ok: false, marked: 0 };
+
+  const rows = selectUnread.all(body.id) as unknown as unknown as RawMessageRow[];
+  markAllRead.run(body.id);
+  return { ok: true, marked: rows.length };
 }
 
 function removePeer(id: string): void {
@@ -590,6 +701,33 @@ function handleCheckConflicts(body: CheckConflictsRequest): CheckConflictsRespon
   return { conflicts };
 }
 
+function handleWakePeer(body: { id: string }): { ok: boolean; delivered: number } {
+  const row = selectPeerById.get(body.id) as unknown as RawPeerRow | undefined;
+  if (!row) return { ok: false, delivered: 0 };
+
+  // Collect undelivered messages for this peer
+  const msgs = selectUndelivered.all(body.id) as unknown as RawMessageRow[];
+
+  // Send a wake event with pending messages to the peer's MCP server via WS
+  const wakeEvent: WsEvent = {
+    type: "wake",
+    data: { id: body.id, messages: msgs.map(rowToMessage) },
+    timestamp: new Date().toISOString(),
+  };
+  const sent = sendToPeer(body.id, wakeEvent);
+
+  // Mark messages as delivered if WS delivery succeeded
+  let delivered = 0;
+  if (sent) {
+    for (const msg of msgs) {
+      markDelivered.run(msg.id);
+      delivered++;
+    }
+  }
+
+  return { ok: sent, delivered };
+}
+
 function handleHealth(): BrokerHealthResponse {
   return {
     status: "ok",
@@ -646,6 +784,12 @@ async function handleRequest(req: Request): Promise<Response> {
       case "/poll-messages":
         result = handlePollMessages(body as PollMessagesRequest);
         break;
+      case "/peek-messages":
+        result = handlePeekMessages(body as PollMessagesRequest);
+        break;
+      case "/mark-read":
+        result = handleMarkRead(body as { id: string });
+        break;
       case "/unregister":
         handleUnregister(body as { id: string });
         result = { ok: true };
@@ -658,6 +802,9 @@ async function handleRequest(req: Request): Promise<Response> {
         break;
       case "/check-conflicts":
         result = handleCheckConflicts(body as CheckConflictsRequest);
+        break;
+      case "/wake-peer":
+        result = handleWakePeer(body as { id: string });
         break;
       case "/cleanup":
         result = handleCleanup();

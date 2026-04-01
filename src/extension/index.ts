@@ -18,6 +18,57 @@ import * as os from "os";
 
 let brokerClient: BrokerClient;
 
+// ─── Terminal lookup helpers ──────────────────────────────
+
+/** Get the parent PID of a process. Linux reads /proc, others use ps/wmic. */
+function getParentPid(pid: number): number {
+  try {
+    if (process.platform === "linux") {
+      const status = fs.readFileSync(`/proc/${pid}/status`, "utf8");
+      const m = status.match(/PPid:\s*(\d+)/);
+      return m ? parseInt(m[1]!, 10) : 0;
+    }
+    const { execSync } = require("child_process") as typeof import("child_process");
+    if (process.platform === "darwin") {
+      return parseInt(execSync(`ps -o ppid= -p ${pid}`, { encoding: "utf8", timeout: 3000 }).trim(), 10) || 0;
+    }
+    if (process.platform === "win32") {
+      const out = execSync(`wmic process where ProcessId=${pid} get ParentProcessId /format:list`, { encoding: "utf8", timeout: 3000 }).trim();
+      const m = out.match(/ParentProcessId=(\d+)/);
+      return m ? parseInt(m[1]!, 10) : 0;
+    }
+    return 0;
+  } catch { return 0; }
+}
+
+/** Collect all ancestor PIDs up to init (PID 1), max 15 levels. */
+function getAncestorPids(pid: number): Set<number> {
+  const ancestors = new Set<number>();
+  let current = pid;
+  for (let i = 0; i < 15 && current > 1; i++) {
+    const parent = getParentPid(current);
+    if (parent <= 1) break;
+    ancestors.add(parent);
+    current = parent;
+  }
+  return ancestors;
+}
+
+/**
+ * Find the VSCode terminal whose shell process is an ancestor of the given PID.
+ * Returns the terminal if found, null otherwise.
+ */
+async function findTerminalForPid(pid: number): Promise<vscode.Terminal | null> {
+  const ancestors = getAncestorPids(pid);
+  for (const terminal of vscode.window.terminals) {
+    const shellPid = await terminal.processId;
+    if (shellPid && ancestors.has(shellPid)) {
+      return terminal;
+    }
+  }
+  return null;
+}
+
 /**
  * Write the UserPromptSubmit hook config to Claude Code's settings.json.
  * Idempotent — skips if the hook is already configured.
@@ -80,17 +131,42 @@ export function activate(extensionContext: vscode.ExtensionContext) {
   // Initialize tree data providers
   const controlProvider = new ControlProvider(brokerClient);
   const peerListProvider = new PeerListProvider(brokerClient);
-  // Register tree views
+  // Register tree views (use createTreeView for peerList to access badge API)
+  const peerListView = vscode.window.createTreeView("agentPeers.peerList", {
+    treeDataProvider: peerListProvider,
+  });
   extensionContext.subscriptions.push(
     vscode.window.registerTreeDataProvider("agentPeers.control", controlProvider),
-    vscode.window.registerTreeDataProvider("agentPeers.peerList", peerListProvider),
+    peerListView,
   );
 
+  // ─── Badge & notification helpers ──────────────────────
+  async function updateMessageBadge() {
+    try {
+      const peers = await brokerClient.listPeers("machine");
+      const total = peers.reduce((sum, p) => sum + (p.pendingMessages ?? 0), 0);
+      peerListView.badge = total > 0
+        ? { value: total, tooltip: `${total} unread message${total !== 1 ? "s" : ""}` }
+        : undefined;
+    } catch { /* broker down */ }
+  }
+
   // Listen to real-time events
-  brokerClient.on("peer-joined", () => peerListProvider.refresh());
-  brokerClient.on("peer-left", () => peerListProvider.refresh());
+  brokerClient.on("peer-joined", () => { peerListProvider.refresh(); updateMessageBadge(); });
+  brokerClient.on("peer-left", () => { peerListProvider.refresh(); updateMessageBadge(); });
   brokerClient.on("context-updated", () => {
     peerListProvider.refresh();
+  });
+  brokerClient.on("message", (data) => {
+    peerListProvider.refresh();
+    updateMessageBadge();
+
+    // Show a toast notification for the incoming message
+    const msg = data as { fromId?: string; text?: string; type?: string } | undefined;
+    if (msg?.fromId && msg?.text) {
+      const preview = msg.text.length > 120 ? msg.text.slice(0, 120) + "…" : msg.text;
+      vscode.window.showInformationMessage(`💬 ${msg.fromId}: ${preview}`);
+    }
   });
 
   // Register commands
@@ -358,6 +434,102 @@ AGENT_PEERS_AGENT_TYPE = "codex"
         vscode.window.showInformationMessage("Conflict detection hook is already configured.");
       }
     }),
+
+    vscode.commands.registerCommand("agentPeers.checkMessages", async (item?: { peerId?: string; peer?: { id: string; pid?: number } }) => {
+      const peerId = item?.peerId || item?.peer?.id;
+      if (!peerId) {
+        vscode.window.showWarningMessage("No peer selected.");
+        return;
+      }
+
+      // Get peer info (need PID to locate terminal)
+      const peers = await brokerClient.listPeers("machine");
+      const peer = peers.find(p => p.id === peerId);
+      if (!peer) {
+        vscode.window.showWarningMessage(`Peer "${peerId}" not found.`);
+        return;
+      }
+
+      // Poll unread messages for this peer
+      const poll = await brokerClient.pollMessages(peerId);
+      if (!poll || !poll.found || poll.messages.length === 0) {
+        vscode.window.showInformationMessage(`No pending messages for ${peerId}.`);
+        return;
+      }
+
+      // Build a prompt from all pending messages
+      const promptLines = poll.messages.map(m =>
+        `[Message from ${m.fromId} (${m.type})] ${m.text}`
+      );
+      const prompt = promptLines.join("\n");
+
+      // Deliver via terminal.sendText() — works for terminal-based sessions
+      // (Claude Code in terminal, Codex, etc.)
+      const terminal = await findTerminalForPid(peer.pid);
+      if (terminal) {
+        terminal.sendText(prompt);
+        terminal.show(/* preserveFocus */ true);
+        await brokerClient.markRead(peerId);
+        vscode.window.showInformationMessage(
+          `Injected ${poll.messages.length} message(s) into ${peerId}'s terminal.`,
+        );
+      } else {
+        // No terminal found — this peer is running inside the VSCode extension
+        // (sidebar/editor panel), which cannot receive terminal input.
+        vscode.window.showWarningMessage(
+          `Cannot deliver to ${peerId}: no terminal session found. ` +
+          `This peer is running inside the VSCode extension panel. ` +
+          `Open it in a terminal ("Claude Code: Open in Terminal") to receive messages.`,
+        );
+      }
+
+      peerListProvider.refresh();
+      updateMessageBadge();
+    }),
+
+    vscode.commands.registerCommand("agentPeers.checkAllMessages", async () => {
+      const peers = await brokerClient.listPeers("machine");
+      if (peers.length === 0) {
+        vscode.window.showInformationMessage("No peers found.");
+        return;
+      }
+      let totalDelivered = 0;
+      let deliveredPeerCount = 0;
+      const noTerminalPeers: string[] = [];
+      for (const peer of peers) {
+        const poll = await brokerClient.pollMessages(peer.id);
+        if (!poll || !poll.found || poll.messages.length === 0) continue;
+
+        const promptLines = poll.messages.map(m =>
+          `[Message from ${m.fromId} (${m.type})] ${m.text}`
+        );
+        const prompt = promptLines.join("\n");
+
+        const terminal = await findTerminalForPid(peer.pid);
+        if (terminal) {
+          terminal.sendText(prompt);
+          terminal.show(/* preserveFocus */ true);
+          await brokerClient.markRead(peer.id);
+          totalDelivered += poll.messages.length;
+          deliveredPeerCount++;
+        } else {
+          noTerminalPeers.push(peer.id);
+        }
+      }
+      if (totalDelivered > 0) {
+        vscode.window.showInformationMessage(
+          `Injected ${totalDelivered} message(s) into ${deliveredPeerCount} peer(s)' terminals.`,
+        );
+      } else if (noTerminalPeers.length > 0) {
+        vscode.window.showWarningMessage(
+          `No terminal sessions found for peers with pending messages: ${noTerminalPeers.join(", ")}`,
+        );
+      } else {
+        vscode.window.showInformationMessage("No pending messages for any peer.");
+      }
+      peerListProvider.refresh();
+      updateMessageBadge();
+    }),
   );
 
   // Track broker connection state via WebSocket events
@@ -373,14 +545,20 @@ AGENT_PEERS_AGENT_TYPE = "codex"
   vscode.commands.executeCommand("setContext", "agentPeers.brokerConnected", false);
 
   // React to WebSocket connection state changes
-  brokerClient.on("broker-connected", () => setBrokerConnected(true));
-  brokerClient.on("broker-disconnected", () => setBrokerConnected(false));
+  brokerClient.on("broker-connected", () => { setBrokerConnected(true); updateMessageBadge(); });
+  brokerClient.on("broker-disconnected", () => {
+    setBrokerConnected(false);
+    peerListView.badge = undefined;
+  });
 
   // Periodic health check + timestamp refresh (fallback in case WS events are missed)
   const statusRefreshInterval = setInterval(async () => {
     const h = await brokerClient.health();
     setBrokerConnected(h !== null);
-    if (h) peerListProvider.refresh();
+    if (h) {
+      peerListProvider.refresh();
+      updateMessageBadge();
+    }
   }, 30_000);
 
   extensionContext.subscriptions.push({

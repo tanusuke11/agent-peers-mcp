@@ -250,8 +250,15 @@ class PeerItem extends vscode.TreeItem {
       } else {
         const summary = peer.context.summary && peer.context.summary !== "Untitled" ? peer.context.summary : "";
         const ago = relativeTime(peer.context.updatedAt || peer.registeredAt);
-        this.description = summary ? `${summary} · ${ago}` : ago;
-        this.contextValue = "peerActive";
+        const pending = peer.pendingMessages ?? 0;
+        const pendingBadge = pending > 0 ? ` 💬${pending}` : "";
+        this.description = summary ? `${summary} · ${ago}${pendingBadge}` : `${ago}${pendingBadge}`;
+        this.contextValue = pending > 0 ? "peerHasMessages" : "peerActive";
+        if (pending > 0) {
+          this.iconPath = new vscode.ThemeIcon("mail", new vscode.ThemeColor("notificationsInfoIcon.foreground"));
+        } else {
+          this.iconPath = new vscode.ThemeIcon("circle-filled", agentColor(peer.agentType));
+        }
       }
       this.tooltip = new vscode.MarkdownString(this.buildTooltip(peer));
       this.children = buildContextItems(peer);

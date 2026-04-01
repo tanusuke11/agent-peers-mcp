@@ -123,6 +123,28 @@ export class BrokerClient {
     }
   }
 
+  async wakePeer(id: string): Promise<{ ok: boolean; delivered: number } | null> {
+    try {
+      return await this.post<{ ok: boolean; delivered: number }>("/wake-peer", { id });
+    } catch {
+      return null;
+    }
+  }
+
+  async pollMessages(id: string): Promise<{ found: boolean; messages: Message[] } | null> {
+    try {
+      return await this.post<{ found: boolean; messages: Message[] }>("/poll-messages", { id });
+    } catch {
+      return null;
+    }
+  }
+
+  async markRead(id: string): Promise<void> {
+    try {
+      await this.post("/mark-read", { id });
+    } catch { /* best effort */ }
+  }
+
   async purge(): Promise<{ purged: number } | null> {
     try {
       return await this.post<{ purged: number }>("/purge", {});
@@ -131,10 +153,11 @@ export class BrokerClient {
     }
   }
 
-  async registerPeer(agentType: string, pid: number, cwd: string, gitRoot: string | null): Promise<{ id: string }> {
+  async registerPeer(agentType: string, pid: number, cwd: string, gitRoot: string | null, source: "terminal" | "extension" = "extension"): Promise<{ id: string }> {
     const now = new Date().toISOString();
     return await this.post<{ id: string }>("/register", {
       agentType,
+      source,
       pid,
       cwd,
       gitRoot,

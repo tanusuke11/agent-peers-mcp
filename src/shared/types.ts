@@ -13,6 +13,9 @@ export type PeerId = string;
 /** The type of AI agent tool */
 export type AgentType = "claude-code" | "codex" | "generic";
 
+/** How the peer connects: terminal-based MCP server or VSCode extension */
+export type PeerSource = "terminal" | "extension";
+
 // ─── Structured Context ────────────────────────────────────────
 
 /** A file currently being worked on */
@@ -88,6 +91,8 @@ export interface Peer {
   gitRoot: string | null;
   /** Terminal TTY (if detectable) */
   tty: string | null;
+  /** How the peer connects: "terminal" (MCP server) or "extension" (VSCode extension) */
+  source: PeerSource;
   /** Structured context shared by this peer */
   context: AgentContext;
   /** When the peer first registered */
@@ -98,6 +103,8 @@ export interface Peer {
   connected?: boolean;
   /** Whether the peer has been suspended from context sharing */
   suspended?: boolean;
+  /** Number of undelivered messages waiting for this peer */
+  pendingMessages?: number;
 }
 
 // ─── Messages ──────────────────────────────────────────────────
@@ -119,7 +126,11 @@ export interface Message {
 // ─── Broker API Request/Response ───────────────────────────────
 
 export interface RegisterRequest {
+  /** Request a specific ID (persisted from a previous session) */
+  preferredId?: string;
   agentType: AgentType;
+  /** How the peer connects: "terminal" (MCP server) or "extension" (VSCode extension). Defaults to "terminal". */
+  source?: PeerSource;
   pid: number;
   cwd: string;
   gitRoot: string | null;
@@ -179,6 +190,7 @@ export type WsEventType =
   | "peer-joined"     // a peer joined the network
   | "peer-left"       // a peer left the network
   | "context-updated" // a peer updated their context
+  | "wake"            // wake up signal to deliver pending messages
   ;
 
 export interface WsEvent {

@@ -116,6 +116,18 @@
         "title": "Config Conflict Detection Hook",
         "icon": "$(shield)",
         "category": "Agent Peers"
+      },
+      {
+        "command": "agentPeers.checkMessages",
+        "title": "Deliver Messages to Terminal",
+        "icon": "$(send)",
+        "category": "Agent Peers"
+      },
+      {
+        "command": "agentPeers.checkAllMessages",
+        "title": "Deliver Messages (All Peers)",
+        "icon": "$(send)",
+        "category": "Agent Peers"
       }
     ],
     "menus": {
@@ -134,12 +146,12 @@
       "view/item/context": [
         {
           "command": "agentPeers.disconnectPeer",
-          "when": "view == agentPeers.peerList && viewItem == peerActive",
+          "when": "view == agentPeers.peerList && viewItem =~ /^peer(Active|HasMessages)$/",
           "group": "inline"
         },
         {
           "command": "agentPeers.disconnectPeer",
-          "when": "view == agentPeers.peerList && viewItem == peerActive"
+          "when": "view == agentPeers.peerList && viewItem =~ /^peer(Active|HasMessages)$/"
         },
         {
           "command": "agentPeers.connectPeer",
@@ -149,9 +161,24 @@
         {
           "command": "agentPeers.connectPeer",
           "when": "view == agentPeers.peerList && viewItem == peerSuspended"
+        },
+        {
+          "command": "agentPeers.checkMessages",
+          "when": "view == agentPeers.peerList && viewItem == peerHasMessages",
+          "group": "inline"
+        },
+        {
+          "command": "agentPeers.checkMessages",
+          "when": "view == agentPeers.peerList && viewItem == peerHasMessages"
         }
       ],
-      "view/title": []
+      "view/title": [
+        {
+          "command": "agentPeers.checkAllMessages",
+          "when": "view == agentPeers.peerList",
+          "group": "navigation"
+        }
+      ]
     },
     "configuration": {
       "title": "Agent Peers",
