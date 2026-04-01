@@ -30,7 +30,11 @@ import type {
   Peer,
   Message,
   AgentContext,
+  TaskIntent,
   BrokerHealthResponse,
+  CheckConflictsRequest,
+  ConflictResult,
+  CheckConflictsResponse,
   WsEvent,
   WsMessageEvent,
   WsPeerJoinedEvent,
@@ -44,6 +48,7 @@ import {
   STALE_PEER_CLEANUP_MS,
   PEER_TIMEOUT_MS,
 } from "../shared/constants.ts";
+import { terminateProcess } from "../shared/process.ts";
 
 const PORT = parseInt(process.env.AGENT_PEERS_PORT ?? String(DEFAULT_BROKER_PORT), 10);
 const WS_PORT = parseInt(process.env.AGENT_PEERS_WS_PORT ?? String(DEFAULT_WS_PORT), 10);
@@ -477,7 +482,7 @@ function handlePurge(): { purged: number } {
   for (const peer of peers) {
     // Terminate the MCP server process so orphaned sessions don't re-register
     if (peer.pid !== process.pid) {
-      try { process.kill(peer.pid, "SIGTERM"); } catch { /* already gone */ }
+      terminateProcess(peer.pid);
     }
     db.prepare("DELETE FROM peers WHERE id = ?").run(peer.id);
     broadcast({ type: "peer-left", data: { id: peer.id }, timestamp: new Date().toISOString() } satisfies WsPeerLeftEvent);
@@ -501,6 +506,88 @@ function handleCleanup(): { removed: number; remaining: number } {
     }
   }
   return { removed, remaining: (selectAllPeers.all() as unknown as RawPeerRow[]).length };
+}
+
+// ─── Conflict detection ──────────────────────────────────────
+
+const CONFLICT_STOPWORDS = new Set([
+  "the","a","an","is","are","was","were","be","been","being","have","has","had",
+  "do","does","did","will","would","shall","should","may","might","must","can",
+  "could","to","of","in","for","on","with","at","by","from","this","that","it",
+  "and","or","but","not","no","so","if","then","as","into","about","i","we","you",
+  "my","your","its","their","our","all","each","file","files","code","change",
+  "changes","make","update","please","want","need","let","use","using","also",
+  "like","just","get","set","add","new","now","see","look","check","run","try",
+]);
+
+function extractTokens(text: string): string[] {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9_\-/.]/g, " ")
+    .split(/\s+/)
+    .filter(t => t.length > 2 && !CONFLICT_STOPWORDS.has(t));
+}
+
+function handleCheckConflicts(body: CheckConflictsRequest): CheckConflictsResponse {
+  const rows = (selectAllPeers.all() as unknown as RawPeerRow[])
+    .filter(r => r.id !== body.callerId)
+    .filter(r => !r.suspended)
+    .filter(r => body.gitRoot ? r.git_root === body.gitRoot : false);
+
+  const conflicts: ConflictResult[] = [];
+  const promptLower = body.prompt.toLowerCase();
+  const promptTokens = extractTokens(body.prompt);
+
+  for (const row of rows) {
+    const peer = rowToPeer(row);
+    const intent = peer.context.taskIntent;
+    if (!intent || intent.targetFiles.length === 0) continue;
+
+    const reasons: string[] = [];
+    let score = 0;
+
+    // Check 1: File path overlap — prompt mentions files the peer is modifying
+    const fileMatches = intent.targetFiles.filter(f => {
+      const basename = f.split("/").pop()!.toLowerCase();
+      const fLower = f.toLowerCase();
+      return promptLower.includes(basename) || promptLower.includes(fLower);
+    });
+    if (fileMatches.length > 0) {
+      score += 3 * fileMatches.length;
+      reasons.push(`Overlapping files: ${fileMatches.join(", ")}`);
+    }
+
+    // Check 2: Directory/module overlap — prompt mentions areas the peer is working in
+    const areaMatches = intent.targetAreas.filter(a =>
+      promptLower.includes(a.toLowerCase())
+    );
+    if (areaMatches.length > 0) {
+      score += 2 * areaMatches.length;
+      reasons.push(`Overlapping areas: ${areaMatches.join(", ")}`);
+    }
+
+    // Check 3: Keyword overlap — significant tokens in common
+    const intentTokens = extractTokens(intent.description);
+    const commonTokens = intentTokens.filter(t => promptTokens.includes(t));
+    if (commonTokens.length >= 2) {
+      score += commonTokens.length;
+      reasons.push(`Related keywords: ${commonTokens.join(", ")}`);
+    }
+
+    if (score >= 3) {
+      const confidence = score >= 6 ? "high" : score >= 4 ? "medium" : "low";
+      conflicts.push({
+        peerId: peer.id,
+        agentType: peer.agentType,
+        summary: peer.context.summary,
+        taskIntent: intent,
+        reason: reasons.join("; "),
+        confidence,
+      });
+    }
+  }
+
+  return { conflicts };
 }
 
 function handleHealth(): BrokerHealthResponse {
@@ -568,6 +655,9 @@ async function handleRequest(req: Request): Promise<Response> {
         break;
       case "/resume-peer":
         result = handleResumePeer(body as { id: string });
+        break;
+      case "/check-conflicts":
+        result = handleCheckConflicts(body as CheckConflictsRequest);
         break;
       case "/cleanup":
         result = handleCleanup();

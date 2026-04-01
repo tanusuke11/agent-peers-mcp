@@ -29,12 +29,15 @@ import type {
   Peer,
   AgentType,
   AgentContext,
+  TaskIntent,
+  ActiveFile,
   Message,
   RegisterResponse,
   PollMessagesResponse,
   MessageType,
   WsEvent,
   WsMessageEvent,
+  GitContext,
 } from "../shared/types.ts";
 import path from "path";
 import WebSocket from "ws";
@@ -44,6 +47,7 @@ import {
   BROKER_HOST,
   HEARTBEAT_INTERVAL_MS,
 } from "../shared/constants.ts";
+import { onProcessTermination } from "../shared/process.ts";
 import {
   gatherGitContext,
   getGitRoot,
@@ -271,6 +275,45 @@ function getRecentExchanges(): import("../shared/types.ts").RecentExchange[] {
   } catch { return []; }
 }
 
+// ─── Task Intent computation ────────────────────────────────
+
+function computeTaskIntent(
+  summary: string,
+  currentTask: string | undefined,
+  activeFiles: ActiveFile[],
+  git: GitContext | null,
+  baseline: string[],
+): TaskIntent {
+  const description = currentTask || summary || "";
+
+  // targetFiles = (git modified - baseline) + activeFile relative paths
+  const gitModified = git?.modifiedFiles ?? [];
+  const baselineSet = new Set(baseline);
+  const agentModified = gitModified.filter(f => !baselineSet.has(f));
+  const activeRelPaths = activeFiles
+    .map(f => f.relativePath)
+    .filter((p): p is string => !!p);
+  const targetFiles = [...new Set([...agentModified, ...activeRelPaths])];
+
+  // targetAreas = unique directory prefixes (first 2 path segments)
+  const targetAreas = [...new Set(targetFiles.map(f => {
+    const parts = f.replace(/\\/g, "/").split("/");
+    return parts.length > 1
+      ? parts.slice(0, Math.min(2, parts.length - 1)).join("/")
+      : ".";
+  }))];
+
+  // action heuristic from description text
+  const text = `${summary} ${currentTask ?? ""}`.toLowerCase();
+  let action = "update";
+  if (/\brefactor/.test(text)) action = "refactor";
+  else if (/\b(add|create|new|implement)\b/.test(text)) action = "add";
+  else if (/\b(fix|bug|patch|repair)\b/.test(text)) action = "fix";
+  else if (/\b(delete|remove|drop)\b/.test(text)) action = "delete";
+
+  return { description, targetFiles, targetAreas, action };
+}
+
 async function ensureBroker(): Promise<void> {
   if (await isBrokerAlive()) {
     log("Broker already running");
@@ -331,6 +374,8 @@ let myCwd = process.cwd();
 let myGitRoot: string | null = null;
 /** Files already modified at registration time — used to compute agent-only changes */
 let baselineModifiedFiles: string[] = [];
+/** Cached session title for taskIntent computation */
+let cachedSessionTitle: string | null = null;
 
 // ─── MCP Server ────────────────────────────────────────────────
 
@@ -418,7 +463,14 @@ mcp.registerTool("share_context", {
       ?? (activeFiles.length
         ? activeFiles.map((f) => f.relativePath || path.basename(f.path)).join(", ")
         : undefined);
-    const context: Partial<AgentContext> = { summary: resolvedSummary, currentTask: current_task, activeFiles, git: gitCtx, updatedAt: new Date().toISOString() };
+    const taskIntent = computeTaskIntent(
+      resolvedSummary ?? cachedSessionTitle ?? "",
+      current_task,
+      activeFiles,
+      gitCtx,
+      baselineModifiedFiles,
+    );
+    const context: Partial<AgentContext> = { summary: resolvedSummary, currentTask: current_task, activeFiles, git: gitCtx, taskIntent, updatedAt: new Date().toISOString() };
     await brokerFetch("/update-context", { id: myId, context });
     return {
       content: [{
@@ -667,6 +719,7 @@ async function main() {
       const title = await getClaudeSessionTitle();
       if (title) {
         sessionTitleSet = true;
+        cachedSessionTitle = title;
         try {
           await brokerFetch("/update-context", { id: myId, context: { summary: title } });
           log(`Session title set: ${title}`);
@@ -685,6 +738,7 @@ async function main() {
     const setOnce = async () => {
       if (!myId || !desiredTitle || desiredTitle === "home" || desiredTitle === "Untitled") return;
       try {
+        cachedSessionTitle = desiredTitle;
         await brokerFetch("/update-context", { id: myId, context: { summary: desiredTitle } });
         log(`Session title set (auto): ${desiredTitle}`);
       } catch {
@@ -726,6 +780,7 @@ async function main() {
   connectBrokerWs();
   let lastGitJson = ""; // Cache to avoid redundant context updates
   let lastExchangesJson = ""; // Cache to avoid redundant exchange updates
+  let lastTaskIntentJson = ""; // Cache to avoid redundant taskIntent updates
   const heartbeatTimer = setInterval(async () => {
     if (!myId) return;
     try {
@@ -763,6 +818,22 @@ async function main() {
         contextUpdate.recentExchanges = exchanges;
       }
 
+      // Update taskIntent (only if changed)
+      // We need the current summary/task from the broker context; approximate with cached session title
+      const currentSummary = cachedSessionTitle ?? "";
+      const taskIntent = computeTaskIntent(
+        currentSummary,
+        undefined, // currentTask is set explicitly via share_context, not available here
+        [], // activeFiles not tracked automatically in heartbeat
+        gitCtx,
+        baselineModifiedFiles,
+      );
+      const taskIntentJson = JSON.stringify(taskIntent);
+      if (taskIntentJson !== lastTaskIntentJson) {
+        lastTaskIntentJson = taskIntentJson;
+        contextUpdate.taskIntent = taskIntent;
+      }
+
       if (Object.keys(contextUpdate).length > 0) {
         await brokerFetch("/update-context", { id: myId, context: contextUpdate });
       }
@@ -788,8 +859,7 @@ async function main() {
     }
     process.exit(0);
   };
-  process.on("SIGINT", cleanup);
-  process.on("SIGTERM", cleanup);
+  onProcessTermination(cleanup);
 
   // Claude closes stdin when it exits (without necessarily sending a signal).
   // Detect this so we unregister immediately instead of leaving a stale peer.

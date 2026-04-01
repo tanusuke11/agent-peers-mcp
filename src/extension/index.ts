@@ -11,8 +11,63 @@ import * as vscode from "vscode";
 import { BrokerClient } from "./broker-client";
 import { PeerListProvider } from "./views/peer-list";
 import { ControlProvider } from "./views/control";
+import { forceKillProcess } from "../shared/process";
+import * as fs from "fs";
+import * as path from "path";
+import * as os from "os";
 
 let brokerClient: BrokerClient;
+
+/**
+ * Write the UserPromptSubmit hook config to Claude Code's settings.json.
+ * Idempotent — skips if the hook is already configured.
+ */
+function configureConflictHook(extensionUri: vscode.Uri): { configured: boolean; error?: string } {
+  const hookScript = vscode.Uri.joinPath(extensionUri, "out", "hooks", "check-conflicts.js").fsPath;
+  // Use forward slashes for cross-platform compatibility in the command string
+  const hookCommand = `node "${hookScript.replace(/\\/g, "/")}"`;
+
+  const settingsDir = path.join(os.homedir(), ".claude");
+  const settingsPath = path.join(settingsDir, "settings.json");
+
+  try {
+    if (!fs.existsSync(settingsDir)) {
+      fs.mkdirSync(settingsDir, { recursive: true });
+    }
+
+    let settings: Record<string, unknown> = {};
+    if (fs.existsSync(settingsPath)) {
+      settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+    }
+
+    if (!settings.hooks || typeof settings.hooks !== "object") {
+      settings.hooks = {};
+    }
+    const hooks = settings.hooks as Record<string, unknown[]>;
+
+    if (!Array.isArray(hooks.UserPromptSubmit)) {
+      hooks.UserPromptSubmit = [];
+    }
+
+    // Check if already configured
+    const alreadyExists = hooks.UserPromptSubmit.some((group: unknown) => {
+      const g = group as { hooks?: Array<{ command?: string }> };
+      return g.hooks?.some(h => h.command?.includes("check-conflicts"));
+    });
+    if (alreadyExists) {
+      return { configured: false };
+    }
+
+    hooks.UserPromptSubmit.push({
+      hooks: [{ type: "command", command: hookCommand }],
+    });
+
+    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+    return { configured: true };
+  } catch (e) {
+    return { configured: false, error: String(e) };
+  }
+}
 
 export function activate(extensionContext: vscode.ExtensionContext) {
   const config = vscode.workspace.getConfiguration("agentPeers");
@@ -119,7 +174,7 @@ export function activate(extensionContext: vscode.ExtensionContext) {
       const still = await brokerClient.health();
       if (still && brokerPid) {
         // Force kill as fallback (cross-platform)
-        try { process.kill(brokerPid, "SIGKILL"); } catch { /* already dead */ }
+        forceKillProcess(brokerPid);
       }
 
       vscode.window.showInformationMessage("Agent Peers broker stopped.");
@@ -199,14 +254,19 @@ export function activate(extensionContext: vscode.ExtensionContext) {
       terminal.sendText(cmd);
       terminal.show();
       vscode.window.showInformationMessage(`Running: ${cmd}`);
+
+      // Auto-configure conflict detection hook
+      const hookResult = configureConflictHook(extensionContext.extensionUri);
+      if (hookResult.configured) {
+        vscode.window.showInformationMessage("Conflict detection hook configured in ~/.claude/settings.json");
+      } else if (hookResult.error) {
+        vscode.window.showWarningMessage(`Could not configure conflict hook: ${hookResult.error}`);
+      }
     }),
 
     vscode.commands.registerCommand("agentPeers.addMcpServerCodex", async () => {
       const serverScript = vscode.Uri.joinPath(extensionContext.extensionUri, "out", "server", "index.js").fsPath;
       const { exec } = require("child_process") as typeof import("child_process");
-      const os = require("os") as typeof import("os");
-      const fs = require("fs") as typeof import("fs");
-      const path = require("path") as typeof import("path");
       const isWin = process.platform === "win32";
 
       // Check if codex CLI is available (cross-platform)
@@ -286,6 +346,17 @@ AGENT_PEERS_AGENT_TYPE = "codex"
       const current = cfg.get<boolean>("autoStartBroker", false);
       await cfg.update("autoStartBroker", !current, vscode.ConfigurationTarget.Global);
       controlProvider.refresh();
+    }),
+
+    vscode.commands.registerCommand("agentPeers.configConflictHook", async () => {
+      const result = configureConflictHook(extensionContext.extensionUri);
+      if (result.configured) {
+        vscode.window.showInformationMessage("Conflict detection hook configured in ~/.claude/settings.json");
+      } else if (result.error) {
+        vscode.window.showErrorMessage(`Failed to configure hook: ${result.error}`);
+      } else {
+        vscode.window.showInformationMessage("Conflict detection hook is already configured.");
+      }
     }),
   );
 

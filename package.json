@@ -110,6 +110,12 @@
         "title": "Toggle Auto-Start Broker",
         "icon": "$(settings-gear)",
         "category": "Agent Peers"
+      },
+      {
+        "command": "agentPeers.configConflictHook",
+        "title": "Config Conflict Detection Hook",
+        "icon": "$(shield)",
+        "category": "Agent Peers"
       }
     ],
     "menus": {
@@ -169,10 +175,11 @@
     }
   },
   "scripts": {
-    "build": "npm run build:broker && npm run build:server && npm run build:extension",
+    "build": "npm run build:broker && npm run build:server && npm run build:extension && npm run build:hooks",
     "build:broker": "esbuild src/broker/index.ts --bundle --outfile=out/broker/index.js --platform=node --format=cjs",
     "build:server": "esbuild src/server/index.ts --bundle --outfile=out/server/index.js --platform=node --format=cjs",
     "build:extension": "esbuild src/extension/index.ts --bundle --outfile=out/extension/index.js --platform=node --format=cjs --external:vscode",
+    "build:hooks": "esbuild src/hooks/check-conflicts.ts --bundle --outfile=out/hooks/check-conflicts.js --platform=node --format=cjs",
     "dev:broker": "npm run build:broker && node out/broker/index.js",
     "dev:server": "npm run build:server && node out/server/index.js",
     "watch": "esbuild src/extension/index.ts --bundle --outfile=out/extension/index.js --platform=node --format=cjs --external:vscode --watch",

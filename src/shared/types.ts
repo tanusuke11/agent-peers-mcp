@@ -42,6 +42,18 @@ export interface RecentExchange {
   timestamp: string;
 }
 
+/** Structured description of what an agent is currently doing (for conflict detection) */
+export interface TaskIntent {
+  /** What the peer is doing (from session title + currentTask) */
+  description: string;
+  /** Files being modified: (git modified - baseline) + activeFiles */
+  targetFiles: string[];
+  /** Directories/modules being touched (e.g. "src/broker") */
+  targetAreas: string[];
+  /** High-level action: "refactor" | "add" | "fix" | "delete" | "update" */
+  action: string;
+}
+
 /** The structured context an agent shares */
 export interface AgentContext {
   /** Free-text summary of current work */
@@ -52,6 +64,8 @@ export interface AgentContext {
   git: GitContext | null;
   /** Current task description (if any) */
   currentTask?: string;
+  /** Structured task intent for conflict detection */
+  taskIntent?: TaskIntent;
   /** Recent conversation exchanges (truncated, last N turns) */
   recentExchanges?: RecentExchange[];
   /** Key-value metadata (extensible) */
@@ -191,4 +205,25 @@ export interface WsPeerLeftEvent extends WsEvent {
 export interface WsContextUpdatedEvent extends WsEvent {
   type: "context-updated";
   data: { id: PeerId; context: AgentContext };
+}
+
+// ─── Conflict Detection ───────────────────────────────────────
+
+export interface CheckConflictsRequest {
+  prompt: string;
+  callerId: string;
+  gitRoot: string | null;
+}
+
+export interface ConflictResult {
+  peerId: string;
+  agentType: string;
+  summary: string;
+  taskIntent: TaskIntent;
+  reason: string;
+  confidence: "high" | "medium" | "low";
+}
+
+export interface CheckConflictsResponse {
+  conflicts: ConflictResult[];
 }
