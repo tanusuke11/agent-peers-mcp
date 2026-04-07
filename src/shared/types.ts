@@ -109,6 +109,8 @@ export interface Peer {
   pendingMessages?: number;
   /** Number of unread report messages for this peer (replies to task-handoffs) */
   pendingReports?: number;
+  /** Total number of messages (read + unread) stored for this peer in the sidebar */
+  totalMessages?: number;
 }
 
 // ─── Messages ──────────────────────────────────────────────────

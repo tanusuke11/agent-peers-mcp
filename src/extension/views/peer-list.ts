@@ -7,7 +7,7 @@
 import * as path from "path";
 import * as vscode from "vscode";
 import type { BrokerClient } from "../broker-client";
-import type { Peer, Message } from "../../shared/types";
+import type { Peer, RecentExchange } from "../../shared/types";
 
 export class PeerListProvider implements vscode.TreeDataProvider<PeerItem> {
   private _onDidChangeTreeData = new vscode.EventEmitter<PeerItem | undefined>();
@@ -25,27 +25,28 @@ export class PeerListProvider implements vscode.TreeDataProvider<PeerItem> {
 
   async getChildren(element?: PeerItem): Promise<PeerItem[]> {
     if (element) {
-      // Lazily load report items when a "reports" node is expanded
-      if (element.reportsForPeerId) {
-        const reports = await this.client.listReports(element.reportsForPeerId);
-        return reports.map((r) => {
-          const preview = r.text.length > 80 ? r.text.slice(0, 80) + "…" : r.text;
-          const item = leaf(`${r.fromId}: ${preview}`, undefined, "mail-read", new vscode.ThemeColor("charts.green"));
-          item.tooltip = `[report] from ${r.fromId}\nSent: ${r.sentAt}\n\n${r.text}`;
-          return item;
-        });
-      }
-      // Lazily load unread message items when a "messages" node is expanded
-      if (element.messagesForPeerId) {
-        const messages = await this.client.peekMessages(element.messagesForPeerId);
+      // Lazily load all messages (read + unread, all types) when an "incoming" node is expanded
+      if (element.incomingForPeerId) {
+        const messages = await this.client.listMessages(element.incomingForPeerId);
         return messages.map((m) => {
           const preview = m.text.length > 80 ? m.text.slice(0, 80) + "…" : m.text;
-          const icon = m.type === "task-handoff" ? "arrow-swap" : "comment";
-          const color = m.type === "task-handoff"
-            ? new vscode.ThemeColor("charts.red")
-            : new vscode.ThemeColor("charts.blue");
-          const item = leaf(`← ${m.fromId}: ${preview}`, undefined, icon, color);
+          const isReport = m.type === "report";
+          const icon = isReport ? "mail-read" : m.type === "task-handoff" ? "arrow-swap" : "comment";
+          const color = isReport
+            ? new vscode.ThemeColor("charts.green")
+            : m.type === "task-handoff"
+              ? new vscode.ThemeColor("charts.red")
+              : new vscode.ThemeColor("charts.blue");
+          const prefix = isReport ? "📨" : "←";
+          const item = leaf(`${prefix} ${m.fromId}: ${preview}`, undefined, icon, color);
           item.tooltip = `[${m.type}] from ${m.fromId}\nSent: ${m.sentAt}\n\n${m.text}`;
+          item.contextValue = "incomingMessage";
+          item.messageId = m.id;
+          item.command = {
+            command: "agentPeers.openMessageInEditor",
+            title: "Open in Editor",
+            arguments: [m],
+          };
           return item;
         });
       }
@@ -288,6 +289,11 @@ function buildContextItems(peer: Peer): PeerItem[] {
       dim ?? new vscode.ThemeColor("charts.foreground"),
     );
     rawItem.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
+    rawItem.command = {
+      command: "agentPeers.openMessageInEditor",
+      title: "Open in Editor",
+      arguments: [buildRecentContextDocument(peer, exchanges)],
+    };
     rawItem.children = exchanges.map((ex) => {
       const icon = ex.role === "human" ? "account" : "hubot";
       const color = ex.role === "human"
@@ -295,6 +301,11 @@ function buildContextItems(peer: Peer): PeerItem[] {
         : (dim ?? new vscode.ThemeColor("charts.green"));
       const item = leaf(ex.text, undefined, icon, color);
       item.tooltip = `[${ex.role}] ${ex.timestamp}\n\n${ex.text}`;
+      item.command = {
+        command: "agentPeers.openMessageInEditor",
+        title: "Open in Editor",
+        arguments: [buildRecentExchangeDocument(peer, ex)],
+      };
       return item;
     });
     chatChildren.push(rawItem);
@@ -314,36 +325,25 @@ function buildContextItems(peer: Peer): PeerItem[] {
     items.push(chatItem);
   }
 
-  // Messages subtree — lazily loaded when expanded
-  const messageCount = peer.pendingMessages ?? 0;
-  if (messageCount > 0) {
-    const messagesItem = new PeerItem(
-      `Incoming Messages (${messageCount} unread)`,
+  // Incoming messages + reports subtree — lazily loaded when expanded
+  const totalMessages = peer.totalMessages ?? 0;
+  if (totalMessages > 0) {
+    const unreadCount = (peer.pendingMessages ?? 0) + (peer.pendingReports ?? 0);
+    const label = unreadCount > 0
+      ? `Incoming Messages (${totalMessages}, ${unreadCount} unread)`
+      : `Incoming Messages (${totalMessages})`;
+    const incomingItem = new PeerItem(
+      label,
       peer.id,
       "detail",
       undefined,
       "mail",
       dim ?? new vscode.ThemeColor("notificationsInfoIcon.foreground"),
     );
-    messagesItem.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
-    messagesItem.messagesForPeerId = peer.id;
-    items.push(messagesItem);
-  }
-
-  // Reports subtree — lazily loaded when expanded
-  const reportCount = peer.pendingReports ?? 0;
-  if (reportCount > 0) {
-    const reportsItem = new PeerItem(
-      `📨 Reports (${reportCount} unread)`,
-      peer.id,
-      "detail",
-      undefined,
-      "inbox",
-      dim ?? new vscode.ThemeColor("charts.orange"),
-    );
-    reportsItem.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
-    reportsItem.reportsForPeerId = peer.id;
-    items.push(reportsItem);
+    incomingItem.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
+    incomingItem.incomingForPeerId = peer.id;
+    incomingItem.contextValue = "incomingMessagesHeader";
+    items.push(incomingItem);
   }
 
   return items;
@@ -358,12 +358,53 @@ function leaf(label: string, value: string | undefined, iconId: string, iconColo
   return item;
 }
 
+function buildRecentContextDocument(peer: Peer, exchanges: RecentExchange[]) {
+  const lines = exchanges.flatMap((ex) => [
+    `## ${ex.role === "human" ? "Human" : "Assistant"} · ${ex.timestamp}`,
+    "",
+    ex.text,
+    "",
+  ]);
+
+  return {
+    title: `Recent Context: ${peer.id}`,
+    header: [
+      `# Recent Context for ${peer.id}`,
+      "",
+      `- **Agent:** ${peer.agentType}`,
+      `- **Workspace:** ${peer.cwd}`,
+      `- **Exchanges:** ${exchanges.length}`,
+      "",
+      "---",
+      "",
+    ].join("\n"),
+    text: lines.join("\n").trim(),
+  };
+}
+
+function buildRecentExchangeDocument(peer: Peer, exchange: RecentExchange) {
+  return {
+    title: `Recent Context: ${peer.id}`,
+    header: [
+      `# Recent Context for ${peer.id}`,
+      "",
+      `- **Agent:** ${peer.agentType}`,
+      `- **Role:** ${exchange.role}`,
+      `- **Timestamp:** ${exchange.timestamp}`,
+      "",
+      "---",
+      "",
+    ].join("\n"),
+    text: exchange.text,
+  };
+}
+
 class PeerItem extends vscode.TreeItem {
   children?: PeerItem[];
-  /** When set, getChildren will lazily fetch reports for this peer ID */
-  reportsForPeerId?: string;
-  /** When set, getChildren will lazily fetch unread messages for this peer ID */
-  messagesForPeerId?: string;
+  /** When set, getChildren will lazily fetch all messages for this peer ID */
+  incomingForPeerId?: string;
+  /** Message ID for individual message items — used by delete command */
+  messageId?: number;
 
   static projectHeader(projectName: string, peerCount: number): PeerItem {
     const item = new PeerItem(projectName, "", "header");

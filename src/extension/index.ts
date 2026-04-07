@@ -38,7 +38,7 @@ const MESSAGE_BATCH_DELAY_MS = 600;
 
 // ─── Terminal lookup helpers ──────────────────────────────
 
-/** Get the parent PID of a process. Linux reads /proc, others use ps/wmic. */
+/** Get the parent PID of a process. Linux reads /proc, others use ps/PowerShell. */
 function getParentPid(pid: number): number {
   try {
     if (process.platform === "linux") {
@@ -51,9 +51,12 @@ function getParentPid(pid: number): number {
       return parseInt(execSync(`ps -o ppid= -p ${pid}`, { encoding: "utf8", timeout: 3000 }).trim(), 10) || 0;
     }
     if (process.platform === "win32") {
-      const out = execSync(`wmic process where ProcessId=${pid} get ParentProcessId /format:list`, { encoding: "utf8", timeout: 3000 }).trim();
-      const m = out.match(/ParentProcessId=(\d+)/);
-      return m ? parseInt(m[1]!, 10) : 0;
+      // wmic is deprecated/removed in Windows 11 — use PowerShell instead
+      const out = execSync(
+        `powershell -NoProfile -Command "(Get-WmiObject Win32_Process -Filter 'ProcessId=${pid}').ParentProcessId"`,
+        { encoding: "utf8", timeout: 5000 },
+      ).trim();
+      return parseInt(out, 10) || 0;
     }
     return 0;
   } catch { return 0; }
@@ -239,6 +242,28 @@ export function activate(extensionContext: vscode.ExtensionContext) {
     }
   }
 
+  // Show a message to the user via VS Code notification (for extension peers or fallback).
+  async function showMessageNotification(fromId: string, toId: string, type: string, combined: string) {
+    const typeLabel = type === "task-handoff" ? "Task handoff" : type === "context-request" ? "Context request" : "Message";
+    const preview = combined.length > 200 ? combined.slice(0, 200) + "…" : combined;
+    const choice = await vscode.window.showInformationMessage(
+      `${typeLabel} from ${fromId} → ${toId}:\n${preview}`,
+      { modal: false },
+      "Copy to Clipboard",
+      "Open in Editor",
+    );
+    if (choice === "Copy to Clipboard") {
+      await vscode.env.clipboard.writeText(combined);
+    } else if (choice === "Open in Editor") {
+      const doc = await vscode.workspace.openTextDocument({ content: `[Message from ${fromId} (${type})]\n\n${combined}`, language: "markdown" });
+      await vscode.window.showTextDocument(doc, { preview: true });
+    }
+    // Do NOT call markRead here: messages must persist in the sidebar until manually removed,
+    // regardless of whether the user dismissed, copied, or opened the notification.
+    peerListProvider.refresh();
+    updateMessageBadge();
+  }
+
   // Flush a batched delivery: combine all queued texts into one sendText().
   async function flushDelivery(key: string) {
     const pending = pendingDeliveries.get(key);
@@ -248,10 +273,18 @@ export function activate(extensionContext: vscode.ExtensionContext) {
     const combined = pending.texts.join("\n\n");
     const prompt = `[Message from ${pending.fromId} (${pending.type})] ${combined}`;
 
+    // Check if the target is an extension peer (no terminal available)
+    const peers = await brokerClient.listPeers("machine");
+    const peer = peers.find(p => p.id === pending.toId);
+    if (peer?.source === "extension") {
+      await showMessageNotification(pending.fromId, pending.toId, pending.type, combined);
+      return;
+    }
+
     const autoDeliver = vscode.workspace.getConfiguration("agentPeers").get<boolean>("autoDeliveryMessage", true);
 
     if (!autoDeliver) {
-      const typeLabel = pending.type === "task-handoff" ? "🔄 Task handoff" : pending.type === "context-request" ? "📋 Context request" : "💬 Message";
+      const typeLabel = pending.type === "task-handoff" ? "Task handoff" : pending.type === "context-request" ? "Context request" : "Message";
       const preview = combined.length > 200 ? combined.slice(0, 200) + "…" : combined;
       const choice = await vscode.window.showInformationMessage(
         `${typeLabel} from ${pending.fromId} → ${pending.toId}:\n${preview}`,
@@ -260,8 +293,6 @@ export function activate(extensionContext: vscode.ExtensionContext) {
         "Dismiss",
       );
       if (choice === "Deliver to Terminal") {
-        const peers = await brokerClient.listPeers("machine");
-        const peer = peers.find(p => p.id === pending.toId);
         if (peer) {
           const terminal = await findTerminalForPid(peer.pid);
           if (terminal) {
@@ -276,8 +307,6 @@ export function activate(extensionContext: vscode.ExtensionContext) {
       return;
     }
 
-    const peers = await brokerClient.listPeers("machine");
-    const peer = peers.find(p => p.id === pending.toId);
     if (peer) {
       const terminal = await findTerminalForPid(peer.pid);
       if (terminal) {
@@ -290,9 +319,8 @@ export function activate(extensionContext: vscode.ExtensionContext) {
       }
     }
 
-    // Fallback: toast
-    const preview = combined.length > 120 ? combined.slice(0, 120) + "…" : combined;
-    vscode.window.showInformationMessage(`💬 ${pending.fromId}: ${preview}`);
+    // Fallback: notification with actions
+    await showMessageNotification(pending.fromId, pending.toId, pending.type, combined);
   }
 
   brokerClient.on("message", (data) => {
@@ -342,7 +370,13 @@ export function activate(extensionContext: vscode.ExtensionContext) {
         return;
       }
 
-      const items = peers.map((p) => {
+      const activePeers = peers.filter((p) => !p.suspended);
+      if (activePeers.length === 0) {
+        vscode.window.showInformationMessage("No active peers found — all peers are currently sleeping.");
+        return;
+      }
+
+      const items = activePeers.map((p) => {
         const sourceLabel = p.source === "extension" ? "[ext]" : "[term]";
         return {
           label: `${p.agentType} — ${p.id} ${sourceLabel}`,
@@ -357,13 +391,6 @@ export function activate(extensionContext: vscode.ExtensionContext) {
         placeHolder: "Select a peer to message",
       });
       if (!selected) return;
-
-      if (selected.source === "extension") {
-        vscode.window.showWarningMessage(
-          "Extension peers cannot receive general messages. Only report replies to task-handoffs are allowed.",
-        );
-        return;
-      }
 
       const message = await vscode.window.showInputBox({
         placeHolder: "Enter your message...",
@@ -679,6 +706,56 @@ AGENT_PEERS_AGENT_TYPE = "codex"
       // Update the running broker in real-time
       await brokerClient.updateConfig({ autoConflictCheck: newValue });
       controlProvider.refresh();
+    }),
+
+    vscode.commands.registerCommand("agentPeers.openMessageInEditor", async (
+      item?: {
+        fromId?: string;
+        toId?: string;
+        type?: string;
+        text?: string;
+        sentAt?: string;
+        title?: string;
+        header?: string;
+      },
+    ) => {
+      if (!item?.text) return;
+      const header = item.header ?? [
+        `# Message from ${item.fromId ?? "unknown"}`,
+        "",
+        `- **Type:** ${item.type ?? "text"}`,
+        `- **Sent:** ${item.sentAt ?? "unknown"}`,
+        item.toId ? `- **To:** ${item.toId}` : "",
+        "",
+        "---",
+        "",
+      ].filter(Boolean).join("\n");
+      const content = header + item.text;
+      const doc = await vscode.workspace.openTextDocument({ content, language: "markdown" });
+      await vscode.window.showTextDocument(doc, { preview: true });
+    }),
+
+    vscode.commands.registerCommand("agentPeers.deleteMessage", async (item?: { messageId?: number; peerId?: string }) => {
+      if (!item?.messageId) return;
+      try {
+        await brokerClient.deleteMessage(item.messageId);
+        peerListProvider.refresh();
+        updateMessageBadge();
+      } catch (e) {
+        vscode.window.showErrorMessage(`Failed to delete message: ${e}`);
+      }
+    }),
+
+    vscode.commands.registerCommand("agentPeers.clearMessages", async (item?: { incomingForPeerId?: string; peerId?: string }) => {
+      const peerId = item?.incomingForPeerId ?? item?.peerId;
+      if (!peerId) return;
+      try {
+        await brokerClient.clearMessages(peerId);
+        peerListProvider.refresh();
+        updateMessageBadge();
+      } catch (e) {
+        vscode.window.showErrorMessage(`Failed to clear messages: ${e}`);
+      }
     }),
 
     vscode.commands.registerCommand("agentPeers.configConflictHook", async () => {

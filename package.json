@@ -124,6 +124,12 @@
         "category": "Agent Peers"
       },
       {
+        "command": "agentPeers.openMessageInEditor",
+        "title": "Open Message in Editor",
+        "icon": "$(go-to-file)",
+        "category": "Agent Peers"
+      },
+      {
         "command": "agentPeers.toggleAutoConflictCheck",
         "title": "Toggle Auto Conflict Check",
         "icon": "$(shield)",
@@ -146,6 +152,18 @@
         "title": "Delete Peer",
         "icon": "$(trash)",
         "category": "Agent Peers"
+      },
+      {
+        "command": "agentPeers.deleteMessage",
+        "title": "Remove Message",
+        "icon": "$(close)",
+        "category": "Agent Peers"
+      },
+      {
+        "command": "agentPeers.clearMessages",
+        "title": "Clear All Messages",
+        "icon": "$(clear-all)",
+        "category": "Agent Peers"
       }
     ],
     "menus": {
@@ -165,6 +183,16 @@
         {
           "command": "agentPeers.deletePeer",
           "when": "view == agentPeers.peerList && viewItem =~ /^(peer|sleepPeer)$/",
+          "group": "inline"
+        },
+        {
+          "command": "agentPeers.deleteMessage",
+          "when": "view == agentPeers.peerList && viewItem == incomingMessage",
+          "group": "inline"
+        },
+        {
+          "command": "agentPeers.clearMessages",
+          "when": "view == agentPeers.peerList && viewItem == incomingMessagesHeader",
           "group": "inline"
         }
       ],

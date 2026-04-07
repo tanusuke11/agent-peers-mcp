@@ -22,7 +22,10 @@ async function run(cmd: string[], cwd: string): Promise<string | null> {
 }
 
 export async function getGitRoot(cwd: string): Promise<string | null> {
-  return run(["git", "rev-parse", "--show-toplevel"], cwd);
+  const result = await run(["git", "rev-parse", "--show-toplevel"], cwd);
+  if (!result || process.platform !== "win32") return result;
+  // Git for Windows (MSYS2) returns POSIX paths like /c/Users/foo — convert to Win32
+  return result.replace(/^\/([a-zA-Z])\//, (_, d) => `${d.toUpperCase()}:\\`).replace(/\//g, "\\");
 }
 
 export async function getGitBranch(cwd: string): Promise<string | null> {

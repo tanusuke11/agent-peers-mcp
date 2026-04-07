@@ -17,6 +17,7 @@
  *   AGENT_PEERS_AGENT_TYPE  — "claude-code" | "codex" | "generic"
  *   AGENT_PEERS_PORT        — broker HTTP port (default 7899)
  *   AGENT_PEERS_MAX_MESSAGES_PER_DIRECTION — max messages from A→B (default 50, min 1)
+ *   AGENT_PEERS_TRUST_BROKER_ID_ONLY — "false" to disable the strict broker-ID instruction (default: enabled)
  */
 
 import { spawn } from "child_process";
@@ -67,6 +68,7 @@ const WS_PORT = parseInt(process.env.AGENT_PEERS_WS_PORT ?? String(DEFAULT_WS_PO
 const BROKER_URL = `http://${BROKER_HOST}:${BROKER_PORT}`;
 const BROKER_WS_URL = `ws://${BROKER_HOST}:${WS_PORT}`;
 const AGENT_TYPE = (process.env.AGENT_PEERS_AGENT_TYPE ?? "claude-code") as AgentType;
+const TRUST_BROKER_ID_ONLY = process.env.AGENT_PEERS_TRUST_BROKER_ID_ONLY !== "false"; // default: true
 const BROKER_SCRIPT = path.join(__dirname, "..", "broker", "index.js");
 const CODEX_SESSIONS_DIR = path.join(os.homedir(), ".codex", "sessions");
 
@@ -104,7 +106,7 @@ const BROKER_LOCK = path.join(os.tmpdir(), "agent-peers-broker.lock");
  * Get the command-line arguments of a process by PID (cross-platform).
  * Linux: reads /proc/<pid>/cmdline
  * macOS: uses `ps -o args=`
- * Windows: uses `wmic`
+ * Windows: uses PowerShell Get-WmiObject (wmic is deprecated in Windows 11)
  */
 function getProcessArgs(pid: number): string[] | null {
   try {
@@ -116,9 +118,12 @@ function getProcessArgs(pid: number): string[] | null {
       return execSync(`ps -o args= -p ${pid}`, { encoding: "utf8", timeout: 3000 }).trim().split(/\s+/);
     }
     if (process.platform === "win32") {
-      const out = execSync(`wmic process where ProcessId=${pid} get CommandLine /format:list`, { encoding: "utf8", timeout: 3000 }).trim();
-      const match = out.match(/CommandLine=(.*)/);
-      return match ? match[1]!.split(/\s+/) : null;
+      // wmic is deprecated/removed in Windows 11 — use PowerShell instead
+      const out = execSync(
+        `powershell -NoProfile -Command "(Get-WmiObject Win32_Process -Filter 'ProcessId=${pid}').CommandLine"`,
+        { encoding: "utf8", timeout: 5000 },
+      ).trim();
+      return out ? out.split(/\s+/) : null;
     }
     return null;
   } catch { return null; }
@@ -128,7 +133,7 @@ function getProcessArgs(pid: number): string[] | null {
  * Get the parent PID of a process (cross-platform).
  * Linux: reads /proc/<pid>/status
  * macOS: uses `ps -o ppid=`
- * Windows: uses `wmic`
+ * Windows: uses PowerShell Get-WmiObject (wmic is deprecated in Windows 11)
  */
 function getParentPid(pid: number): number {
   try {
@@ -142,9 +147,12 @@ function getParentPid(pid: number): number {
       return parseInt(execSync(`ps -o ppid= -p ${pid}`, { encoding: "utf8", timeout: 3000 }).trim(), 10) || 0;
     }
     if (process.platform === "win32") {
-      const out = execSync(`wmic process where ProcessId=${pid} get ParentProcessId /format:list`, { encoding: "utf8", timeout: 3000 }).trim();
-      const match = out.match(/ParentProcessId=(\d+)/);
-      return match ? parseInt(match[1]!, 10) : 0;
+      // wmic is deprecated/removed in Windows 11 — use PowerShell instead
+      const out = execSync(
+        `powershell -NoProfile -Command "(Get-WmiObject Win32_Process -Filter 'ProcessId=${pid}').ParentProcessId"`,
+        { encoding: "utf8", timeout: 5000 },
+      ).trim();
+      return parseInt(out, 10) || 0;
     }
     return 0;
   } catch { return 0; }
@@ -355,8 +363,13 @@ function getProcessStartTimeMs(pid: number): number | null {
       return seconds !== null ? Date.now() - (seconds * 1000) : null;
     }
     if (process.platform === "win32") {
-      const out = execSync(`wmic process where ProcessId=${pid} get CreationDate /format:list`, { encoding: "utf8", timeout: 3000 }).trim();
-      const match = out.match(/CreationDate=(\d{14})\./);
+      // wmic is deprecated/removed in Windows 11 — use PowerShell instead
+      const out = execSync(
+        `powershell -NoProfile -Command "(Get-WmiObject Win32_Process -Filter 'ProcessId=${pid}').CreationDate"`,
+        { encoding: "utf8", timeout: 5000 },
+      ).trim();
+      // PowerShell returns a WMI datetime string like "20240101120000.000000+000"
+      const match = out.match(/(\d{14})/);
       if (!match) return null;
       const raw = match[1]!;
       const iso = `${raw.slice(0, 4)}-${raw.slice(4, 6)}-${raw.slice(6, 8)}T${raw.slice(8, 10)}:${raw.slice(10, 12)}:${raw.slice(12, 14)}Z`;
@@ -744,14 +757,19 @@ let cachedSessionTitle: string | null = null;
 
 // ─── MCP Server ────────────────────────────────────────────────
 
+const TRUST_BROKER_ID_INSTRUCTION = TRUST_BROKER_ID_ONLY
+  ? "\nIMPORTANT: Your peer ID is assigned exclusively by the broker. NEVER assume or guess your own peer ID — always call `whoami` to retrieve it. Do not rely on your training knowledge or conversation context to determine who you are on the network."
+  : "";
+
 const mcp = new McpServer(
   { name: "agent-peers", version: "0.1.0" },
   {
     instructions: `You are connected to the agent-peers network. Other AI agent instances (Claude Code, Codex, etc.) on this machine can discover you, send you messages, and share structured context.
 
-IMPORTANT: When you receive a <channel source="agent-peers" ...> message, RESPOND IMMEDIATELY. Pause what you are doing, reply using send_message, then resume your work.
+IMPORTANT: When you receive a <channel source="agent-peers" ...> message, RESPOND IMMEDIATELY. Pause what you are doing, reply using send_message, then resume your work.${TRUST_BROKER_ID_INSTRUCTION}
 
 Available tools:
+- whoami: Get your own broker-assigned peer ID and registration info. Use this to know your identity on the network.
 - list_peers: Discover other AI agent instances (scope: machine/directory/repo)
 - send_message: Send a message or task handoff to another instance
 - share_context: Share your current structured context (active files, git state, task). Also runs an automatic conflict check.
@@ -765,6 +783,25 @@ When you start, proactively call share_context to publish your current state. Th
 );
 
 // ─── Tool handlers ─────────────────────────────────────────────
+
+mcp.registerTool("whoami", {
+  description: "Get your own broker-assigned peer ID and registration info. Always use this to determine your identity on the agent-peers network — never assume or guess your peer ID.",
+  inputSchema: {},
+}, async () => {
+  if (!myId) return { content: [{ type: "text" as const, text: "Not registered yet — broker registration is pending." }], isError: true };
+  const parts = [
+    `Your peer ID: ${myId}`,
+    `Agent type: ${AGENT_TYPE}`,
+    `CWD: ${myCwd}`,
+    `Git root: ${myGitRoot ?? "(none)"}`,
+    `Source: ${mySource}`,
+    `Owner PID: ${ownerPid}`,
+  ];
+  if (TRUST_BROKER_ID_ONLY) {
+    parts.push("\nNote: This ID is assigned by the broker and is the authoritative source of your identity on the network.");
+  }
+  return { content: [{ type: "text" as const, text: parts.join("\n") }] };
+});
 
 mcp.registerTool("list_peers", {
   description: "List AI agent instances running on this machine, including yourself (marked with '(you)'). Returns their ID, agent type (claude-code/codex), working directory, git repo, and current context summary.",
@@ -791,7 +828,7 @@ mcp.registerTool("list_peers", {
 });
 
 mcp.registerTool("send_message", {
-  description: "Send a message to another AI agent instance. Supports types: 'text' (general), 'context-request' (ask for context), 'task-handoff' (delegate a task), 'report' (reply to a task-handoff with a work report — NOT delivered to the requester's terminal, only visible in their UI). Extension peers do not accept general messages, but they do accept 'report' messages when reply_to points to their original task-handoff. For task-handoff, the broker checks for duplicate/similar tasks already in progress and blocks if found — use force=true to override.",
+  description: "Send a message to another AI agent instance. Supports types: 'text' (general), 'context-request' (ask for context), 'task-handoff' (delegate a task), 'report' (reply to a task-handoff with a work report — NOT delivered to the requester's terminal, only visible in their UI). All peer types (terminal and extension) accept all message types. For 'report' messages to extension peers, reply_to must point to the original task-handoff. For task-handoff, the broker checks for duplicate/similar tasks already in progress and blocks if found — use force=true to override. Suspended/sleeping peers (suspended=true in list_peers) are not valid recipients — messages to them will be rejected.",
   inputSchema: {
     to_id: z.string().describe("The peer ID of the target agent (from list_peers)"),
     message: z.string().describe("The message text"),

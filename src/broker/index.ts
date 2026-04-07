@@ -262,6 +262,10 @@ interface RawPeerRow {
 const countUndelivered = db.prepare(`SELECT COUNT(*) as cnt FROM messages WHERE to_id = ? AND read = 0 AND type != 'report'`);
 const countUnreadReports = db.prepare(`SELECT COUNT(*) as cnt FROM messages WHERE to_id = ? AND read = 0 AND type = 'report'`);
 const countPerDirection = db.prepare(`SELECT COUNT(*) as cnt FROM messages WHERE from_id = ? AND to_id = ?`);
+const countAllMessages = db.prepare(`SELECT COUNT(*) as cnt FROM messages WHERE to_id = ?`);
+const selectAllMessagesForPeer = db.prepare(`SELECT * FROM messages WHERE to_id = ? ORDER BY sent_at ASC`);
+const deleteMessageById = db.prepare(`DELETE FROM messages WHERE id = ?`);
+const clearMessagesForPeer = db.prepare(`DELETE FROM messages WHERE to_id = ?`);
 
 function rowToPeer(row: RawPeerRow): Peer {
   const pending = (countUndelivered.get(row.id) as unknown as { cnt: number })?.cnt ?? 0;
@@ -281,6 +285,10 @@ function rowToPeer(row: RawPeerRow): Peer {
     pendingMessages: pending > 0 ? pending : undefined,
     pendingReports: (() => {
       const cnt = (countUnreadReports.get(row.id) as unknown as { cnt: number })?.cnt ?? 0;
+      return cnt > 0 ? cnt : undefined;
+    })(),
+    totalMessages: (() => {
+      const cnt = (countAllMessages.get(row.id) as unknown as { cnt: number })?.cnt ?? 0;
       return cnt > 0 ? cnt : undefined;
     })(),
   };
@@ -609,15 +617,25 @@ function handleSendMessage(body: SendMessageRequest): SendMessageResponse {
     return { ok: false, error: `Peer ${body.toId} not found` };
   }
 
-  // Extension peers do not accept general messages.
-  // The only allowed inbound message is a report that is explicitly linked
-  // to a prior task-handoff sent by that extension peer.
-  const targetSource = target.source ?? "terminal";
-  if (targetSource !== "terminal") {
-    if (body.type !== "report") {
-      return { ok: false, error: `Cannot send ${body.type} messages to ${targetSource} peer ${body.toId}. Extension peers only accept report replies to prior task-handoffs.` };
-    }
+  // Reject messages to suspended (sleeping) peers — they have no active session to receive them
+  if (target.suspended) {
+    return {
+      ok: false,
+      error: `Cannot send message to peer ${body.toId}: peer is currently sleeping/suspended. Wait for it to resume or choose a different peer.`,
+    };
+  }
 
+  // Reject task-handoff to extension peers — they cannot autonomously execute tasks
+  const targetSource = target.source ?? "terminal";
+  if (targetSource !== "terminal" && body.type === "task-handoff") {
+    return {
+      ok: false,
+      error: `Cannot send task-handoff to extension peer ${body.toId}: extension peers cannot execute tasks autonomously. Choose a terminal peer instead.`,
+    };
+  }
+
+  // For report messages to extension peers, validate the replyTo chain
+  if (targetSource !== "terminal" && body.type === "report") {
     if (!body.replyTo) {
       return { ok: false, error: `Report to ${targetSource} peer ${body.toId} must include replyTo for the original task-handoff.` };
     }
@@ -713,7 +731,18 @@ function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
     markRead.run(row.id);
   }
 
-  return { found: true, messages: rows.map(rowToMessage) };
+  return {
+    found: true,
+    messages: rows.map((row) => {
+      const msg = rowToMessage(row);
+      if (msg.type === "task-handoff") {
+        msg.text =
+          msg.text +
+          `\n\n---\n[Agent Peers] This is a task-handoff. Please send a \`report\` message back to "${msg.fromId}" (use reply_to: ${msg.id}) when the task is complete.`;
+      }
+      return msg;
+    }),
+  };
 }
 
 /** Return unread messages WITHOUT marking them as read.
@@ -934,6 +963,27 @@ function handleMarkReportsRead(body: { id: string }): { ok: boolean; marked: num
   return { ok: true, marked: rows.length };
 }
 
+/** List all messages (read + unread, all types) for a peer — used by the sidebar for persistent display. */
+function handleListMessages(body: { id: string }): { messages: Message[] } {
+  const exists = selectPeerById.get(body.id) as unknown as RawPeerRow | undefined;
+  if (!exists) return { messages: [] };
+  const rows = selectAllMessagesForPeer.all(body.id) as unknown as RawMessageRow[];
+  return { messages: rows.map(rowToMessage) };
+}
+
+/** Delete a single message by ID. */
+function handleDeleteMessage(body: { id: number }): { ok: boolean } {
+  deleteMessageById.run(body.id);
+  return { ok: true };
+}
+
+/** Delete all messages for a peer. */
+function handleClearMessages(body: { peerId: string }): { ok: boolean; cleared: number } {
+  const rows = selectAllMessagesForPeer.all(body.peerId) as unknown as RawMessageRow[];
+  clearMessagesForPeer.run(body.peerId);
+  return { ok: true, cleared: rows.length };
+}
+
 function handleWakePeer(body: { id: string }): { ok: boolean; delivered: number } {
   const row = selectPeerById.get(body.id) as unknown as RawPeerRow | undefined;
   if (!row) return { ok: false, delivered: 0 };
@@ -1057,6 +1107,15 @@ async function handleRequest(req: Request): Promise<Response> {
         break;
       case "/mark-reports-read":
         result = handleMarkReportsRead(body as { id: string });
+        break;
+      case "/list-messages":
+        result = handleListMessages(body as { id: string });
+        break;
+      case "/delete-message":
+        result = handleDeleteMessage(body as { id: number });
+        break;
+      case "/clear-messages":
+        result = handleClearMessages(body as { peerId: string });
         break;
       case "/wake-peer":
         result = handleWakePeer(body as { id: string });

@@ -174,6 +174,23 @@ export class BrokerClient {
     } catch { /* best effort */ }
   }
 
+  async listMessages(peerId: string): Promise<Message[]> {
+    try {
+      const result = await this.post<{ messages: Message[] }>("/list-messages", { id: peerId });
+      return result.messages;
+    } catch {
+      return [];
+    }
+  }
+
+  async deleteMessage(messageId: number): Promise<void> {
+    await this.post("/delete-message", { id: messageId });
+  }
+
+  async clearMessages(peerId: string): Promise<void> {
+    await this.post("/clear-messages", { peerId });
+  }
+
   async purge(): Promise<{ purged: number } | null> {
     try {
       return await this.post<{ purged: number }>("/purge", {});
