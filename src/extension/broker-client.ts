@@ -182,6 +182,14 @@ export class BrokerClient {
     }
   }
 
+  async updateConfig(config: { maxMessagesPerDirection?: number }): Promise<{ ok: boolean; maxMessagesPerDirection: number } | null> {
+    try {
+      return await this.post<{ ok: boolean; maxMessagesPerDirection: number }>("/update-config", config);
+    } catch {
+      return null;
+    }
+  }
+
   async registerPeer(agentType: string, pid: number, cwd: string, gitRoot: string | null, source: "terminal" | "extension" = "extension"): Promise<{ id: string }> {
     const now = new Date().toISOString();
     return await this.post<{ id: string }>("/register", {
@@ -209,9 +217,17 @@ export class BrokerClient {
     // Start broker as a detached background process (no terminal needed)
     const brokerPath = vscode.Uri.joinPath(extensionUri, "out", "broker", "index.js").fsPath;
     const { spawn } = require("child_process") as typeof import("child_process");
+    const cfg = vscode.workspace.getConfiguration("agentPeers");
+    const maxMsg = cfg.get<number>("maxMessagesPerDirection", 8);
+    const autoConflict = cfg.get<boolean>("autoConflictCheck", true);
     const proc = spawn("node", [brokerPath], {
       stdio: "ignore",
       detached: true,
+      env: {
+        ...process.env,
+        AGENT_PEERS_MAX_MESSAGES_PER_DIRECTION: String(maxMsg),
+        AGENT_PEERS_AUTO_CONFLICT_CHECK: String(autoConflict),
+      },
     });
     proc.unref();
 

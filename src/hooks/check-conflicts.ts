@@ -55,10 +55,12 @@ async function main() {
   const promptText = input.prompt?.content;
   if (!promptText || promptText.length < 10) process.exit(0);
 
-  // Check broker is alive
+  // Check broker is alive and auto-conflict-check is enabled
   try {
     const res = await fetch(`${BROKER_URL}/health`, { signal: AbortSignal.timeout(1000) });
     if (!res.ok) process.exit(0);
+    const health = (await res.json()) as { autoConflictCheck?: boolean };
+    if (health.autoConflictCheck === false) process.exit(0);
   } catch {
     process.exit(0);
   }

@@ -396,7 +396,18 @@ export function activate(extensionContext: vscode.ExtensionContext) {
 
       const brokerPath = vscode.Uri.joinPath(extensionContext.extensionUri, "out", "broker", "index.js").fsPath;
       const { spawn } = require("child_process") as typeof import("child_process");
-      const proc = spawn("node", [brokerPath], { stdio: "ignore", detached: true });
+      const cfg = vscode.workspace.getConfiguration("agentPeers");
+      const maxMsg = cfg.get<number>("maxMessagesPerDirection", 8);
+      const autoConflict = cfg.get<boolean>("autoConflictCheck", true);
+      const proc = spawn("node", [brokerPath], {
+        stdio: "ignore",
+        detached: true,
+        env: {
+          ...process.env,
+          AGENT_PEERS_MAX_MESSAGES_PER_DIRECTION: String(maxMsg),
+          AGENT_PEERS_AUTO_CONFLICT_CHECK: String(autoConflict),
+        },
+      });
       proc.unref();
       // Poll until broker is ready, then immediately reconnect WS
       for (let i = 0; i < 10; i++) {
@@ -632,6 +643,41 @@ AGENT_PEERS_AGENT_TYPE = "codex"
       const cfg = vscode.workspace.getConfiguration("agentPeers");
       const current = cfg.get<boolean>("autoDeliveryMessage", true);
       await cfg.update("autoDeliveryMessage", !current, vscode.ConfigurationTarget.Global);
+      controlProvider.refresh();
+    }),
+
+    vscode.commands.registerCommand("agentPeers.setMaxMessages", async () => {
+      const cfg = vscode.workspace.getConfiguration("agentPeers");
+      const current = cfg.get<number>("maxMessagesPerDirection", 8);
+      const input = await vscode.window.showInputBox({
+        title: "Max Messages Per Direction",
+        prompt: "Maximum number of messages allowed per direction (A→B). Prevents infinite loops.",
+        value: String(current),
+        validateInput: (v) => {
+          const n = parseInt(v, 10);
+          if (isNaN(n) || n < 1) return "Enter a positive integer (minimum 1)";
+          if (n > 10000) return "Maximum value is 10000";
+          return undefined;
+        },
+      });
+      if (input === undefined) return;
+      const newValue = parseInt(input, 10);
+      await cfg.update("maxMessagesPerDirection", newValue, vscode.ConfigurationTarget.Global);
+      // Update the running broker in real-time
+      const result = await brokerClient.updateConfig({ maxMessagesPerDirection: newValue });
+      if (result?.ok) {
+        vscode.window.showInformationMessage(`Max messages per direction set to ${newValue}`);
+      }
+      controlProvider.refresh();
+    }),
+
+    vscode.commands.registerCommand("agentPeers.toggleAutoConflictCheck", async () => {
+      const cfg = vscode.workspace.getConfiguration("agentPeers");
+      const current = cfg.get<boolean>("autoConflictCheck", true);
+      const newValue = !current;
+      await cfg.update("autoConflictCheck", newValue, vscode.ConfigurationTarget.Global);
+      // Update the running broker in real-time
+      await brokerClient.updateConfig({ autoConflictCheck: newValue });
       controlProvider.refresh();
     }),
 

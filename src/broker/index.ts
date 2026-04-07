@@ -56,9 +56,10 @@ import { terminateProcess } from "../shared/process.ts";
 const PORT = parseInt(process.env.AGENT_PEERS_PORT ?? String(DEFAULT_BROKER_PORT), 10);
 const WS_PORT = parseInt(process.env.AGENT_PEERS_WS_PORT ?? String(DEFAULT_WS_PORT), 10);
 const DB_PATH = process.env.AGENT_PEERS_DB ?? BROKER_DB_PATH;
-const MAX_MESSAGES_PER_DIRECTION = Math.max(1,
+let MAX_MESSAGES_PER_DIRECTION = Math.max(1,
   parseInt(process.env.AGENT_PEERS_MAX_MESSAGES_PER_DIRECTION ?? String(DEFAULT_MAX_MESSAGES_PER_DIRECTION), 10) || DEFAULT_MAX_MESSAGES_PER_DIRECTION,
 );
+let AUTO_CONFLICT_CHECK = process.env.AGENT_PEERS_AUTO_CONFLICT_CHECK !== "false";
 const startTime = Date.now();
 
 // ─── Database setup ────────────────────────────────────────────
@@ -960,12 +961,24 @@ function handleWakePeer(body: { id: string }): { ok: boolean; delivered: number 
   return { ok: sent, delivered };
 }
 
+function handleUpdateConfig(body: { maxMessagesPerDirection?: number; autoConflictCheck?: boolean }): { ok: boolean; maxMessagesPerDirection: number; autoConflictCheck: boolean } {
+  if (body.maxMessagesPerDirection !== undefined) {
+    MAX_MESSAGES_PER_DIRECTION = Math.max(1, Math.floor(body.maxMessagesPerDirection));
+  }
+  if (body.autoConflictCheck !== undefined) {
+    AUTO_CONFLICT_CHECK = body.autoConflictCheck;
+  }
+  return { ok: true, maxMessagesPerDirection: MAX_MESSAGES_PER_DIRECTION, autoConflictCheck: AUTO_CONFLICT_CHECK };
+}
+
 function handleHealth(): BrokerHealthResponse {
   return {
     status: "ok",
     pid: process.pid,
     peerCount: (selectAllPeers.all() as unknown as RawPeerRow[]).length,
     uptime: Math.floor((Date.now() - startTime) / 1000),
+    maxMessagesPerDirection: MAX_MESSAGES_PER_DIRECTION,
+    autoConflictCheck: AUTO_CONFLICT_CHECK,
   };
 }
 
@@ -1053,6 +1066,9 @@ async function handleRequest(req: Request): Promise<Response> {
         break;
       case "/purge":
         result = handlePurge();
+        break;
+      case "/update-config":
+        result = handleUpdateConfig(body as { maxMessagesPerDirection?: number });
         break;
       case "/shutdown":
         result = { ok: true };

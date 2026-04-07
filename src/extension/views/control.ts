@@ -42,6 +42,23 @@ export class ControlProvider implements vscode.TreeDataProvider<ControlItem> {
       autoDeliver ? "ON — auto-delivered" : "OFF — messages held for review",
     ));
 
+    // Auto conflict check toggle
+    const autoConflict = vscode.workspace.getConfiguration("agentPeers").get<boolean>("autoConflictCheck", true);
+    items.push(ControlItem.action(
+      "Auto Conflict Check", "agentPeers.toggleAutoConflictCheck",
+      autoConflict ? "pass-filled" : "circle-large-outline",
+      autoConflict ? "charts.green" : "disabledForeground",
+      autoConflict ? "ON — checks peers before work" : "OFF — manual only",
+    ));
+
+    // Max messages per direction
+    const maxMsg = vscode.workspace.getConfiguration("agentPeers").get<number>("maxMessagesPerDirection", 8);
+    items.push(ControlItem.action(
+      "Max Messages / Direction", "agentPeers.setMaxMessages",
+      "symbol-number", "charts.yellow",
+      `${maxMsg}`,
+    ));
+
     // Broker actions — disable the irrelevant one based on state
     const status = this.brokerConnected ? "Broker is running" : "Broker is stopped";
     items.push(ControlItem.action(

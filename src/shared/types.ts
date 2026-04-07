@@ -214,6 +214,8 @@ export interface BrokerHealthResponse {
   pid: number;
   peerCount: number;
   uptime: number;
+  maxMessagesPerDirection?: number;
+  autoConflictCheck?: boolean;
 }
 
 // ─── WebSocket Events (real-time push) ─────────────────────────

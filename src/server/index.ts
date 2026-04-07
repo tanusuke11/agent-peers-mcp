@@ -855,20 +855,25 @@ mcp.registerTool("share_context", {
       (activeFiles.length ? `\nActive files: ${activeFiles.map((f) => f.relativePath).join(", ")}` : "");
 
     // Proactive conflict check: warn the agent if their work overlaps with others
+    // Only runs when autoConflictCheck is enabled in the broker
     try {
-      const conflictPrompt = [resolvedSummary, current_task, ...activeFiles.map(f => f.relativePath)].filter(Boolean).join(" ");
-      if (conflictPrompt.length >= 10) {
-        const conflictResult = await brokerFetch<CheckConflictsResponse>("/check-conflicts", {
-          prompt: conflictPrompt,
-          callerId: myId,
-          gitRoot: myGitRoot,
-        });
-        if (conflictResult.conflicts && conflictResult.conflicts.length > 0) {
-          const warnings = conflictResult.conflicts.map(c =>
-            `- Peer "${c.peerId}" (${c.agentType}): ${c.summary}\n  Files: ${c.taskIntent.targetFiles.slice(0, 5).join(", ")}\n  Conflict: ${c.reason} (${c.confidence})`
-          );
-          statusText += `\n\n⚠ Conflict warning — other agent(s) are working on overlapping files/areas:\n${warnings.join("\n")}`;
-          statusText += "\nUse check_conflicts or send_message to coordinate.";
+      const healthRes = await fetch(`${BROKER_URL}/health`, { signal: AbortSignal.timeout(1000) });
+      const health = healthRes.ok ? await healthRes.json() as { autoConflictCheck?: boolean } : null;
+      if (health?.autoConflictCheck !== false) {
+        const conflictPrompt = [resolvedSummary, current_task, ...activeFiles.map(f => f.relativePath)].filter(Boolean).join(" ");
+        if (conflictPrompt.length >= 10) {
+          const conflictResult = await brokerFetch<CheckConflictsResponse>("/check-conflicts", {
+            prompt: conflictPrompt,
+            callerId: myId,
+            gitRoot: myGitRoot,
+          });
+          if (conflictResult.conflicts && conflictResult.conflicts.length > 0) {
+            const warnings = conflictResult.conflicts.map(c =>
+              `- Peer "${c.peerId}" (${c.agentType}): ${c.summary}\n  Files: ${c.taskIntent.targetFiles.slice(0, 5).join(", ")}\n  Conflict: ${c.reason} (${c.confidence})`
+            );
+            statusText += `\n\n⚠ Conflict warning — other agent(s) are working on overlapping files/areas:\n${warnings.join("\n")}`;
+            statusText += "\nUse check_conflicts or send_message to coordinate.";
+          }
         }
       }
     } catch { /* non-critical: don't fail share_context if conflict check fails */ }

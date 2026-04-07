@@ -124,6 +124,18 @@
         "category": "Agent Peers"
       },
       {
+        "command": "agentPeers.toggleAutoConflictCheck",
+        "title": "Toggle Auto Conflict Check",
+        "icon": "$(shield)",
+        "category": "Agent Peers"
+      },
+      {
+        "command": "agentPeers.setMaxMessages",
+        "title": "Set Max Messages Per Direction",
+        "icon": "$(symbol-number)",
+        "category": "Agent Peers"
+      },
+      {
         "command": "agentPeers.markReportsRead",
         "title": "Mark Reports as Read",
         "icon": "$(check-all)",
@@ -181,6 +193,18 @@
           "type": "boolean",
           "default": true,
           "description": "When enabled, incoming peer messages (text, task-handoff, context-request, etc.) are auto-delivered to the terminal. When disabled, messages are shown as notifications for manual approval before delivery."
+        },
+        "agentPeers.autoConflictCheck": {
+          "type": "boolean",
+          "default": true,
+          "description": "When ON, automatically checks for conflicts with other peers before every prompt (via hook) and when sharing context. When OFF, conflicts are only checked when explicitly using the check_conflicts tool."
+        },
+        "agentPeers.maxMessagesPerDirection": {
+          "type": "number",
+          "default": 8,
+          "minimum": 1,
+          "maximum": 10000,
+          "description": "Maximum number of messages allowed per direction (A→B). Prevents infinite message loops between peers."
         }
       }
     }
