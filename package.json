@@ -128,6 +128,12 @@
         "title": "Mark Reports as Read",
         "icon": "$(check-all)",
         "category": "Agent Peers"
+      },
+      {
+        "command": "agentPeers.deletePeer",
+        "title": "Delete Peer",
+        "icon": "$(trash)",
+        "category": "Agent Peers"
       }
     ],
     "menus": {
@@ -143,7 +149,13 @@
           "command": "agentPeers.startBroker"
         }
       ],
-      "view/item/context": [],
+      "view/item/context": [
+        {
+          "command": "agentPeers.deletePeer",
+          "when": "view == agentPeers.peerList && viewItem =~ /^(peer|sleepPeer)$/",
+          "group": "inline"
+        }
+      ],
       "view/title": [
       ]
     },

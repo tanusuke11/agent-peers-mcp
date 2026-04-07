@@ -88,6 +88,49 @@ async function findTerminalForPid(pid: number): Promise<vscode.Terminal | null> 
 }
 
 /**
+ * Find and kill a zombie broker process that occupies the port but no longer
+ * responds to health checks (e.g. stuck in CLOSE_WAIT).
+ * Cross-platform: lsof on macOS/Linux, netstat on Windows.
+ */
+async function killZombieBroker(port: number): Promise<void> {
+  const { execFile } = require("child_process") as typeof import("child_process");
+
+  const pids = await new Promise<number[]>((resolve) => {
+    if (process.platform === "win32") {
+      execFile("netstat", ["-ano", "-p", "TCP"], { timeout: 5000 }, (err, stdout) => {
+        if (err) return resolve([]);
+        const found: number[] = [];
+        for (const line of stdout.split("\n")) {
+          if (line.includes(`127.0.0.1:${port}`) && line.includes("LISTENING")) {
+            const parts = line.trim().split(/\s+/);
+            const pid = parseInt(parts[parts.length - 1]!, 10);
+            if (pid > 0) found.push(pid);
+          }
+        }
+        resolve(found);
+      });
+    } else {
+      execFile("lsof", ["-ti", `TCP:${port}`, "-sTCP:LISTEN"], { timeout: 5000 }, (err, stdout) => {
+        if (err) return resolve([]);
+        const found = stdout.trim().split(/\s+/).map(Number).filter((n) => n > 0);
+        resolve(found);
+      });
+    }
+  });
+
+  for (const pid of pids) {
+    try {
+      forceKillProcess(pid);
+    } catch { /* already gone */ }
+  }
+
+  // Brief wait for OS to release the port
+  if (pids.length > 0) {
+    await new Promise((r) => setTimeout(r, 500));
+  }
+}
+
+/**
  * Write the UserPromptSubmit hook config to Claude Code's settings.json.
  * Idempotent — skips if the hook is already configured.
  */
@@ -346,6 +389,11 @@ export function activate(extensionContext: vscode.ExtensionContext) {
         vscode.window.showInformationMessage(`Agent Peers broker is already running (${health.peerCount} peers).`);
         return;
       }
+
+      // A previous broker may be occupying the port but unresponsive (CLOSE_WAIT zombie).
+      // Try to detect and kill it before spawning a new one.
+      await killZombieBroker(brokerPort);
+
       const brokerPath = vscode.Uri.joinPath(extensionContext.extensionUri, "out", "broker", "index.js").fsPath;
       const { spawn } = require("child_process") as typeof import("child_process");
       const proc = spawn("node", [brokerPath], { stdio: "ignore", detached: true });
@@ -398,6 +446,27 @@ export function activate(extensionContext: vscode.ExtensionContext) {
 
       // Suspend functionality has been removed; command kept for compatibility.
       vscode.window.showInformationMessage("Suspend is no longer available.");
+    }),
+
+    vscode.commands.registerCommand("agentPeers.deletePeer", async (item?: { peerId?: string; peer?: { id: string } }) => {
+      const peerId = item?.peerId || item?.peer?.id;
+      if (!peerId) {
+        vscode.window.showWarningMessage("No peer selected.");
+        return;
+      }
+      const confirm = await vscode.window.showWarningMessage(
+        `Delete peer "${peerId}"? All context and messages will be permanently removed.`,
+        { modal: true },
+        "Delete",
+      );
+      if (confirm !== "Delete") return;
+      try {
+        await brokerClient.deletePeer(peerId);
+        peerListProvider.refresh();
+        updateMessageBadge();
+      } catch (e) {
+        vscode.window.showErrorMessage(`Failed to delete peer: ${e}`);
+      }
     }),
 
     vscode.commands.registerCommand("agentPeers.markReportsRead", async (item?: { peerId?: string; peer?: { id: string } }) => {
@@ -625,7 +694,7 @@ AGENT_PEERS_AGENT_TYPE = "codex"
 
   // Auto-start broker if configured, then do initial status check
   if (config.get<boolean>("autoStartBroker", false)) {
-    brokerClient.ensureBroker(extensionContext.extensionUri)
+    brokerClient.ensureBroker(extensionContext.extensionUri, () => killZombieBroker(brokerPort))
       .catch(() => { /* Broker may already be running, that's fine */ })
       .finally(() => {
         // Initial status check after broker is ready

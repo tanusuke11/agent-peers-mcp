@@ -20,7 +20,6 @@
  */
 
 import { spawn } from "child_process";
-import crypto from "crypto";
 import fs from "fs";
 import os from "os";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -44,6 +43,7 @@ import type {
   ConflictResult,
   SendMessageResponse,
   DuplicateTaskInfo,
+  PeerSource,
 } from "../shared/types.ts";
 import path from "path";
 import WebSocket from "ws";
@@ -68,13 +68,14 @@ const BROKER_URL = `http://${BROKER_HOST}:${BROKER_PORT}`;
 const BROKER_WS_URL = `ws://${BROKER_HOST}:${WS_PORT}`;
 const AGENT_TYPE = (process.env.AGENT_PEERS_AGENT_TYPE ?? "claude-code") as AgentType;
 const BROKER_SCRIPT = path.join(__dirname, "..", "broker", "index.js");
+const CODEX_SESSIONS_DIR = path.join(os.homedir(), ".codex", "sessions");
 
 // ─── Broker communication ──────────────────────────────────────
 
 async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
   const res = await fetch(`${BROKER_URL}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "Connection": "close" },
     body: JSON.stringify(body),
   });
   if (!res.ok) {
@@ -150,6 +151,57 @@ function getParentPid(pid: number): number {
 }
 
 /**
+ * Walk up the process tree to find the CLI session (Claude Code / Codex) PID.
+ * This is the long-lived process whose liveness indicates the session is active.
+ * Falls back to process.ppid if the CLI process cannot be identified.
+ */
+function findOwnerPid(): number {
+  let pid = process.ppid;
+  for (let depth = 0; depth < 5 && pid > 1; depth++) {
+    const cmdArgs = getProcessArgs(pid);
+    if (cmdArgs) {
+      const cmdLine = cmdArgs.join(" ").toLowerCase();
+      // Match Claude Code CLI (node-based) or Codex CLI
+      if (cmdLine.includes("claude") || cmdLine.includes("codex")) {
+        return pid;
+      }
+    }
+    pid = getParentPid(pid);
+  }
+  // Fallback: the immediate parent is the best guess
+  return process.ppid;
+}
+
+/** Cached owner PID — resolved once at startup */
+let ownerPid = 0;
+
+function looksLikeExtensionOwner(cmdLine: string): boolean {
+  const cmd = cmdLine.toLowerCase();
+  return (
+    cmd.includes("/.vscode/extensions/") ||
+    cmd.includes("\\.vscode\\extensions\\") ||
+    cmd.includes("openai.chatgpt-") ||
+    cmd.includes("anthropic.claude-code-")
+  );
+}
+
+function resolvePeerSource(owner: number): PeerSource {
+  const override = process.env.AGENT_PEERS_SOURCE;
+  if (override === "extension" || override === "terminal") return override;
+
+  // True extension-host launches are extension peers.
+  if (process.env.ELECTRON_RUN_AS_NODE) return "extension";
+
+  // VSCode integrated terminals also set VSCODE_PID, so don't rely on it alone.
+  // Instead, inspect the owner process command line for extension binary paths.
+  const ownerArgs = getProcessArgs(owner);
+  const ownerCmd = ownerArgs?.join(" ") ?? "";
+  if (ownerCmd && looksLikeExtensionOwner(ownerCmd)) return "extension";
+
+  return "terminal";
+}
+
+/**
  * Find the Claude Code session JSONL file path for THIS MCP server instance.
  *
  * Strategy:
@@ -168,6 +220,7 @@ function getParentPid(pid: number): number {
 let cachedSessionFile: string | null | undefined;
 /** Session ID detected from process tree (cached even when the JSONL doesn't exist yet) */
 let cachedSessionId: string | null | undefined;
+let cachedCodexSessionFile: string | null | undefined;
 
 function findSessionFile(): string | null {
   // If we previously found a concrete file, return it immediately.
@@ -262,15 +315,227 @@ async function getClaudeSessionTitle(): Promise<string | null> {
   } catch { return null; }
 }
 
+function parsePsElapsedSeconds(value: string): number | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+
+  const [daysPart, timePart] = trimmed.includes("-")
+    ? trimmed.split("-", 2)
+    : [null, trimmed];
+  const timeParts = timePart.split(":").map((part) => parseInt(part, 10));
+  if (timeParts.some((part) => Number.isNaN(part))) return null;
+
+  let hours = 0;
+  let minutes = 0;
+  let seconds = 0;
+  if (timeParts.length === 3) {
+    [hours, minutes, seconds] = timeParts;
+  } else if (timeParts.length === 2) {
+    [minutes, seconds] = timeParts;
+  } else {
+    return null;
+  }
+
+  const days = daysPart ? parseInt(daysPart, 10) : 0;
+  if (Number.isNaN(days)) return null;
+  return (days * 24 * 60 * 60) + (hours * 60 * 60) + (minutes * 60) + seconds;
+}
+
+function getProcessStartTimeMs(pid: number): number | null {
+  try {
+    const { execSync } = require("child_process") as typeof import("child_process");
+    if (process.platform === "linux") {
+      const elapsed = execSync(`ps -o etimes= -p ${pid}`, { encoding: "utf8", timeout: 3000 }).trim();
+      const seconds = parseInt(elapsed, 10);
+      return Number.isFinite(seconds) ? Date.now() - (seconds * 1000) : null;
+    }
+    if (process.platform === "darwin") {
+      const elapsed = execSync(`ps -o etime= -p ${pid}`, { encoding: "utf8", timeout: 3000 }).trim();
+      const seconds = parsePsElapsedSeconds(elapsed);
+      return seconds !== null ? Date.now() - (seconds * 1000) : null;
+    }
+    if (process.platform === "win32") {
+      const out = execSync(`wmic process where ProcessId=${pid} get CreationDate /format:list`, { encoding: "utf8", timeout: 3000 }).trim();
+      const match = out.match(/CreationDate=(\d{14})\./);
+      if (!match) return null;
+      const raw = match[1]!;
+      const iso = `${raw.slice(0, 4)}-${raw.slice(4, 6)}-${raw.slice(6, 8)}T${raw.slice(8, 10)}:${raw.slice(10, 12)}:${raw.slice(12, 14)}Z`;
+      const parsed = Date.parse(iso);
+      return Number.isNaN(parsed) ? null : parsed;
+    }
+    return null;
+  } catch { return null; }
+}
+
+function walkFiles(root: string, predicate: (file: string) => boolean): string[] {
+  const found: string[] = [];
+  const stack = [root];
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    let entries: fs.Dirent[] = [];
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const fullPath = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(fullPath);
+      } else if (entry.isFile() && predicate(fullPath)) {
+        found.push(fullPath);
+      }
+    }
+  }
+  return found;
+}
+
+function readFileHead(file: string, maxBytes = 8192): string {
+  const fd = fs.openSync(file, "r");
+  try {
+    const buffer = Buffer.alloc(maxBytes);
+    const bytesRead = fs.readSync(fd, buffer, 0, maxBytes, 0);
+    return buffer.subarray(0, bytesRead).toString("utf8");
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function extractCwdFromEnvironmentContext(text: string): string | null {
+  const match = text.match(/Current working directory:\s*(.+)/);
+  return match?.[1]?.trim() ?? null;
+}
+
+function extractCodexMessageText(content: unknown, role: "user" | "assistant"): string {
+  if (!Array.isArray(content)) return "";
+  const allowedTypes = role === "user"
+    ? new Set(["input_text", "text"])
+    : new Set(["output_text", "text"]);
+  return content
+    .filter((block): block is { type?: string; text?: string } => !!block && typeof block === "object")
+    .filter((block) => typeof block.type === "string" && allowedTypes.has(block.type))
+    .map((block) => typeof block.text === "string" ? block.text : "")
+    .join(" ")
+    .trim();
+}
+
+type CodexSessionMeta = {
+  cwd: string | null;
+  startedAtMs: number | null;
+};
+
+function readCodexSessionMeta(file: string): CodexSessionMeta {
+  try {
+    const head = readFileHead(file);
+    let cwd: string | null = null;
+    let startedAtMs: number | null = null;
+
+    for (const line of head.split("\n").filter(Boolean).slice(0, 12)) {
+      try {
+        const obj = JSON.parse(line) as Record<string, unknown>;
+        if (!startedAtMs) {
+          const directTimestamp = typeof obj.timestamp === "string" ? Date.parse(obj.timestamp) : NaN;
+          if (!Number.isNaN(directTimestamp)) {
+            startedAtMs = directTimestamp;
+          } else if (obj.type === "session_meta" && obj.payload && typeof obj.payload === "object") {
+            const payload = obj.payload as Record<string, unknown>;
+            const payloadTimestamp = typeof payload.timestamp === "string" ? Date.parse(payload.timestamp) : NaN;
+            if (!Number.isNaN(payloadTimestamp)) startedAtMs = payloadTimestamp;
+          }
+        }
+
+        if (!cwd && obj.type === "session_meta" && obj.payload && typeof obj.payload === "object") {
+          const payload = obj.payload as Record<string, unknown>;
+          if (typeof payload.cwd === "string") cwd = payload.cwd;
+        }
+
+        if (!cwd && obj.type === "message" && obj.role === "user") {
+          const text = extractCodexMessageText(obj.content, "user");
+          if (text.includes("<environment_context>")) {
+            cwd = extractCwdFromEnvironmentContext(text);
+          }
+        }
+
+        if (cwd && startedAtMs) break;
+      } catch { /* skip */ }
+    }
+
+    return { cwd, startedAtMs };
+  } catch {
+    return { cwd: null, startedAtMs: null };
+  }
+}
+
+function findCodexSessionFile(): string | null {
+  if (cachedCodexSessionFile) return cachedCodexSessionFile;
+
+  const result = findCodexSessionFileUncached();
+  if (result) cachedCodexSessionFile = result;
+  return result;
+}
+
+function findCodexSessionFileUncached(): string | null {
+  if (!fs.existsSync(CODEX_SESSIONS_DIR)) return null;
+
+  const targetCwd = myCwd;
+  const ownerStartTimeMs = getProcessStartTimeMs(process.ppid);
+  const candidates = walkFiles(CODEX_SESSIONS_DIR, (file) => file.endsWith(".jsonl") && path.basename(file).startsWith("rollout-"))
+    .map((file) => ({ file, ...readCodexSessionMeta(file) }))
+    .filter((session) => session.cwd === targetCwd);
+
+  if (candidates.length === 0) return null;
+
+  candidates.sort((a, b) => {
+    if (ownerStartTimeMs && a.startedAtMs && b.startedAtMs) {
+      const deltaA = Math.abs(a.startedAtMs - ownerStartTimeMs);
+      const deltaB = Math.abs(b.startedAtMs - ownerStartTimeMs);
+      if (deltaA !== deltaB) return deltaA - deltaB;
+    }
+    return (b.startedAtMs ?? 0) - (a.startedAtMs ?? 0);
+  });
+
+  return candidates[0]?.file ?? null;
+}
+
 const EXCHANGE_MAX_CHARS = 200;
 const EXCHANGE_MAX_COUNT = 5;
 
 /** Read recent human/assistant exchanges from the Claude Code session JSONL. */
 function getRecentExchanges(): import("../shared/types.ts").RecentExchange[] {
+  if (AGENT_TYPE === "codex") {
+    try {
+      const file = findCodexSessionFile();
+      if (!file) return [];
+
+      const lines = fs.readFileSync(file, "utf8").split("\n").filter(Boolean);
+      const exchanges: import("../shared/types.ts").RecentExchange[] = [];
+
+      for (const line of lines) {
+        try {
+          const obj = JSON.parse(line) as Record<string, unknown>;
+          if (obj.type !== "message") continue;
+
+          const role = obj.role as "user" | "assistant" | undefined;
+          if (role !== "user" && role !== "assistant") continue;
+
+          const text = extractCodexMessageText(obj.content, role);
+          if (!text || text.includes("<environment_context>")) continue;
+
+          exchanges.push({
+            role: role === "user" ? "human" : "assistant",
+            text: text.length > EXCHANGE_MAX_CHARS ? text.slice(0, EXCHANGE_MAX_CHARS) + "…" : text,
+            timestamp: typeof obj.timestamp === "string" ? obj.timestamp : new Date().toISOString(),
+          });
+        } catch { /* skip */ }
+      }
+
+      return exchanges.slice(-EXCHANGE_MAX_COUNT);
+    } catch { return []; }
+  }
+
   // Only Claude Code writes the ~/.claude session JSONL files we inspect below.
-  // Other agent types (e.g., Codex) should not scrape these logs, otherwise they
-  // may accidentally surface another tool's conversation history (as seen when a
-  // Codex peer picked up the latest Claude session file in the same repo).
+  // Other agent types should explicitly add their own reader rather than falling
+  // back to another tool's session logs.
   if (AGENT_TYPE !== "claude-code") return [];
 
   try {
@@ -502,14 +767,15 @@ When you start, proactively call share_context to publish your current state. Th
 // ─── Tool handlers ─────────────────────────────────────────────
 
 mcp.registerTool("list_peers", {
-  description: "List other AI agent instances running on this machine. Returns their ID, agent type (claude-code/codex), working directory, git repo, and current context summary.",
+  description: "List AI agent instances running on this machine, including yourself (marked with '(you)'). Returns their ID, agent type (claude-code/codex), working directory, git repo, and current context summary.",
   inputSchema: { scope: z.enum(["machine", "directory", "repo"]).describe('"machine" = all instances. "directory" = same working directory. "repo" = same git repository.') },
 }, async ({ scope }) => {
   try {
-    const peers = await brokerFetch<Peer[]>("/list-peers", { scope, cwd: myCwd, gitRoot: myGitRoot, excludeId: myId });
-    if (peers.length === 0) return { content: [{ type: "text" as const, text: `No other agents found (scope: ${scope}).` }] };
+    const peers = await brokerFetch<Peer[]>("/list-peers", { scope, cwd: myCwd, gitRoot: myGitRoot });
+    if (peers.length === 0) return { content: [{ type: "text" as const, text: `No agents found (scope: ${scope}).` }] };
     const lines = peers.map((p) => {
-      const parts = [`ID: ${p.id}`, `Agent: ${p.agentType}`, `PID: ${p.pid}`, `CWD: ${p.cwd}`];
+      const isSelf = p.id === myId;
+      const parts = [`ID: ${p.id}${isSelf ? " (you)" : ""}`, `Agent: ${p.agentType}`, `PID: ${p.pid}`, `CWD: ${p.cwd}`];
       if (p.gitRoot) parts.push(`Repo: ${p.gitRoot}`);
       if (p.context.summary) parts.push(`Summary: ${p.context.summary}`);
       if (p.context.currentTask) parts.push(`Task: ${p.context.currentTask}`);
@@ -736,7 +1002,7 @@ function connectBrokerWs() {
       log("WebSocket connected to broker");
       // Identify ourselves so the broker can deliver messages directly
       if (myId) {
-        brokerWs!.send(JSON.stringify({ type: "identify", id: myId }));
+        brokerWs!.send(JSON.stringify({ type: "identify", id: myId, pid: ownerPid, source: mySource }));
       }
       // Drain any messages that arrived while disconnected
       drainUndeliveredMessages();
@@ -808,29 +1074,7 @@ async function drainUndeliveredMessages() {
 // ─── Startup ───────────────────────────────────────────────────
 
 let myTty: string | null = null;
-
-/** Directory for persisting peer IDs across broker restarts. */
-const ID_PERSIST_DIR = path.join(os.homedir(), ".agent-peers", "ids");
-
-/** Deterministic key for this MCP server instance (cwd + agentType). */
-function idPersistKey(): string {
-  return crypto.createHash("sha256").update(`${myCwd}:${AGENT_TYPE}`).digest("hex").slice(0, 12);
-}
-
-function loadPersistedId(): string | null {
-  try {
-    const file = path.join(ID_PERSIST_DIR, `${idPersistKey()}.id`);
-    if (fs.existsSync(file)) return fs.readFileSync(file, "utf8").trim();
-  } catch { /* ignore */ }
-  return null;
-}
-
-function persistId(id: string): void {
-  try {
-    fs.mkdirSync(ID_PERSIST_DIR, { recursive: true });
-    fs.writeFileSync(path.join(ID_PERSIST_DIR, `${idPersistKey()}.id`), id);
-  } catch { /* best effort */ }
-}
+let mySource: PeerSource = "terminal";
 
 async function registerWithBroker(): Promise<void> {
   const gitCtx = await gatherGitContext(myCwd);
@@ -846,19 +1090,20 @@ async function registerWithBroker(): Promise<void> {
     git: gitCtx,
     updatedAt: new Date().toISOString(),
   };
-  const preferredId = loadPersistedId();
+  const source = mySource;
+  // Let the broker decide: claim a suspended peer of the same kind, or create a new one.
+  // Register with the owner (CLI session) PID so liveness checks target the long-lived process.
   const reg = await brokerFetch<RegisterResponse>("/register", {
-    preferredId: preferredId ?? undefined,
     agentType: AGENT_TYPE,
-    pid: process.pid,
+    source,
+    pid: ownerPid,
     cwd: myCwd,
     gitRoot: myGitRoot,
     tty: myTty,
     context,
   });
   myId = reg.id;
-  persistId(myId);
-  log(`Registered as peer ${myId}${preferredId && preferredId === myId ? " (restored)" : ""}`);
+  log(`Registered as peer ${myId}`);
 
   // Try to restore session title immediately after (re-)registration
   if (AGENT_TYPE === "claude-code") {
@@ -878,10 +1123,14 @@ async function main() {
   myCwd = process.cwd();
   myGitRoot = await getGitRoot(myCwd);
   myTty = getTty();
+  ownerPid = findOwnerPid();
+  mySource = resolvePeerSource(ownerPid);
 
   log(`Agent type: ${AGENT_TYPE}`);
   log(`CWD: ${myCwd}`);
   log(`Git root: ${myGitRoot ?? "(none)"}`);
+  log(`Owner PID: ${ownerPid}`);
+  log(`Source: ${mySource}`);
 
   await registerWithBroker();
 
@@ -948,7 +1197,7 @@ async function main() {
   const heartbeatTimer = setInterval(async () => {
     if (!myId) return;
     try {
-      const result = await brokerFetch<{ ok: boolean }>("/heartbeat", { id: myId });
+      const result = await brokerFetch<{ ok: boolean }>("/heartbeat", { id: myId, pid: ownerPid, source: mySource });
       if (!result.ok) {
         // Broker restarted and lost our entry — re-register and re-identify on WS
         log("Peer entry gone from broker, re-registering...");
@@ -1039,7 +1288,7 @@ async function main() {
     gitWatcher?.close();
     clearInterval(parentWatchTimer);
     if (myId) {
-      try { await brokerFetch("/suspend-peer", { id: myId }); log("Suspended (session detached)"); } catch { /* */ }
+      try { await brokerFetch("/suspend-peer", { id: myId }); log("Sleep (session detached)"); } catch { /* */ }
     }
     process.exit(0);
   };

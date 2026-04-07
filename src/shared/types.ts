@@ -13,7 +13,7 @@ export type PeerId = string;
 /** The type of AI agent tool */
 export type AgentType = "claude-code" | "codex" | "generic";
 
-/** How the peer connects: terminal-based MCP server or VSCode extension */
+/** How the peer connects: terminal-based MCP server or IDE extension */
 export type PeerSource = "terminal" | "extension";
 
 // ─── Structured Context ────────────────────────────────────────
@@ -150,6 +150,10 @@ export interface RegisterResponse {
 
 export interface HeartbeatRequest {
   id: PeerId;
+  /** Owner (CLI session) PID — used to resume suspended peers and update liveness */
+  pid?: number;
+  /** How the peer connects: "terminal" or "extension" */
+  source?: PeerSource;
 }
 
 export interface UpdateContextRequest {

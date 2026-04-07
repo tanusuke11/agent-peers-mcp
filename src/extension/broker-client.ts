@@ -35,7 +35,7 @@ export class BrokerClient {
   private async post<T>(path: string, body?: unknown): Promise<T> {
     const res = await fetch(`${this.baseUrl}${path}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "Connection": "close" },
       body: body ? JSON.stringify(body) : undefined,
     });
     if (!res.ok) {
@@ -48,6 +48,7 @@ export class BrokerClient {
     try {
       const res = await fetch(`${this.baseUrl}/health`, {
         signal: AbortSignal.timeout(timeoutMs),
+        headers: { "Connection": "close" },
       });
       if (res.ok) return res.json() as Promise<BrokerHealthResponse>;
     } catch { /* broker not running */ }
@@ -105,6 +106,10 @@ export class BrokerClient {
 
   async unregisterPeer(id: string): Promise<void> {
     await this.post("/unregister", { id });
+  }
+
+  async deletePeer(id: string): Promise<void> {
+    await this.post("/delete-peer", { id });
   }
 
   async suspendPeer(id: string): Promise<void> {
@@ -194,9 +199,12 @@ export class BrokerClient {
    * Ensure the broker is running. Non-blocking: spawns the process and polls
    * in the background without blocking extension activation.
    */
-  async ensureBroker(extensionUri: vscode.Uri): Promise<void> {
+  async ensureBroker(extensionUri: vscode.Uri, killZombie?: () => Promise<void>): Promise<void> {
     const h = await this.health(500);
     if (h) return; // Already running
+
+    // Kill zombie broker that may be occupying the port but not responding
+    if (killZombie) await killZombie();
 
     // Start broker as a detached background process (no terminal needed)
     const brokerPath = vscode.Uri.joinPath(extensionUri, "out", "broker", "index.js").fsPath;

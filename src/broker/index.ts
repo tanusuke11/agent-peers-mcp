@@ -175,8 +175,7 @@ function cleanStalePeers() {
   }
 }
 
-cleanStalePeers();
-setInterval(cleanStalePeers, STALE_PEER_CLEANUP_MS);
+// NOTE: cleanStalePeers() is called after prepared statements are defined (see below)
 
 // ─── Prepared statements ───────────────────────────────────────
 
@@ -188,9 +187,13 @@ const insertPeer = db.prepare(`
 const updateLastSeen = db.prepare(`UPDATE peers SET last_seen = ? WHERE id = ?`);
 const updateContext = db.prepare(`UPDATE peers SET context_json = ?, last_seen = ? WHERE id = ?`);
 const deletePeer = db.prepare(`DELETE FROM peers WHERE id = ?`);
+const deleteMessagesForPeer = db.prepare(`DELETE FROM messages WHERE from_id = ? OR to_id = ?`);
 const selectAllPeers = db.prepare(`SELECT * FROM peers`);
 const selectPeersByDirectory = db.prepare(`SELECT * FROM peers WHERE cwd = ?`);
 const selectPeerById = db.prepare(`SELECT * FROM peers WHERE id = ?`);
+const selectActiveByPid = db.prepare(`SELECT * FROM peers WHERE pid = ? AND suspended = 0 LIMIT 1`);
+const selectSuspendedByRepo = db.prepare(`SELECT * FROM peers WHERE agent_type = ? AND git_root = ? AND suspended = 1 ORDER BY last_seen DESC LIMIT 1`);
+const selectSuspendedByCwd = db.prepare(`SELECT * FROM peers WHERE agent_type = ? AND cwd = ? AND suspended = 1 ORDER BY last_seen DESC LIMIT 1`);
 const selectMessageById = db.prepare(`SELECT * FROM messages WHERE id = ?`);
 
 const insertMessage = db.prepare(`
@@ -206,6 +209,10 @@ const selectUnread = db.prepare(`
 const markDelivered = db.prepare(`UPDATE messages SET delivered = 1 WHERE id = ?`);
 const markRead = db.prepare(`UPDATE messages SET read = 1 WHERE id = ?`);
 const markAllRead = db.prepare(`UPDATE messages SET read = 1 WHERE to_id = ? AND read = 0`);
+
+// ─── Stale peer cleanup (deferred until prepared statements are ready) ──
+cleanStalePeers();
+setInterval(cleanStalePeers, STALE_PEER_CLEANUP_MS);
 
 // ─── Helpers ───────────────────────────────────────────────────
 
@@ -352,6 +359,7 @@ function deduplicateExchanges(peers: Peer[]): void {
 function clearSessionContext(peer: Peer): void {
   peer.context.recentExchanges = [];
   peer.context.summary = "";
+  peer.context.conversationDigest = undefined;
 }
 
 // ─── Request handlers ──────────────────────────────────────────
@@ -361,30 +369,45 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
   const contextJson = JSON.stringify(body.context);
   const source = body.source ?? "terminal";
 
-  // Wrap in a transaction so the read-delete-insert is atomic.
+  // Wrap in a transaction so register/resume is atomic.
   db.exec("BEGIN");
   let id: string;
   try {
-    // Clean up any existing peer with the same PID (process reuse)
-    db.prepare("DELETE FROM peers WHERE pid = ? AND suspended = 0").run(body.pid);
+    // 1. If preferredId is given (e.g. extension peers), use that stable identity.
+    // 2. Else, if the same owner PID is already active, keep that identity (prevents ID churn).
+    // 3. Else, claim a suspended peer of the same agentType in the same project.
+    let existingRow: RawPeerRow | undefined;
+    if (body.preferredId) {
+      existingRow = selectPeerById.get(body.preferredId) as unknown as RawPeerRow | undefined;
+    } else {
+      existingRow = selectActiveByPid.get(body.pid) as unknown as RawPeerRow | undefined;
+    }
 
-    // Check if preferredId matches an existing peer we can resume
-    const existingRow = body.preferredId
-      ? (selectPeerById.get(body.preferredId) as unknown as RawPeerRow | undefined)
-      : undefined;
+    if (!existingRow && body.gitRoot) {
+      existingRow = selectSuspendedByRepo.get(body.agentType, body.gitRoot) as unknown as RawPeerRow | undefined;
+    } else if (!existingRow) {
+      existingRow = selectSuspendedByCwd.get(body.agentType, body.cwd) as unknown as RawPeerRow | undefined;
+    }
 
     if (existingRow) {
       // Resume existing peer: reassign session, unsuspend, update connection info
       id = existingRow.id;
-      // Merge context: keep existing context but overlay with new session's fresh data
+      // Merge context: preserve existing data, only overlay non-empty new fields
       const existingContext = JSON.parse(existingRow.context_json) as AgentContext;
+      const incoming = body.context;
       const mergedContext: AgentContext = {
         ...existingContext,
-        ...body.context,
-        // Preserve summary from previous session if new one is empty/placeholder
-        summary: (!body.context.summary || body.context.summary === "Untitled") && existingContext.summary
-          ? existingContext.summary
-          : body.context.summary,
+        // Only overwrite with incoming values when they carry real data
+        summary: (incoming.summary && incoming.summary !== "Untitled")
+          ? incoming.summary
+          : existingContext.summary ?? "",
+        activeFiles: incoming.activeFiles?.length ? incoming.activeFiles : existingContext.activeFiles,
+        git: incoming.git ?? existingContext.git,
+        currentTask: incoming.currentTask || existingContext.currentTask,
+        taskIntent: incoming.taskIntent ?? existingContext.taskIntent,
+        recentExchanges: incoming.recentExchanges?.length ? incoming.recentExchanges : existingContext.recentExchanges,
+        conversationDigest: incoming.conversationDigest || existingContext.conversationDigest,
+        metadata: incoming.metadata ?? existingContext.metadata,
         updatedAt: now,
       };
       db.prepare(`
@@ -396,7 +419,7 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
              body.agentType, JSON.stringify(mergedContext), now, id);
       log(`Peer ${id} resumed (was suspended=${!!existingRow.suspended})`);
     } else {
-      // No existing peer to resume — create new one
+      // No suspended peer of this kind — create new one
       const existingIds = new Set((selectAllPeers.all() as unknown as RawPeerRow[]).map((r) => r.id));
       if (body.preferredId && !existingIds.has(body.preferredId)) {
         id = body.preferredId;
@@ -424,7 +447,25 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
 function handleHeartbeat(body: HeartbeatRequest): { ok: boolean } {
   const row = selectPeerById.get(body.id) as unknown as RawPeerRow | undefined;
   if (!row) return { ok: false };
-  updateLastSeen.run(new Date().toISOString(), body.id);
+  const now = new Date().toISOString();
+  const pid = body.pid ?? row.pid;
+  const source = body.source ?? row.source;
+  if (row.suspended) {
+    // Peer is alive (sending heartbeats) — resume it
+    db.prepare("UPDATE peers SET suspended = 0, pid = ?, source = ?, last_seen = ? WHERE id = ?")
+      .run(pid, source, now, body.id);
+    const peer = rowToPeer(selectPeerById.get(body.id) as unknown as RawPeerRow);
+    broadcast({ type: "peer-joined", data: peer, timestamp: now } satisfies WsPeerJoinedEvent);
+    log(`Peer ${body.id} resumed via heartbeat (pid=${pid}, source=${source})`);
+  } else {
+    // Update PID/source if changed
+    if ((body.pid && body.pid !== row.pid) || (body.source && body.source !== row.source)) {
+      db.prepare("UPDATE peers SET pid = ?, source = ?, last_seen = ? WHERE id = ?")
+        .run(pid, source, now, body.id);
+    } else {
+      updateLastSeen.run(now, body.id);
+    }
+  }
   return { ok: true };
 }
 
@@ -716,10 +757,11 @@ function detachPeer(id: string): void {
   log(`Peer ${id} detached (suspended)`);
 }
 
-/** Hard-remove a peer and its messages (used by purge only). */
+/** Hard-remove a peer and all its messages. */
 function removePeer(id: string): void {
   const row = selectPeerById.get(id) as unknown as RawPeerRow | undefined;
   if (!row) return;
+  deleteMessagesForPeer.run(id, id);
   deletePeer.run(id);
   broadcast({
     type: "peer-left",
@@ -727,6 +769,13 @@ function removePeer(id: string): void {
     timestamp: new Date().toISOString(),
   } satisfies WsPeerLeftEvent);
   log(`Peer ${id} removed`);
+}
+
+function handleDeletePeer(body: { id: string }): { ok: boolean } {
+  const row = selectPeerById.get(body.id) as unknown as RawPeerRow | undefined;
+  if (!row) return { ok: false };
+  removePeer(body.id);
+  return { ok: true };
 }
 
 function handleUnregister(body: { id: string }): void {
@@ -926,6 +975,7 @@ const corsHeaders: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
+  "Connection": "close",
 };
 
 async function handleRequest(req: Request): Promise<Response> {
@@ -976,6 +1026,9 @@ async function handleRequest(req: Request): Promise<Response> {
       case "/unregister":
         handleUnregister(body as { id: string });
         result = { ok: true };
+        break;
+      case "/delete-peer":
+        result = handleDeletePeer(body as { id: string });
         break;
       case "/suspend-peer":
         result = handleSuspendPeer(body as { id: string });
@@ -1052,6 +1105,11 @@ http.createServer(async (nodeReq, nodeRes) => {
     if (!nodeRes.headersSent) nodeRes.writeHead(500);
     if (!nodeRes.writableEnded) nodeRes.end(JSON.stringify({ error: String(e) }));
   }
+}).on("connection", (socket) => {
+  // Prevent CLOSE_WAIT accumulation: destroy idle sockets after 30s.
+  // Broker requests are short-lived; no reason to keep connections open.
+  socket.setTimeout(30_000, () => socket.destroy());
+  socket.setKeepAlive(false);
 }).listen(PORT, "127.0.0.1", () => {
   log(`HTTP listening on 127.0.0.1:${PORT}`);
 }).on("error", (err: NodeJS.ErrnoException) => {
@@ -1073,12 +1131,32 @@ wss.on("connection", (ws) => {
 
   ws.on("message", (data) => {
     try {
-      const msg = JSON.parse(String(data)) as { type?: string; id?: string };
+      const msg = JSON.parse(String(data)) as { type?: string; id?: string; pid?: number; source?: string };
       if (msg.type === "identify" && msg.id) {
         // Promote from anonymous to peer-identified
         wsClients.delete(ws);
         identifiedPeerId = msg.id;
         wsPeerClients.set(msg.id, ws);
+        // Resume suspended peer on WS re-identify (e.g. after reconnect)
+        const row = selectPeerById.get(msg.id) as unknown as RawPeerRow | undefined;
+        if (row?.suspended) {
+          const pid = typeof msg.pid === "number" ? msg.pid : row.pid;
+          const source = (msg.source === "extension" || msg.source === "terminal") ? msg.source : row.source;
+          db.prepare("UPDATE peers SET suspended = 0, pid = ?, source = ?, last_seen = ? WHERE id = ?")
+            .run(pid, source, new Date().toISOString(), msg.id);
+          const peer = rowToPeer(selectPeerById.get(msg.id) as unknown as RawPeerRow);
+          broadcast({ type: "peer-joined", data: peer, timestamp: new Date().toISOString() } satisfies WsPeerJoinedEvent);
+          log(`Peer ${msg.id} resumed via WS identify (pid=${pid}, source=${source})`);
+        } else if (row) {
+          // Not suspended but source/pid may need updating
+          const pid = typeof msg.pid === "number" ? msg.pid : row.pid;
+          const source = (msg.source === "extension" || msg.source === "terminal") ? msg.source : row.source;
+          if (pid !== row.pid || source !== row.source) {
+            db.prepare("UPDATE peers SET pid = ?, source = ?, last_seen = ? WHERE id = ?")
+              .run(pid, source, new Date().toISOString(), msg.id);
+            log(`Peer ${msg.id} updated via WS identify (pid=${pid}, source=${source})`);
+          }
+        }
         log(`WebSocket peer identified: ${msg.id} (anonymous: ${wsClients.size}, peers: ${wsPeerClients.size})`);
       }
     } catch { /* ignore malformed messages */ }
@@ -1088,8 +1166,17 @@ wss.on("connection", (ws) => {
     wsClients.delete(ws);
     if (identifiedPeerId) {
       wsPeerClients.delete(identifiedPeerId);
-      // Peer WS disconnected — detach (suspend) instead of deleting
-      detachPeer(identifiedPeerId);
+      // Only suspend if the owner process is dead; skip if still alive
+      const row = selectPeerById.get(identifiedPeerId) as unknown as RawPeerRow | undefined;
+      let ownerAlive = false;
+      if (row && row.pid > 0) {
+        try { process.kill(row.pid, 0); ownerAlive = true; } catch { /* dead */ }
+      }
+      if (!ownerAlive) {
+        detachPeer(identifiedPeerId);
+      } else {
+        log(`WebSocket disconnected for ${identifiedPeerId} but owner pid ${row!.pid} alive — not suspending`);
+      }
     }
     log(`WebSocket client disconnected (anonymous: ${wsClients.size}, peers: ${wsPeerClients.size})`);
   });
@@ -1098,7 +1185,14 @@ wss.on("connection", (ws) => {
     wsClients.delete(ws);
     if (identifiedPeerId) {
       wsPeerClients.delete(identifiedPeerId);
-      detachPeer(identifiedPeerId);
+      const row = selectPeerById.get(identifiedPeerId) as unknown as RawPeerRow | undefined;
+      let ownerAlive = false;
+      if (row && row.pid > 0) {
+        try { process.kill(row.pid, 0); ownerAlive = true; } catch { /* dead */ }
+      }
+      if (!ownerAlive) {
+        detachPeer(identifiedPeerId);
+      }
     }
   });
 });
