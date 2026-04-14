@@ -51,6 +51,14 @@ export class ControlProvider implements vscode.TreeDataProvider<ControlItem> {
       autoConflict ? "ON — checks peers before work" : "OFF — manual only",
     ));
 
+    // Max context length (number of recent exchanges in shared context)
+    const maxContextLength = vscode.workspace.getConfiguration("agentPeers").get<number>("maxContextLength", 10);
+    items.push(ControlItem.action(
+      "Max Context Length", "agentPeers.setMaxContextLength",
+      "list-ordered", "charts.foreground",
+      `${maxContextLength} exchanges`,
+    ));
+
     // Broker actions — disable the irrelevant one based on state
     const status = this.brokerConnected ? "Broker is running" : "Broker is stopped";
     items.push(ControlItem.action(

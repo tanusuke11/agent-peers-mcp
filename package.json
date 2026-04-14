@@ -214,6 +214,11 @@
           "type": "boolean",
           "default": true,
           "description": "When ON, automatically checks for conflicts with other peers before every prompt (via hook) and when sharing context. When OFF, conflicts are only checked when explicitly using the check_conflicts tool."
+        },
+        "agentPeers.maxContextLength": {
+          "type": "number",
+          "default": 10,
+          "description": "Number of recent conversation exchanges to include in the shared context (recentContext markdown document)."
         }
       }
     }

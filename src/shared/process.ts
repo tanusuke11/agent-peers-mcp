@@ -12,6 +12,33 @@
 import { execSync } from "child_process";
 
 /**
+ * Find the Node.js binary to use when spawning child node processes.
+ *
+ * - In a plain Node.js context (MCP server, broker): `process.execPath` is
+ *   the node binary itself — use it directly so we inherit the same version
+ *   and don't rely on the system PATH.
+ * - In an Electron context (VSCode extension host): `process.execPath` is
+ *   the Electron binary, not node.  We try `which`/`where` and fall back to
+ *   the literal string "node" (PATH lookup at spawn-time).
+ *
+ * Using this instead of the bare string "node" prevents failures when node
+ * is installed via nvm/fnm/volta or lives outside the system PATH.
+ */
+export function findNodeBinary(): string {
+  const execBasename = process.execPath.split(/[\\/]/).pop()!.replace(/\.exe$/i, "").toLowerCase();
+  if (execBasename === "node" || execBasename === "bun") {
+    return process.execPath;
+  }
+  // Electron / other host — locate node on PATH
+  try {
+    const cmd = process.platform === "win32" ? "where node" : "which node";
+    const found = execSync(cmd, { encoding: "utf8", timeout: 3000 }).trim().split("\n")[0]?.trim() ?? "";
+    if (found) return found;
+  } catch { /* fall through */ }
+  return "node"; // last resort: let the OS resolve via PATH at spawn time
+}
+
+/**
  * Gracefully terminate a process.
  * - Unix: sends SIGTERM
  * - Windows: uses `taskkill /PID <pid>` (graceful)

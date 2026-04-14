@@ -7,7 +7,7 @@
 import * as path from "path";
 import * as vscode from "vscode";
 import type { BrokerClient } from "../broker-client";
-import type { Peer, RecentExchange } from "../../shared/types";
+import type { Peer } from "../../shared/types";
 
 export class PeerListProvider implements vscode.TreeDataProvider<PeerItem> {
   private _onDidChangeTreeData = new vscode.EventEmitter<PeerItem | undefined>();
@@ -271,7 +271,7 @@ function buildContextItems(peer: Peer): PeerItem[] {
     items.push(filesItem);
   }
 
-  const exchanges = peer.context.recentContext ?? [];
+  const recentContext = peer.context.recentContext;
   const digest = peer.context.conversationDigest;
   const chatChildren: PeerItem[] = [];
 
@@ -282,34 +282,20 @@ function buildContextItems(peer: Peer): PeerItem[] {
     chatChildren.push(digestItem);
   }
 
-  // Raw exchanges beneath, grouped as a collapsible sub-tree
-  if (exchanges.length > 0) {
+  // Recent context as a single collapsible entry (opens full markdown in editor)
+  if (recentContext) {
     const rawItem = leaf(
-      `Recent Context (${exchanges.length})`,
+      "Recent Context",
       undefined,
       "history",
       dim ?? new vscode.ThemeColor("charts.foreground"),
     );
-    rawItem.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
+    rawItem.collapsibleState = vscode.TreeItemCollapsibleState.None;
     rawItem.command = {
       command: "agentPeers.openMessageInEditor",
       title: "Open in Editor",
-      arguments: [buildRecentContextDocument(peer, exchanges)],
+      arguments: [buildRecentContextDocument(peer, recentContext)],
     };
-    rawItem.children = exchanges.map((ex) => {
-      const icon = ex.role === "human" ? "account" : "hubot";
-      const color = ex.role === "human"
-        ? (dim ?? new vscode.ThemeColor("charts.blue"))
-        : (dim ?? new vscode.ThemeColor("charts.green"));
-      const item = leaf(ex.text, undefined, icon, color);
-      item.tooltip = `[${ex.role}] ${ex.timestamp}\n\n${ex.text}`;
-      item.command = {
-        command: "agentPeers.openMessageInEditor",
-        title: "Open in Editor",
-        arguments: [buildRecentExchangeDocument(peer, ex)],
-      };
-      return item;
-    });
     chatChildren.push(rawItem);
   }
 
@@ -358,14 +344,7 @@ function leaf(label: string, value: string | undefined, iconId: string, iconColo
   return item;
 }
 
-function buildRecentContextDocument(peer: Peer, exchanges: RecentExchange[]) {
-  const lines = exchanges.flatMap((ex) => [
-    `## ${ex.role === "human" ? "Human" : "Assistant"} · ${ex.timestamp}`,
-    "",
-    ex.text,
-    "",
-  ]);
-
+function buildRecentContextDocument(peer: Peer, recentContext: string) {
   return {
     title: `Recent Context: ${peer.id}`,
     header: [
@@ -373,29 +352,11 @@ function buildRecentContextDocument(peer: Peer, exchanges: RecentExchange[]) {
       "",
       `- **Agent:** ${peer.agentType}`,
       `- **Workspace:** ${peer.cwd}`,
-      `- **Exchanges:** ${exchanges.length}`,
       "",
       "---",
       "",
     ].join("\n"),
-    text: lines.join("\n").trim(),
-  };
-}
-
-function buildRecentExchangeDocument(peer: Peer, exchange: RecentExchange) {
-  return {
-    title: `Recent Context: ${peer.id}`,
-    header: [
-      `# Recent Context for ${peer.id}`,
-      "",
-      `- **Agent:** ${peer.agentType}`,
-      `- **Role:** ${exchange.role}`,
-      `- **Timestamp:** ${exchange.timestamp}`,
-      "",
-      "---",
-      "",
-    ].join("\n"),
-    text: exchange.text,
+    text: recentContext,
   };
 }
 

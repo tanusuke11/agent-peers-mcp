@@ -56,6 +56,7 @@ const PORT = parseInt(process.env.AGENT_PEERS_PORT ?? String(DEFAULT_BROKER_PORT
 const WS_PORT = parseInt(process.env.AGENT_PEERS_WS_PORT ?? String(DEFAULT_WS_PORT), 10);
 const DB_PATH = process.env.AGENT_PEERS_DB ?? BROKER_DB_PATH;
 let AUTO_CONFLICT_CHECK = process.env.AGENT_PEERS_AUTO_CONFLICT_CHECK !== "false";
+let MAX_CONTEXT_LENGTH = parseInt(process.env.AGENT_PEERS_MAX_CONTEXT_LENGTH ?? "10", 10) || 10;
 const startTime = Date.now();
 
 // ─── Database setup ────────────────────────────────────────────
@@ -332,16 +333,15 @@ function isAlive(pid: number): boolean {
  * the peer that registered earliest (most likely the true session owner).
  */
 function deduplicateExchanges(peers: Peer[]): void {
-  // Fingerprint each peer's session-derived data (exchanges + summary).
+  // Fingerprint each peer's session-derived data (recentContext markdown + summary).
   // Two peers sharing the same session file will have identical fingerprints.
   const seen = new Map<string, string>(); // fingerprint → peerId (earliest owner)
 
   for (const peer of peers) {
-    const exchanges = peer.context.recentContext;
-    const hasExchanges = exchanges && exchanges.length > 0;
-    if (!hasExchanges) continue;
+    const recentContext = peer.context.recentContext;
+    if (!recentContext) continue;
 
-    const fp = exchanges.map(e => `${e.role}:${e.text}`).join("|");
+    const fp = recentContext;
     const existing = seen.get(fp);
     if (existing === undefined) {
       seen.set(fp, peer.id);
@@ -360,7 +360,7 @@ function deduplicateExchanges(peers: Peer[]): void {
 
 /** Clear context fields that are derived from reading the Claude Code session file. */
 function clearSessionContext(peer: Peer): void {
-  peer.context.recentContext = [];
+  peer.context.recentContext = undefined;
   peer.context.summary = "";
   peer.context.conversationDigest = undefined;
 }
@@ -408,7 +408,7 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
         git: incoming.git ?? existingContext.git,
         currentTask: incoming.currentTask || existingContext.currentTask,
         taskIntent: incoming.taskIntent ?? existingContext.taskIntent,
-        recentContext: incoming.recentContext?.length ? incoming.recentContext : existingContext.recentContext,
+        recentContext: incoming.recentContext || existingContext.recentContext,
         conversationDigest: incoming.conversationDigest || existingContext.conversationDigest,
         metadata: incoming.metadata ?? existingContext.metadata,
         updatedAt: now,
@@ -989,11 +989,14 @@ function handleWakePeer(body: { id: string }): { ok: boolean; delivered: number 
   return { ok: sent, delivered };
 }
 
-function handleUpdateConfig(body: { autoConflictCheck?: boolean }): { ok: boolean; autoConflictCheck: boolean } {
+function handleUpdateConfig(body: { autoConflictCheck?: boolean; maxContextLength?: number }): { ok: boolean; autoConflictCheck: boolean; maxContextLength: number } {
   if (body.autoConflictCheck !== undefined) {
     AUTO_CONFLICT_CHECK = body.autoConflictCheck;
   }
-  return { ok: true, autoConflictCheck: AUTO_CONFLICT_CHECK };
+  if (body.maxContextLength !== undefined && body.maxContextLength > 0) {
+    MAX_CONTEXT_LENGTH = body.maxContextLength;
+  }
+  return { ok: true, autoConflictCheck: AUTO_CONFLICT_CHECK, maxContextLength: MAX_CONTEXT_LENGTH };
 }
 
 function handleHealth(): BrokerHealthResponse {
@@ -1003,6 +1006,7 @@ function handleHealth(): BrokerHealthResponse {
     peerCount: (selectAllPeers.all() as unknown as RawPeerRow[]).length,
     uptime: Math.floor((Date.now() - startTime) / 1000),
     autoConflictCheck: AUTO_CONFLICT_CHECK,
+    maxContextLength: MAX_CONTEXT_LENGTH,
   };
 }
 

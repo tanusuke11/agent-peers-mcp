@@ -11,6 +11,7 @@ import type {
   BrokerHealthResponse,
   WsEvent,
 } from "../shared/types";
+import { findNodeBinary } from "../shared/process";
 
 type EventHandler = (data: unknown) => void;
 
@@ -178,9 +179,9 @@ export class BrokerClient {
     }
   }
 
-  async updateConfig(config: { autoConflictCheck?: boolean }): Promise<{ ok: boolean; autoConflictCheck: boolean } | null> {
+  async updateConfig(config: { autoConflictCheck?: boolean; maxContextLength?: number }): Promise<{ ok: boolean; autoConflictCheck: boolean; maxContextLength: number } | null> {
     try {
-      return await this.post<{ ok: boolean; autoConflictCheck: boolean }>("/update-config", config);
+      return await this.post<{ ok: boolean; autoConflictCheck: boolean; maxContextLength: number }>("/update-config", config);
     } catch {
       return null;
     }
@@ -215,12 +216,14 @@ export class BrokerClient {
     const { spawn } = require("child_process") as typeof import("child_process");
     const cfg = vscode.workspace.getConfiguration("agentPeers");
     const autoConflict = cfg.get<boolean>("autoConflictCheck", true);
-    const proc = spawn("node", [brokerPath], {
+    const maxContextLength = cfg.get<number>("maxContextLength", 10);
+    const proc = spawn(findNodeBinary(), [brokerPath], {
       stdio: "ignore",
       detached: true,
       env: {
         ...process.env,
         AGENT_PEERS_AUTO_CONFLICT_CHECK: String(autoConflict),
+        AGENT_PEERS_MAX_CONTEXT_LENGTH: String(maxContextLength),
       },
     });
     proc.unref();

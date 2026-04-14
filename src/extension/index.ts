@@ -11,7 +11,7 @@ import * as vscode from "vscode";
 import { BrokerClient } from "./broker-client";
 import { PeerListProvider } from "./views/peer-list";
 import { ControlProvider } from "./views/control";
-import { forceKillProcess } from "../shared/process";
+import { forceKillProcess, findNodeBinary } from "../shared/process";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
@@ -51,9 +51,10 @@ function getParentPid(pid: number): number {
       return parseInt(execSync(`ps -o ppid= -p ${pid}`, { encoding: "utf8", timeout: 3000 }).trim(), 10) || 0;
     }
     if (process.platform === "win32") {
-      // wmic is deprecated/removed in Windows 11 — use PowerShell instead
+      // Get-CimInstance works in both Windows PowerShell 5.1 and PowerShell Core 7+.
+      // Get-WmiObject is not available in PS7+.
       const out = execSync(
-        `powershell -NoProfile -Command "(Get-WmiObject Win32_Process -Filter 'ProcessId=${pid}').ParentProcessId"`,
+        `powershell -NoProfile -Command "(Get-CimInstance -ClassName Win32_Process -Filter 'ProcessId=${pid}').ParentProcessId"`,
         { encoding: "utf8", timeout: 5000 },
       ).trim();
       return parseInt(out, 10) || 0;
@@ -112,11 +113,25 @@ async function killZombieBroker(port: number): Promise<void> {
         }
         resolve(found);
       });
-    } else {
+    } else if (process.platform === "darwin") {
+      // macOS: lsof is always present
       execFile("lsof", ["-ti", `TCP:${port}`, "-sTCP:LISTEN"], { timeout: 5000 }, (err, stdout) => {
         if (err) return resolve([]);
         const found = stdout.trim().split(/\s+/).map(Number).filter((n) => n > 0);
         resolve(found);
+      });
+    } else {
+      // Linux: use `ss` (part of iproute2, universally available on modern Linux).
+      // `lsof` may not be installed on minimal/container environments.
+      // `ss -tlnp sport = :PORT` lists TCP listeners and embeds PIDs in the Process column.
+      execFile("ss", ["-tlnp", `sport = :${port}`], { timeout: 5000 }, (err, stdout) => {
+        if (err) return resolve([]);
+        const found: number[] = [];
+        for (const m of stdout.matchAll(/pid=(\d+)/g)) {
+          const pid = parseInt(m[1]!, 10);
+          if (pid > 0) found.push(pid);
+        }
+        resolve([...new Set(found)]);
       });
     }
   });
@@ -439,7 +454,7 @@ export function activate(extensionContext: vscode.ExtensionContext) {
       const { spawn } = require("child_process") as typeof import("child_process");
       const cfg = vscode.workspace.getConfiguration("agentPeers");
       const autoConflict = cfg.get<boolean>("autoConflictCheck", true);
-      const proc = spawn("node", [brokerPath], {
+      const proc = spawn(findNodeBinary(), [brokerPath], {
         stdio: "ignore",
         detached: true,
         env: {
@@ -676,6 +691,25 @@ AGENT_PEERS_AGENT_TYPE = "codex"
       await cfg.update("autoConflictCheck", newValue, vscode.ConfigurationTarget.Global);
       // Update the running broker in real-time
       await brokerClient.updateConfig({ autoConflictCheck: newValue });
+      controlProvider.refresh();
+    }),
+
+    vscode.commands.registerCommand("agentPeers.setMaxContextLength", async () => {
+      const cfg = vscode.workspace.getConfiguration("agentPeers");
+      const current = cfg.get<number>("maxContextLength", 10);
+      const input = await vscode.window.showInputBox({
+        title: "Max Context Length",
+        prompt: "Number of recent conversation exchanges to include in shared context",
+        value: String(current),
+        validateInput: (v) => {
+          const n = parseInt(v, 10);
+          return (isNaN(n) || n < 1) ? "Enter a positive integer" : null;
+        },
+      });
+      if (input === undefined) return;
+      const newValue = parseInt(input, 10);
+      await cfg.update("maxContextLength", newValue, vscode.ConfigurationTarget.Global);
+      await brokerClient.updateConfig({ maxContextLength: newValue });
       controlProvider.refresh();
     }),
 

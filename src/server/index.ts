@@ -53,7 +53,7 @@ import {
   BROKER_HOST,
   HEARTBEAT_INTERVAL_MS,
 } from "../shared/constants.ts";
-import { onProcessTermination } from "../shared/process.ts";
+import { onProcessTermination, findNodeBinary } from "../shared/process.ts";
 import {
   gatherGitContext,
   getGitRoot,
@@ -105,7 +105,7 @@ const BROKER_LOCK = path.join(os.tmpdir(), "agent-peers-broker.lock");
  * Get the command-line arguments of a process by PID (cross-platform).
  * Linux: reads /proc/<pid>/cmdline
  * macOS: uses `ps -o args=`
- * Windows: uses PowerShell Get-WmiObject (wmic is deprecated in Windows 11)
+ * Windows: uses PowerShell Get-CimInstance (works in PS5.1 and PS7+)
  */
 function getProcessArgs(pid: number): string[] | null {
   try {
@@ -117,9 +117,10 @@ function getProcessArgs(pid: number): string[] | null {
       return execSync(`ps -o args= -p ${pid}`, { encoding: "utf8", timeout: 3000 }).trim().split(/\s+/);
     }
     if (process.platform === "win32") {
-      // wmic is deprecated/removed in Windows 11 — use PowerShell instead
+      // Get-CimInstance works in both Windows PowerShell 5.1 and PowerShell Core 7+.
+      // Get-WmiObject is not available in PS7+.
       const out = execSync(
-        `powershell -NoProfile -Command "(Get-WmiObject Win32_Process -Filter 'ProcessId=${pid}').CommandLine"`,
+        `powershell -NoProfile -Command "(Get-CimInstance -ClassName Win32_Process -Filter 'ProcessId=${pid}').CommandLine"`,
         { encoding: "utf8", timeout: 5000 },
       ).trim();
       return out ? out.split(/\s+/) : null;
@@ -132,7 +133,7 @@ function getProcessArgs(pid: number): string[] | null {
  * Get the parent PID of a process (cross-platform).
  * Linux: reads /proc/<pid>/status
  * macOS: uses `ps -o ppid=`
- * Windows: uses PowerShell Get-WmiObject (wmic is deprecated in Windows 11)
+ * Windows: uses PowerShell Get-CimInstance (works in PS5.1 and PS7+)
  */
 function getParentPid(pid: number): number {
   try {
@@ -146,9 +147,10 @@ function getParentPid(pid: number): number {
       return parseInt(execSync(`ps -o ppid= -p ${pid}`, { encoding: "utf8", timeout: 3000 }).trim(), 10) || 0;
     }
     if (process.platform === "win32") {
-      // wmic is deprecated/removed in Windows 11 — use PowerShell instead
+      // Get-CimInstance works in both Windows PowerShell 5.1 and PowerShell Core 7+.
+      // Get-WmiObject is not available in PS7+.
       const out = execSync(
-        `powershell -NoProfile -Command "(Get-WmiObject Win32_Process -Filter 'ProcessId=${pid}').ParentProcessId"`,
+        `powershell -NoProfile -Command "(Get-CimInstance -ClassName Win32_Process -Filter 'ProcessId=${pid}').ParentProcessId"`,
         { encoding: "utf8", timeout: 5000 },
       ).trim();
       return parseInt(out, 10) || 0;
@@ -268,15 +270,15 @@ function findSessionFileUncached(): string | null {
 /** Walk the process tree to discover the Claude Code session ID. */
 function resolveSessionId(): string | null {
   // Method 1: look for --resume <sessionId> in ancestor command lines.
+  // Use regex on the joined string instead of array indexing so that paths
+  // containing spaces (common on macOS) do not misalign the argument list.
   let pid = process.ppid;
   for (let depth = 0; depth < 5 && pid > 1; depth++) {
     const cmdArgs = getProcessArgs(pid);
     if (!cmdArgs) break;
 
-    const resumeIdx = cmdArgs.indexOf("--resume");
-    if (resumeIdx !== -1 && cmdArgs[resumeIdx + 1]) {
-      return cmdArgs[resumeIdx + 1]!;
-    }
+    const match = cmdArgs.join(" ").match(/--resume\s+(\S+)/);
+    if (match) return match[1]!;
     pid = getParentPid(pid);
   }
 
@@ -362,9 +364,10 @@ function getProcessStartTimeMs(pid: number): number | null {
       return seconds !== null ? Date.now() - (seconds * 1000) : null;
     }
     if (process.platform === "win32") {
-      // wmic is deprecated/removed in Windows 11 — use PowerShell instead
+      // Get-CimInstance works in both Windows PowerShell 5.1 and PowerShell Core 7+.
+      // Get-WmiObject is not available in PS7+.
       const out = execSync(
-        `powershell -NoProfile -Command "(Get-WmiObject Win32_Process -Filter 'ProcessId=${pid}').CreationDate"`,
+        `powershell -NoProfile -Command "(Get-CimInstance -ClassName Win32_Process -Filter 'ProcessId=${pid}').CreationDate"`,
         { encoding: "utf8", timeout: 5000 },
       ).trim();
       // PowerShell returns a WMI datetime string like "20240101120000.000000+000"
@@ -510,17 +513,26 @@ function findCodexSessionFileUncached(): string | null {
 }
 
 const EXCHANGE_MAX_CHARS = 200;
-const EXCHANGE_MAX_COUNT = 5;
+let cachedMaxContextLength = 10; // updated from broker health on each heartbeat
 
-/** Read recent human/assistant exchanges from the Claude Code session JSONL. */
-function getRecentExchanges(): import("../shared/types.ts").RecentExchange[] {
+/** Format a list of raw exchanges into a single markdown document. */
+function buildRecentContextMarkdown(
+  exchanges: Array<{ role: "human" | "assistant"; text: string; timestamp: string }>,
+): string {
+  return exchanges
+    .map((ex) => `## ${ex.role === "human" ? "Human" : "Assistant"} · ${ex.timestamp}\n\n${ex.text}`)
+    .join("\n\n");
+}
+
+/** Read recent human/assistant exchanges from the session JSONL and return as a single markdown document. */
+function getRecentExchanges(): string {
   if (AGENT_TYPE === "codex") {
     try {
       const file = findCodexSessionFile();
-      if (!file) return [];
+      if (!file) return "";
 
       const lines = fs.readFileSync(file, "utf8").split("\n").filter(Boolean);
-      const exchanges: import("../shared/types.ts").RecentExchange[] = [];
+      const exchanges: Array<{ role: "human" | "assistant"; text: string; timestamp: string }> = [];
 
       for (const line of lines) {
         try {
@@ -541,21 +553,21 @@ function getRecentExchanges(): import("../shared/types.ts").RecentExchange[] {
         } catch { /* skip */ }
       }
 
-      return exchanges.slice(-EXCHANGE_MAX_COUNT);
-    } catch { return []; }
+      return buildRecentContextMarkdown(exchanges.slice(-cachedMaxContextLength));
+    } catch { return ""; }
   }
 
   // Only Claude Code writes the ~/.claude session JSONL files we inspect below.
   // Other agent types should explicitly add their own reader rather than falling
   // back to another tool's session logs.
-  if (AGENT_TYPE !== "claude-code") return [];
+  if (AGENT_TYPE !== "claude-code") return "";
 
   try {
     const file = findSessionFile();
-    if (!file) return [];
+    if (!file) return "";
 
     const lines = fs.readFileSync(file, "utf8").split("\n").filter(Boolean);
-    const exchanges: import("../shared/types.ts").RecentExchange[] = [];
+    const exchanges: Array<{ role: "human" | "assistant"; text: string; timestamp: string }> = [];
 
     for (const line of lines) {
       try {
@@ -585,8 +597,8 @@ function getRecentExchanges(): import("../shared/types.ts").RecentExchange[] {
       } catch { /* skip */ }
     }
 
-    return exchanges.slice(-EXCHANGE_MAX_COUNT);
-  } catch { return []; }
+    return buildRecentContextMarkdown(exchanges.slice(-cachedMaxContextLength));
+  } catch { return ""; }
 }
 
 // ─── Conversation Digest (AI-generated summary) ─────────────
@@ -595,61 +607,101 @@ const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
 const DIGEST_MODEL = "claude-haiku-4-5-20251001";
 
 /**
- * Generate a 1-2 sentence digest of recent conversation exchanges using the
- * Anthropic Messages API (Haiku for low cost/latency).  Returns null if no
- * API key is configured or the call fails — callers should treat this as a
- * best-effort enrichment.
+ * Generate a digest locally without any API call.
+ * Strategy (案1 + 案3):
+ *   1. Use currentTask or summary if available (案3)
+ *   2. Otherwise use the last assistant block from the markdown document (案1)
+ */
+function generateLocalDigest(
+  recentContext: string | undefined,
+  summary?: string,
+  currentTask?: string,
+  git?: import("../shared/types.ts").GitContext | null,
+): string | null {
+  // 案3: currentTask or summary が非空なら優先
+  const task = currentTask || summary;
+  if (task && task !== "Untitled") {
+    // git の変更ファイルがあれば付記
+    const modifiedFiles = git?.modifiedFiles ?? [];
+    const baselineFiles = new Set(git?.baselineModifiedFiles ?? []);
+    const agentFiles = modifiedFiles.filter(f => !baselineFiles.has(f));
+    if (agentFiles.length > 0) {
+      const fileList = agentFiles.slice(0, 3).join(", ") + (agentFiles.length > 3 ? ` +${agentFiles.length - 3}` : "");
+      return `${task} [${fileList}]`;
+    }
+    return task;
+  }
+
+  // 案1: 最後の ## Assistant ブロックの先頭150文字
+  if (recentContext) {
+    const blocks = recentContext.split(/\n(?=## )/);
+    const lastAssistant = [...blocks].reverse().find(b => b.startsWith("## Assistant"));
+    if (lastAssistant) {
+      const text = lastAssistant.replace(/^## Assistant[^\n]*\n\n?/, "").trimStart();
+      return text.length > 150 ? text.slice(0, 150) + "…" : text;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Generate a 1-2 sentence digest of recent conversation exchanges.
+ * If ANTHROPIC_API_KEY is set, uses Haiku for semantic summarization.
+ * Falls back to local rule-based digest (always available, zero cost).
  */
 async function generateConversationDigest(
-  exchanges: import("../shared/types.ts").RecentExchange[],
+  recentContext: string | undefined,
+  summary?: string,
+  currentTask?: string,
+  git?: import("../shared/types.ts").GitContext | null,
 ): Promise<string | null> {
-  if (exchanges.length === 0) return null;
+  if (!recentContext && !summary && !currentTask) return null;
 
   const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) return null;
+  if (apiKey && recentContext) {
+    const conversation = recentContext;
 
-  const conversation = exchanges
-    .map((ex) => `[${ex.role}] ${ex.text}`)
-    .join("\n");
+    try {
+      const res = await fetch(ANTHROPIC_API_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model: DIGEST_MODEL,
+          max_tokens: 150,
+          messages: [
+            {
+              role: "user",
+              content: `Summarize this AI agent conversation in 1-2 concise sentences. Focus on what was decided, what is being worked on, and any key outcomes. Write in the same language as the conversation.\n\n${conversation}`,
+            },
+          ],
+        }),
+        signal: AbortSignal.timeout(5000),
+      });
 
-  try {
-    const res = await fetch(ANTHROPIC_API_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: DIGEST_MODEL,
-        max_tokens: 150,
-        messages: [
-          {
-            role: "user",
-            content: `Summarize this AI agent conversation in 1-2 concise sentences. Focus on what was decided, what is being worked on, and any key outcomes. Write in the same language as the conversation.\n\n${conversation}`,
-          },
-        ],
-      }),
-      signal: AbortSignal.timeout(5000),
-    });
-
-    if (!res.ok) {
-      log(`Digest API error: ${res.status}`);
-      return null;
+      if (res.ok) {
+        const data = (await res.json()) as {
+          content?: Array<{ type: string; text?: string }>;
+        };
+        const text = data.content
+          ?.filter((b) => b.type === "text")
+          .map((b) => b.text ?? "")
+          .join("");
+        if (text) return text;
+      } else {
+        log(`Digest API error: ${res.status} — falling back to local digest`);
+      }
+    } catch (err) {
+      log(`Digest generation failed: ${err} — falling back to local digest`);
     }
-
-    const data = (await res.json()) as {
-      content?: Array<{ type: string; text?: string }>;
-    };
-    const text = data.content
-      ?.filter((b) => b.type === "text")
-      .map((b) => b.text ?? "")
-      .join("");
-    return text || null;
-  } catch (err) {
-    log(`Digest generation failed: ${err}`);
-    return null;
   }
+
+  // Fallback: local rule-based digest (案1 + 案3)
+  return generateLocalDigest(recentContext, summary, currentTask, git);
 }
 
 // ─── Task Intent computation ────────────────────────────────
@@ -716,7 +768,10 @@ async function ensureBroker(): Promise<void> {
 
   try {
     log("Starting broker daemon...");
-    const proc = spawn("node", [BROKER_SCRIPT], {
+    // Use process.execPath (the running Node.js binary) instead of the bare
+    // string "node" so that broker startup succeeds even when node is not on
+    // the system PATH (e.g. installed via nvm, fnm, or volta).
+    const proc = spawn(findNodeBinary(), [BROKER_SCRIPT], {
       stdio: ["ignore", "ignore", "inherit"],
       detached: true,
     });
@@ -941,11 +996,8 @@ mcp.registerTool("request_context", {
     if (ctx.conversationDigest) {
       parts.push(`\nConversation digest: ${ctx.conversationDigest}`);
     }
-    if (ctx.recentContext?.length) {
-      parts.push(`\nRecent conversation (last ${ctx.recentContext.length} exchanges):`);
-      for (const ex of ctx.recentContext) {
-        parts.push(`  [${ex.role}] ${ex.text}`);
-      }
+    if (ctx.recentContext) {
+      parts.push(`\nRecent conversation:\n${ctx.recentContext}`);
     }
     if (ctx.metadata) parts.push(`Metadata: ${JSON.stringify(ctx.metadata)}`);
     parts.push(`Last updated: ${ctx.updatedAt}`);
@@ -1237,6 +1289,12 @@ async function main() {
   const heartbeatTimer = setInterval(async () => {
     if (!myId) return;
     try {
+      // Refresh config from broker (picks up maxContextLength changes in real-time)
+      fetch(`${BROKER_URL}/health`, { signal: AbortSignal.timeout(1000) })
+        .then(r => r.ok ? r.json() as Promise<{ maxContextLength?: number }> : null)
+        .then(h => { if (h?.maxContextLength) cachedMaxContextLength = h.maxContextLength; })
+        .catch(() => { /* non-critical */ });
+
       const result = await brokerFetch<{ ok: boolean }>("/heartbeat", { id: myId, pid: ownerPid, source: mySource });
       if (!result.ok) {
         // Broker restarted and lost our entry — re-register and re-identify on WS
@@ -1263,14 +1321,14 @@ async function main() {
         contextUpdate.git = gitCtx;
       }
 
-      // Update recent exchanges (only if changed) and regenerate digest
-      const exchanges = getRecentExchanges();
-      const exchangesJson = JSON.stringify(exchanges);
-      if (exchangesJson !== lastExchangesJson) {
-        lastExchangesJson = exchangesJson;
-        contextUpdate.recentContext = exchanges;
+      // Update recent context (only if changed) and regenerate digest
+      const recentContext = getRecentExchanges();
+      const currentSummary = cachedSessionTitle ?? "";
+      if (recentContext !== lastExchangesJson) {
+        lastExchangesJson = recentContext;
+        contextUpdate.recentContext = recentContext;
         // Generate digest asynchronously — don't block heartbeat
-        generateConversationDigest(exchanges).then((digest) => {
+        generateConversationDigest(recentContext, currentSummary, undefined, gitCtx).then((digest) => {
           if (digest && myId) {
             brokerFetch("/update-context", {
               id: myId,
@@ -1282,7 +1340,6 @@ async function main() {
 
       // Update taskIntent (only if changed)
       // We need the current summary/task from the broker context; approximate with cached session title
-      const currentSummary = cachedSessionTitle ?? "";
       const taskIntent = computeTaskIntent(
         currentSummary,
         undefined, // currentTask is set explicitly via share_context, not available here

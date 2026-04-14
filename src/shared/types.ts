@@ -38,12 +38,6 @@ export interface GitContext {
   diff?: string; // abbreviated diff
 }
 
-/** A recent conversation exchange (truncated) */
-export interface RecentExchange {
-  role: "human" | "assistant";
-  text: string;
-  timestamp: string;
-}
 
 /** Structured description of what an agent is currently doing (for conflict detection) */
 export interface TaskIntent {
@@ -69,8 +63,8 @@ export interface AgentContext {
   currentTask?: string;
   /** Structured task intent for conflict detection */
   taskIntent?: TaskIntent;
-  /** Recent conversation exchanges (truncated, last N turns) */
-  recentContext?: RecentExchange[];
+  /** Recent conversation as a single markdown document */
+  recentContext?: string;
   /** AI-generated 1-2 sentence digest of the recent conversation */
   conversationDigest?: string;
   /** Key-value metadata (extensible) */
@@ -215,6 +209,7 @@ export interface BrokerHealthResponse {
   peerCount: number;
   uptime: number;
   autoConflictCheck?: boolean;
+  maxContextLength?: number;
 }
 
 // ─── WebSocket Events (real-time push) ─────────────────────────
