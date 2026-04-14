@@ -105,11 +105,7 @@ export interface Peer {
   connected?: boolean;
   /** Whether the peer has been suspended from context sharing */
   suspended?: boolean;
-  /** Number of undelivered messages waiting for this peer */
-  pendingMessages?: number;
-  /** Number of unread report messages for this peer (replies to task-handoffs) */
-  pendingReports?: number;
-  /** Total number of messages (read + unread) stored for this peer in the sidebar */
+  /** Total number of messages stored for this peer in the sidebar */
   totalMessages?: number;
 }
 
@@ -180,6 +176,8 @@ export interface SendMessageRequest {
   replyTo?: number;
   /** When true, skip duplicate task-handoff detection and send anyway */
   force?: boolean;
+  /** When true, this message is initiated by a user (not peer-to-peer autonomous) */
+  fromUser?: boolean;
 }
 
 /** A duplicate task-handoff that was detected */
@@ -216,7 +214,6 @@ export interface BrokerHealthResponse {
   pid: number;
   peerCount: number;
   uptime: number;
-  maxMessagesPerDirection?: number;
   autoConflictCheck?: boolean;
 }
 

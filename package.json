@@ -136,18 +136,6 @@
         "category": "Agent Peers"
       },
       {
-        "command": "agentPeers.setMaxMessages",
-        "title": "Set Max Messages Per Direction",
-        "icon": "$(symbol-number)",
-        "category": "Agent Peers"
-      },
-      {
-        "command": "agentPeers.markReportsRead",
-        "title": "Mark Reports as Read",
-        "icon": "$(check-all)",
-        "category": "Agent Peers"
-      },
-      {
         "command": "agentPeers.deletePeer",
         "title": "Delete Peer",
         "icon": "$(trash)",
@@ -226,13 +214,6 @@
           "type": "boolean",
           "default": true,
           "description": "When ON, automatically checks for conflicts with other peers before every prompt (via hook) and when sharing context. When OFF, conflicts are only checked when explicitly using the check_conflicts tool."
-        },
-        "agentPeers.maxMessagesPerDirection": {
-          "type": "number",
-          "default": 8,
-          "minimum": 1,
-          "maximum": 10000,
-          "description": "Maximum number of messages allowed per direction (A→B). Prevents infinite message loops between peers."
         }
       }
     }

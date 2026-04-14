@@ -83,6 +83,7 @@ switch (cmd) {
       toId,
       type: "text",
       text: msgParts.join(" "),
+      fromUser: true,
     });
     console.log(result.ok ? "Message sent." : `Error: ${result.error}`);
     break;

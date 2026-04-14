@@ -184,10 +184,39 @@ function configureConflictHook(extensionUri: vscode.Uri): { configured: boolean;
   }
 }
 
+// ─── Virtual document provider ──────────────────────────────
+// Serves message content via a custom URI scheme (agent-peers-msg:).
+// Using a virtual document avoids the untitled-document pipeline entirely,
+// which prevents VS Code from showing the "Terminate running processes?" dialog
+// that appears when an untitled editor tab tries to replace a terminal editor tab.
+
+class MessageContentProvider implements vscode.TextDocumentContentProvider {
+  private readonly _contents = new Map<string, string>();
+
+  provideTextDocumentContent(uri: vscode.Uri): string {
+    return this._contents.get(uri.toString()) ?? "";
+  }
+
+  /** Store content and return a URI that can be opened as a virtual document. */
+  store(content: string): vscode.Uri {
+    const key = Date.now().toString(36) + Math.random().toString(36).slice(2);
+    const uri = vscode.Uri.parse(`agent-peers-msg:/${key}.md`);
+    this._contents.set(uri.toString(), content);
+    return uri;
+  }
+}
+
+const messageContentProvider = new MessageContentProvider();
+
 export function activate(extensionContext: vscode.ExtensionContext) {
   const config = vscode.workspace.getConfiguration("agentPeers");
   const brokerPort = config.get<number>("brokerPort", 7899);
   const wsPort = brokerPort + 1; // Convention: WS port = HTTP port + 1
+
+  // Register virtual document provider for message viewing (prevents terminal dialogs)
+  extensionContext.subscriptions.push(
+    vscode.workspace.registerTextDocumentContentProvider("agent-peers-msg", messageContentProvider),
+  );
 
   // Initialize broker client
   brokerClient = new BrokerClient(brokerPort, wsPort);
@@ -195,7 +224,7 @@ export function activate(extensionContext: vscode.ExtensionContext) {
   // Initialize tree data providers
   const controlProvider = new ControlProvider(brokerClient);
   const peerListProvider = new PeerListProvider(brokerClient);
-  // Register tree views (use createTreeView for peerList to access badge API)
+  // Register tree views
   const peerListView = vscode.window.createTreeView("agentPeers.peerList", {
     treeDataProvider: peerListProvider,
   });
@@ -204,20 +233,9 @@ export function activate(extensionContext: vscode.ExtensionContext) {
     peerListView,
   );
 
-  // ─── Badge & notification helpers ──────────────────────
-  async function updateMessageBadge() {
-    try {
-      const peers = await brokerClient.listPeers("machine");
-      const total = peers.reduce((sum, p) => sum + (p.pendingMessages ?? 0), 0);
-      peerListView.badge = total > 0
-        ? { value: total, tooltip: `${total} unread message${total !== 1 ? "s" : ""}` }
-        : undefined;
-    } catch { /* broker down */ }
-  }
-
   // Listen to real-time events
-  brokerClient.on("peer-joined", () => { peerListProvider.refresh(); updateMessageBadge(); });
-  brokerClient.on("peer-left", () => { peerListProvider.refresh(); updateMessageBadge(); });
+  brokerClient.on("peer-joined", () => { peerListProvider.refresh(); });
+  brokerClient.on("peer-left", () => { peerListProvider.refresh(); });
   brokerClient.on("context-updated", () => {
     peerListProvider.refresh();
   });
@@ -255,13 +273,15 @@ export function activate(extensionContext: vscode.ExtensionContext) {
     if (choice === "Copy to Clipboard") {
       await vscode.env.clipboard.writeText(combined);
     } else if (choice === "Open in Editor") {
-      const doc = await vscode.workspace.openTextDocument({ content: `[Message from ${fromId} (${type})]\n\n${combined}`, language: "markdown" });
-      await vscode.window.showTextDocument(doc, { preview: true });
+      try {
+        const uri = messageContentProvider.store(`[Message from ${fromId} (${type})]\n\n${combined}`);
+        const doc = await vscode.workspace.openTextDocument(uri);
+        await vscode.window.showTextDocument(doc, { preview: true, viewColumn: vscode.ViewColumn.Beside });
+      } catch (e) {
+        vscode.window.showErrorMessage(`Failed to open document: ${e}`);
+      }
     }
-    // Do NOT call markRead here: messages must persist in the sidebar until manually removed,
-    // regardless of whether the user dismissed, copied, or opened the notification.
     peerListProvider.refresh();
-    updateMessageBadge();
   }
 
   // Flush a batched delivery: combine all queued texts into one sendText().
@@ -298,12 +318,10 @@ export function activate(extensionContext: vscode.ExtensionContext) {
           if (terminal) {
             deliverToTerminal(terminal, prompt, peer.agentType);
             terminal.show(true);
-            await brokerClient.markRead(peer.id);
           }
         }
       }
       peerListProvider.refresh();
-      updateMessageBadge();
       return;
     }
 
@@ -312,9 +330,7 @@ export function activate(extensionContext: vscode.ExtensionContext) {
       if (terminal) {
         deliverToTerminal(terminal, prompt, peer.agentType);
         terminal.show(true);
-        await brokerClient.markRead(peer.id);
         peerListProvider.refresh();
-        updateMessageBadge();
         return;
       }
     }
@@ -325,12 +341,10 @@ export function activate(extensionContext: vscode.ExtensionContext) {
 
   brokerClient.on("message", (data) => {
     peerListProvider.refresh();
-    updateMessageBadge();
 
     const msg = data as { fromId?: string; toId?: string; text?: string; type?: string } | undefined;
 
-    // Report messages are NOT delivered to terminal — they only update the
-    // sidebar (peer list refresh + badge update above is sufficient).
+    // Report messages are NOT delivered to terminal — they only update the sidebar.
     if (msg?.type === "report") return;
 
     if (!msg?.toId || !msg?.fromId || !msg?.text) {
@@ -424,14 +438,12 @@ export function activate(extensionContext: vscode.ExtensionContext) {
       const brokerPath = vscode.Uri.joinPath(extensionContext.extensionUri, "out", "broker", "index.js").fsPath;
       const { spawn } = require("child_process") as typeof import("child_process");
       const cfg = vscode.workspace.getConfiguration("agentPeers");
-      const maxMsg = cfg.get<number>("maxMessagesPerDirection", 8);
       const autoConflict = cfg.get<boolean>("autoConflictCheck", true);
       const proc = spawn("node", [brokerPath], {
         stdio: "ignore",
         detached: true,
         env: {
           ...process.env,
-          AGENT_PEERS_MAX_MESSAGES_PER_DIRECTION: String(maxMsg),
           AGENT_PEERS_AUTO_CONFLICT_CHECK: String(autoConflict),
         },
       });
@@ -501,24 +513,8 @@ export function activate(extensionContext: vscode.ExtensionContext) {
       try {
         await brokerClient.deletePeer(peerId);
         peerListProvider.refresh();
-        updateMessageBadge();
       } catch (e) {
         vscode.window.showErrorMessage(`Failed to delete peer: ${e}`);
-      }
-    }),
-
-    vscode.commands.registerCommand("agentPeers.markReportsRead", async (item?: { peerId?: string; peer?: { id: string } }) => {
-      const peerId = item?.peerId || item?.peer?.id;
-      if (!peerId) {
-        vscode.window.showWarningMessage("No peer selected.");
-        return;
-      }
-      try {
-        await brokerClient.markReportsRead(peerId);
-        peerListProvider.refresh();
-        updateMessageBadge();
-      } catch (e) {
-        vscode.window.showErrorMessage(`Failed to mark reports as read: ${e}`);
       }
     }),
 
@@ -673,31 +669,6 @@ AGENT_PEERS_AGENT_TYPE = "codex"
       controlProvider.refresh();
     }),
 
-    vscode.commands.registerCommand("agentPeers.setMaxMessages", async () => {
-      const cfg = vscode.workspace.getConfiguration("agentPeers");
-      const current = cfg.get<number>("maxMessagesPerDirection", 8);
-      const input = await vscode.window.showInputBox({
-        title: "Max Messages Per Direction",
-        prompt: "Maximum number of messages allowed per direction (A→B). Prevents infinite loops.",
-        value: String(current),
-        validateInput: (v) => {
-          const n = parseInt(v, 10);
-          if (isNaN(n) || n < 1) return "Enter a positive integer (minimum 1)";
-          if (n > 10000) return "Maximum value is 10000";
-          return undefined;
-        },
-      });
-      if (input === undefined) return;
-      const newValue = parseInt(input, 10);
-      await cfg.update("maxMessagesPerDirection", newValue, vscode.ConfigurationTarget.Global);
-      // Update the running broker in real-time
-      const result = await brokerClient.updateConfig({ maxMessagesPerDirection: newValue });
-      if (result?.ok) {
-        vscode.window.showInformationMessage(`Max messages per direction set to ${newValue}`);
-      }
-      controlProvider.refresh();
-    }),
-
     vscode.commands.registerCommand("agentPeers.toggleAutoConflictCheck", async () => {
       const cfg = vscode.workspace.getConfiguration("agentPeers");
       const current = cfg.get<boolean>("autoConflictCheck", true);
@@ -731,8 +702,16 @@ AGENT_PEERS_AGENT_TYPE = "codex"
         "",
       ].filter(Boolean).join("\n");
       const content = header + item.text;
-      const doc = await vscode.workspace.openTextDocument({ content, language: "markdown" });
-      await vscode.window.showTextDocument(doc, { preview: true });
+      try {
+        // Use virtual document provider (agent-peers-msg: scheme) instead of untitled document.
+        // This avoids the "Do you want to terminate running processes?" dialog that appears
+        // when VS Code tries to close a terminal editor tab to make room for an untitled doc.
+        const uri = messageContentProvider.store(content);
+        const doc = await vscode.workspace.openTextDocument(uri);
+        await vscode.window.showTextDocument(doc, { preview: true, viewColumn: vscode.ViewColumn.Beside });
+      } catch (e) {
+        vscode.window.showErrorMessage(`Failed to open document: ${e}`);
+      }
     }),
 
     vscode.commands.registerCommand("agentPeers.deleteMessage", async (item?: { messageId?: number; peerId?: string }) => {
@@ -740,7 +719,6 @@ AGENT_PEERS_AGENT_TYPE = "codex"
       try {
         await brokerClient.deleteMessage(item.messageId);
         peerListProvider.refresh();
-        updateMessageBadge();
       } catch (e) {
         vscode.window.showErrorMessage(`Failed to delete message: ${e}`);
       }
@@ -749,10 +727,15 @@ AGENT_PEERS_AGENT_TYPE = "codex"
     vscode.commands.registerCommand("agentPeers.clearMessages", async (item?: { incomingForPeerId?: string; peerId?: string }) => {
       const peerId = item?.incomingForPeerId ?? item?.peerId;
       if (!peerId) return;
+      const confirmation = await vscode.window.showWarningMessage(
+        `Clear all messages for peer \"${peerId}\"? This action cannot be undone.`,
+        { modal: true },
+        "Clear All Messages",
+      );
+      if (confirmation !== "Clear All Messages") return;
       try {
         await brokerClient.clearMessages(peerId);
         peerListProvider.refresh();
-        updateMessageBadge();
       } catch (e) {
         vscode.window.showErrorMessage(`Failed to clear messages: ${e}`);
       }
@@ -784,10 +767,9 @@ AGENT_PEERS_AGENT_TYPE = "codex"
   vscode.commands.executeCommand("setContext", "agentPeers.brokerConnected", false);
 
   // React to WebSocket connection state changes
-  brokerClient.on("broker-connected", () => { setBrokerConnected(true); updateMessageBadge(); });
+  brokerClient.on("broker-connected", () => { setBrokerConnected(true); });
   brokerClient.on("broker-disconnected", () => {
     setBrokerConnected(false);
-    peerListView.badge = undefined;
   });
 
   // Periodic health check + timestamp refresh (fallback in case WS events are missed)
@@ -796,7 +778,6 @@ AGENT_PEERS_AGENT_TYPE = "codex"
     setBrokerConnected(h !== null);
     if (h) {
       peerListProvider.refresh();
-      updateMessageBadge();
     }
   }, 30_000);
 

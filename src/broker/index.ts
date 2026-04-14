@@ -46,7 +46,6 @@ import type {
 import {
   DEFAULT_BROKER_PORT,
   DEFAULT_WS_PORT,
-  DEFAULT_MAX_MESSAGES_PER_DIRECTION,
   BROKER_DB_PATH,
   STALE_PEER_CLEANUP_MS,
   PEER_TIMEOUT_MS,
@@ -56,9 +55,6 @@ import { terminateProcess } from "../shared/process.ts";
 const PORT = parseInt(process.env.AGENT_PEERS_PORT ?? String(DEFAULT_BROKER_PORT), 10);
 const WS_PORT = parseInt(process.env.AGENT_PEERS_WS_PORT ?? String(DEFAULT_WS_PORT), 10);
 const DB_PATH = process.env.AGENT_PEERS_DB ?? BROKER_DB_PATH;
-let MAX_MESSAGES_PER_DIRECTION = Math.max(1,
-  parseInt(process.env.AGENT_PEERS_MAX_MESSAGES_PER_DIRECTION ?? String(DEFAULT_MAX_MESSAGES_PER_DIRECTION), 10) || DEFAULT_MAX_MESSAGES_PER_DIRECTION,
-);
 let AUTO_CONFLICT_CHECK = process.env.AGENT_PEERS_AUTO_CONFLICT_CHECK !== "false";
 const startTime = Date.now();
 
@@ -95,7 +91,7 @@ try {
   db.exec("ALTER TABLE peers ADD COLUMN source TEXT NOT NULL DEFAULT 'terminal'");
 } catch { /* column already exists */ }
 
-// Migration: add read column to messages (distinguishes "ws-pushed" from "agent-polled")
+// Legacy compatibility migration: keep the old read column if it exists in user databases
 try {
   db.exec("ALTER TABLE messages ADD COLUMN read INTEGER NOT NULL DEFAULT 0");
 } catch { /* column already exists */ }
@@ -103,6 +99,11 @@ try {
 // Migration: add reply_to column (links report messages to original task-handoff)
 try {
   db.exec("ALTER TABLE messages ADD COLUMN reply_to INTEGER REFERENCES messages(id)");
+} catch { /* column already exists */ }
+
+// Migration: add from_user column (distinguishes user-initiated from peer-to-peer messages)
+try {
+  db.exec("ALTER TABLE messages ADD COLUMN from_user INTEGER NOT NULL DEFAULT 0");
 } catch { /* column already exists */ }
 
 db.exec(`
@@ -115,6 +116,7 @@ db.exec(`
     payload_json TEXT,
     sent_at TEXT NOT NULL,
     delivered INTEGER NOT NULL DEFAULT 0,
+    from_user INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (from_id) REFERENCES peers(id),
     FOREIGN KEY (to_id) REFERENCES peers(id)
   )
@@ -198,18 +200,13 @@ const selectSuspendedByCwd = db.prepare(`SELECT * FROM peers WHERE agent_type = 
 const selectMessageById = db.prepare(`SELECT * FROM messages WHERE id = ?`);
 
 const insertMessage = db.prepare(`
-  INSERT INTO messages (from_id, to_id, type, text, payload_json, sent_at, delivered, reply_to)
-  VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+  INSERT INTO messages (from_id, to_id, type, text, payload_json, sent_at, delivered, reply_to, from_user)
+  VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
 `);
 const selectUndelivered = db.prepare(`
   SELECT * FROM messages WHERE to_id = ? AND delivered = 0 ORDER BY sent_at ASC
 `);
-const selectUnread = db.prepare(`
-  SELECT * FROM messages WHERE to_id = ? AND read = 0 ORDER BY sent_at ASC
-`);
 const markDelivered = db.prepare(`UPDATE messages SET delivered = 1 WHERE id = ?`);
-const markRead = db.prepare(`UPDATE messages SET read = 1 WHERE id = ?`);
-const markAllRead = db.prepare(`UPDATE messages SET read = 1 WHERE to_id = ? AND read = 0`);
 
 // ─── Stale peer cleanup (deferred until prepared statements are ready) ──
 cleanStalePeers();
@@ -259,16 +256,12 @@ interface RawPeerRow {
   suspended: number;
 }
 
-const countUndelivered = db.prepare(`SELECT COUNT(*) as cnt FROM messages WHERE to_id = ? AND read = 0 AND type != 'report'`);
-const countUnreadReports = db.prepare(`SELECT COUNT(*) as cnt FROM messages WHERE to_id = ? AND read = 0 AND type = 'report'`);
-const countPerDirection = db.prepare(`SELECT COUNT(*) as cnt FROM messages WHERE from_id = ? AND to_id = ?`);
 const countAllMessages = db.prepare(`SELECT COUNT(*) as cnt FROM messages WHERE to_id = ?`);
 const selectAllMessagesForPeer = db.prepare(`SELECT * FROM messages WHERE to_id = ? ORDER BY sent_at ASC`);
 const deleteMessageById = db.prepare(`DELETE FROM messages WHERE id = ?`);
 const clearMessagesForPeer = db.prepare(`DELETE FROM messages WHERE to_id = ?`);
 
 function rowToPeer(row: RawPeerRow): Peer {
-  const pending = (countUndelivered.get(row.id) as unknown as { cnt: number })?.cnt ?? 0;
   return {
     id: row.id,
     agentType: row.agent_type as Peer["agentType"],
@@ -282,11 +275,6 @@ function rowToPeer(row: RawPeerRow): Peer {
     lastSeen: row.last_seen,
     connected: !row.suspended,
     suspended: !!row.suspended,
-    pendingMessages: pending > 0 ? pending : undefined,
-    pendingReports: (() => {
-      const cnt = (countUnreadReports.get(row.id) as unknown as { cnt: number })?.cnt ?? 0;
-      return cnt > 0 ? cnt : undefined;
-    })(),
     totalMessages: (() => {
       const cnt = (countAllMessages.get(row.id) as unknown as { cnt: number })?.cnt ?? 0;
       return cnt > 0 ? cnt : undefined;
@@ -304,6 +292,7 @@ interface RawMessageRow {
   reply_to: number | null;
   sent_at: string;
   delivered: number;
+  from_user: number;
 }
 
 function rowToMessage(row: RawMessageRow): Message {
@@ -544,12 +533,15 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
 
 // ─── Duplicate task-handoff detection ─────────────────────────
 
-/** Find recent task-handoff messages from this sender that are still unread by recipients */
-const selectRecentTaskHandoffs = db.prepare(`
+/** Find recent task-handoff messages from this sender that are still open (no report reply yet). */
+const selectRecentOpenTaskHandoffs = db.prepare(`
   SELECT m.*, p.context_json, p.agent_type
   FROM messages m
   JOIN peers p ON p.id = m.to_id
-  WHERE m.from_id = ? AND m.type = 'task-handoff' AND m.read = 0
+  WHERE m.from_id = ? AND m.type = 'task-handoff'
+    AND NOT EXISTS (
+      SELECT 1 FROM messages r WHERE r.type = 'report' AND r.reply_to = m.id
+    )
   ORDER BY m.sent_at DESC
   LIMIT 20
 `);
@@ -559,8 +551,8 @@ function checkDuplicateTaskHandoff(fromId: string, text: string): DuplicateTaskI
   const textTokens = extractTokens(text);
   if (textTokens.length < 2) return duplicates;
 
-  // Check 1: Recent unread task-handoff messages from the same sender
-  const recentHandoffs = selectRecentTaskHandoffs.all(fromId) as unknown as (RawMessageRow & { context_json: string; agent_type: string })[];
+  // Check 1: Recent open task-handoff messages from the same sender
+  const recentHandoffs = selectRecentOpenTaskHandoffs.all(fromId) as unknown as (RawMessageRow & { context_json: string; agent_type: string })[];
   for (const row of recentHandoffs) {
     const handoffTokens = extractTokens(row.text);
     const commonTokens = textTokens.filter(t => handoffTokens.includes(t));
@@ -666,19 +658,11 @@ function handleSendMessage(body: SendMessageRequest): SendMessageResponse {
     }
   }
 
-  // Enforce per-direction message limit
-  const dirCount = (countPerDirection.get(body.fromId, body.toId) as unknown as { cnt: number }).cnt;
-  if (dirCount >= MAX_MESSAGES_PER_DIRECTION) {
-    return {
-      ok: false,
-      error: `Message limit reached: ${body.fromId} → ${body.toId} already has ${dirCount} messages (max ${MAX_MESSAGES_PER_DIRECTION}). Set AGENT_PEERS_MAX_MESSAGES_PER_DIRECTION to adjust.`,
-    };
-  }
-
   const now = new Date().toISOString();
   const payloadJson = body.payload ? JSON.stringify(body.payload) : null;
   const replyTo = body.replyTo ?? null;
-  insertMessage.run(body.fromId, body.toId, body.type, body.text, payloadJson, now, replyTo);
+  const fromUser = body.fromUser ? 1 : 0;
+  insertMessage.run(body.fromId, body.toId, body.type, body.text, payloadJson, now, replyTo, fromUser);
 
   // Get the inserted message
   const lastId = db.prepare("SELECT last_insert_rowid() as id").get() as unknown as { id: number };
@@ -694,7 +678,7 @@ function handleSendMessage(body: SendMessageRequest): SendMessageResponse {
   if (body.type === "report") {
     // Reports are NOT delivered to the recipient's terminal.
     // They accumulate silently — only broadcast to anonymous WS clients (extension UI)
-    // so the sidebar can refresh and show report badges.
+    // so the sidebar can refresh and show the stored message list.
     const broadcastJson = JSON.stringify(event);
     for (const ws of wsClients) {
       if (ws.readyState === WebSocket.OPEN) {
@@ -724,11 +708,10 @@ function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
   const exists = selectPeerById.get(body.id) as unknown as RawPeerRow | undefined;
   if (!exists) return { found: false, messages: [] };
 
-  const rows = selectUnread.all(body.id) as unknown as unknown as RawMessageRow[];
+  const rows = selectUndelivered.all(body.id) as unknown as unknown as RawMessageRow[];
   for (const row of rows) {
-    // Mark both delivered and read when the agent actively polls
+    // Mark delivered when the agent actively polls for new messages
     if (!row.delivered) markDelivered.run(row.id);
-    markRead.run(row.id);
   }
 
   return {
@@ -745,31 +728,19 @@ function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
   };
 }
 
-/** Return unread messages WITHOUT marking them as read.
- *  Used by the MCP server's WS-reconnect drain — it sends channel notifications
- *  but the read flag should only be set when the extension delivers the message
- *  to the agent's terminal via the bell button. */
+/** Return pending undelivered messages and mark them delivered.
+ *  Used by the MCP server's WS-reconnect drain so already-delivered messages
+ *  are not replayed repeatedly across reconnects. */
 function handlePeekMessages(body: PollMessagesRequest): PollMessagesResponse {
   const exists = selectPeerById.get(body.id) as unknown as RawPeerRow | undefined;
   if (!exists) return { found: false, messages: [] };
 
-  const rows = selectUnread.all(body.id) as unknown as unknown as RawMessageRow[];
-  // Mark delivered (broker→MCP server) but NOT read (agent hasn't consumed it yet)
+  const rows = selectUndelivered.all(body.id) as unknown as unknown as RawMessageRow[];
   for (const row of rows) {
     if (!row.delivered) markDelivered.run(row.id);
   }
 
   return { found: true, messages: rows.map(rowToMessage) };
-}
-
-/** Mark all unread messages for a peer as read. */
-function handleMarkRead(body: { id: string }): { ok: boolean; marked: number } {
-  const exists = selectPeerById.get(body.id) as unknown as RawPeerRow | undefined;
-  if (!exists) return { ok: false, marked: 0 };
-
-  const rows = selectUnread.all(body.id) as unknown as unknown as RawMessageRow[];
-  markAllRead.run(body.id);
-  return { ok: true, marked: rows.length };
 }
 
 /** Detach a session from a peer: mark suspended, clear PID, but keep data & messages. */
@@ -946,24 +917,12 @@ function handleCheckConflicts(body: CheckConflictsRequest): CheckConflictsRespon
 }
 
 /** List report messages for a peer (reports sent TO this peer). */
-function handleListReports(body: { id: string; unreadOnly?: boolean }): { reports: Message[] } {
-  const query = body.unreadOnly
-    ? db.prepare("SELECT * FROM messages WHERE to_id = ? AND type = 'report' AND read = 0 ORDER BY sent_at ASC")
-    : db.prepare("SELECT * FROM messages WHERE to_id = ? AND type = 'report' ORDER BY sent_at ASC");
-  const rows = query.all(body.id) as unknown as RawMessageRow[];
+function handleListReports(body: { id: string }): { reports: Message[] } {
+  const rows = db.prepare("SELECT * FROM messages WHERE to_id = ? AND type = 'report' ORDER BY sent_at ASC").all(body.id) as unknown as RawMessageRow[];
   return { reports: rows.map(rowToMessage) };
 }
 
-/** Mark report messages as read for a peer. */
-function handleMarkReportsRead(body: { id: string }): { ok: boolean; marked: number } {
-  const rows = db.prepare("SELECT * FROM messages WHERE to_id = ? AND type = 'report' AND read = 0").all(body.id) as unknown as RawMessageRow[];
-  for (const row of rows) {
-    markRead.run(row.id);
-  }
-  return { ok: true, marked: rows.length };
-}
-
-/** List all messages (read + unread, all types) for a peer — used by the sidebar for persistent display. */
+/** List all stored messages for a peer — used by the sidebar for persistent display. */
 function handleListMessages(body: { id: string }): { messages: Message[] } {
   const exists = selectPeerById.get(body.id) as unknown as RawPeerRow | undefined;
   if (!exists) return { messages: [] };
@@ -1011,14 +970,11 @@ function handleWakePeer(body: { id: string }): { ok: boolean; delivered: number 
   return { ok: sent, delivered };
 }
 
-function handleUpdateConfig(body: { maxMessagesPerDirection?: number; autoConflictCheck?: boolean }): { ok: boolean; maxMessagesPerDirection: number; autoConflictCheck: boolean } {
-  if (body.maxMessagesPerDirection !== undefined) {
-    MAX_MESSAGES_PER_DIRECTION = Math.max(1, Math.floor(body.maxMessagesPerDirection));
-  }
+function handleUpdateConfig(body: { autoConflictCheck?: boolean }): { ok: boolean; autoConflictCheck: boolean } {
   if (body.autoConflictCheck !== undefined) {
     AUTO_CONFLICT_CHECK = body.autoConflictCheck;
   }
-  return { ok: true, maxMessagesPerDirection: MAX_MESSAGES_PER_DIRECTION, autoConflictCheck: AUTO_CONFLICT_CHECK };
+  return { ok: true, autoConflictCheck: AUTO_CONFLICT_CHECK };
 }
 
 function handleHealth(): BrokerHealthResponse {
@@ -1027,7 +983,6 @@ function handleHealth(): BrokerHealthResponse {
     pid: process.pid,
     peerCount: (selectAllPeers.all() as unknown as RawPeerRow[]).length,
     uptime: Math.floor((Date.now() - startTime) / 1000),
-    maxMessagesPerDirection: MAX_MESSAGES_PER_DIRECTION,
     autoConflictCheck: AUTO_CONFLICT_CHECK,
   };
 }
@@ -1083,9 +1038,6 @@ async function handleRequest(req: Request): Promise<Response> {
       case "/peek-messages":
         result = handlePeekMessages(body as PollMessagesRequest);
         break;
-      case "/mark-read":
-        result = handleMarkRead(body as { id: string });
-        break;
       case "/unregister":
         handleUnregister(body as { id: string });
         result = { ok: true };
@@ -1103,10 +1055,7 @@ async function handleRequest(req: Request): Promise<Response> {
         result = handleCheckConflicts(body as CheckConflictsRequest);
         break;
       case "/list-reports":
-        result = handleListReports(body as { id: string; unreadOnly?: boolean });
-        break;
-      case "/mark-reports-read":
-        result = handleMarkReportsRead(body as { id: string });
+        result = handleListReports(body as { id: string });
         break;
       case "/list-messages":
         result = handleListMessages(body as { id: string });
@@ -1127,7 +1076,7 @@ async function handleRequest(req: Request): Promise<Response> {
         result = handlePurge();
         break;
       case "/update-config":
-        result = handleUpdateConfig(body as { maxMessagesPerDirection?: number });
+        result = handleUpdateConfig(body as { autoConflictCheck?: boolean });
         break;
       case "/shutdown":
         result = { ok: true };

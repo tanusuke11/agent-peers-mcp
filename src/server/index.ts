@@ -16,7 +16,6 @@
  * Environment:
  *   AGENT_PEERS_AGENT_TYPE  — "claude-code" | "codex" | "generic"
  *   AGENT_PEERS_PORT        — broker HTTP port (default 7899)
- *   AGENT_PEERS_MAX_MESSAGES_PER_DIRECTION — max messages from A→B (default 50, min 1)
  *   AGENT_PEERS_TRUST_BROKER_ID_ONLY — "false" to disable the strict broker-ID instruction (default: enabled)
  */
 
@@ -828,7 +827,7 @@ mcp.registerTool("list_peers", {
 });
 
 mcp.registerTool("send_message", {
-  description: "Send a message to another AI agent instance. Supports types: 'text' (general), 'context-request' (ask for context), 'task-handoff' (delegate a task), 'report' (reply to a task-handoff with a work report — NOT delivered to the requester's terminal, only visible in their UI). All peer types (terminal and extension) accept all message types. For 'report' messages to extension peers, reply_to must point to the original task-handoff. For task-handoff, the broker checks for duplicate/similar tasks already in progress and blocks if found — use force=true to override. Suspended/sleeping peers (suspended=true in list_peers) are not valid recipients — messages to them will be rejected.",
+  description: "Send a message to another AI agent instance. Supports types: 'text' (general), 'context-request' (ask for context), 'task-handoff' (delegate a task to another peer — see guidance below), 'report' (reply to a task-handoff with a work report — NOT delivered to the requester's terminal, only visible in their UI). All peer types (terminal and extension) accept all message types. For 'report' messages to extension peers, reply_to must point to the original task-handoff. For task-handoff, the broker checks for duplicate/similar tasks already in progress and blocks if found — use force=true to override. Suspended/sleeping peers (suspended=true in list_peers) are not valid recipients — messages to them will be rejected. IMPORTANT GUIDANCE FOR TASK-HANDOFF: When delegating a task via task-handoff, perform minimal investigation/analysis before sending — don't parallelize your own work. Wait for the recipient to send a 'report' back with their results before resuming your own tasks.",
   inputSchema: {
     to_id: z.string().describe("The peer ID of the target agent (from list_peers)"),
     message: z.string().describe("The message text"),
@@ -1097,8 +1096,7 @@ function scheduleWsReconnect() {
 async function drainUndeliveredMessages() {
   if (!myId) return;
   try {
-    // Use peek-messages (not poll-messages) so messages stay unread.
-    // read is only marked when the extension delivers via terminal injection.
+    // Use peek-messages to drain messages that have not been delivered yet.
     const result = await brokerFetch<PollMessagesResponse>("/peek-messages", { id: myId });
     if (!result.found) {
       log("Peer entry gone from broker (purged), re-registering...");

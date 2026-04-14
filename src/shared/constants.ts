@@ -17,8 +17,6 @@ export function getBrokerUrl(port?: number): string {
   return `http://${BROKER_HOST}:${port ?? DEFAULT_BROKER_PORT}`;
 }
 
-export const DEFAULT_MAX_MESSAGES_PER_DIRECTION = 8;
-
 export function getWsUrl(port?: number): string {
   return `ws://${BROKER_HOST}:${port ?? DEFAULT_WS_PORT}`;
 }

@@ -25,7 +25,7 @@ export class PeerListProvider implements vscode.TreeDataProvider<PeerItem> {
 
   async getChildren(element?: PeerItem): Promise<PeerItem[]> {
     if (element) {
-      // Lazily load all messages (read + unread, all types) when an "incoming" node is expanded
+      // Lazily load all stored messages when an "incoming" node is expanded
       if (element.incomingForPeerId) {
         const messages = await this.client.listMessages(element.incomingForPeerId);
         return messages.map((m) => {
@@ -39,8 +39,10 @@ export class PeerListProvider implements vscode.TreeDataProvider<PeerItem> {
               : new vscode.ThemeColor("charts.blue");
           const prefix = isReport ? "📨" : "←";
           const item = leaf(`${prefix} ${m.fromId}: ${preview}`, undefined, icon, color);
+          item.id = `peer:${element.incomingForPeerId}:incoming:message:${m.id}`;
           item.tooltip = `[${m.type}] from ${m.fromId}\nSent: ${m.sentAt}\n\n${m.text}`;
           item.contextValue = "incomingMessage";
+          item.incomingForPeerId = element.incomingForPeerId;
           item.messageId = m.id;
           item.command = {
             command: "agentPeers.openMessageInEditor",
@@ -74,8 +76,8 @@ export class PeerListProvider implements vscode.TreeDataProvider<PeerItem> {
     });
 
     const items: PeerItem[] = [];
-    for (const [, group] of sortedGroups) {
-      const header = PeerItem.projectHeader(group.label, group.peers.length);
+    for (const [groupKey, group] of sortedGroups) {
+      const header = PeerItem.projectHeader(group.label, group.peers.length, groupKey);
       const activeDescriptions = new Set(
         group.peers
           .filter((p) => !p.suspended)
@@ -328,10 +330,7 @@ function buildContextItems(peer: Peer): PeerItem[] {
   // Incoming messages + reports subtree — lazily loaded when expanded
   const totalMessages = peer.totalMessages ?? 0;
   if (totalMessages > 0) {
-    const unreadCount = (peer.pendingMessages ?? 0) + (peer.pendingReports ?? 0);
-    const label = unreadCount > 0
-      ? `Incoming Messages (${totalMessages}, ${unreadCount} unread)`
-      : `Incoming Messages (${totalMessages})`;
+    const label = `Incoming Messages (${totalMessages})`;
     const incomingItem = new PeerItem(
       label,
       peer.id,
@@ -340,6 +339,7 @@ function buildContextItems(peer: Peer): PeerItem[] {
       "mail",
       dim ?? new vscode.ThemeColor("notificationsInfoIcon.foreground"),
     );
+    incomingItem.id = `peer:${peer.id}:incoming`;
     incomingItem.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
     incomingItem.incomingForPeerId = peer.id;
     incomingItem.contextValue = "incomingMessagesHeader";
@@ -406,8 +406,9 @@ class PeerItem extends vscode.TreeItem {
   /** Message ID for individual message items — used by delete command */
   messageId?: number;
 
-  static projectHeader(projectName: string, peerCount: number): PeerItem {
+  static projectHeader(projectName: string, peerCount: number, projectKey: string): PeerItem {
     const item = new PeerItem(projectName, "", "header");
+    item.id = `project:${projectKey}`;
     item.description = `${peerCount} peer${peerCount !== 1 ? "s" : ""}`;
     item.iconPath = new vscode.ThemeIcon("root-folder", new vscode.ThemeColor("charts.blue"));
     item.contextValue = "projectHeader";
@@ -428,6 +429,7 @@ class PeerItem extends vscode.TreeItem {
 
     if (itemType === "peer" && peer) {
       const isSuspended = !!peer.suspended;
+      this.id = `peer:${peer.id}`;
       this.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
 
       // Build description from recent context (shared by both active & sleep peers)
@@ -446,13 +448,7 @@ class PeerItem extends vscode.TreeItem {
         const hasConversationCue = !!preferredConversationCue(peer);
         const recentlyActive = isRecentlyActive(peer, 2 * 60_000);
         const isWorking = !!task || hasInformativeSummary || hasConversationCue || recentlyActive;
-        const pending = peer.pendingMessages ?? 0;
-        const reports = peer.pendingReports ?? 0;
-        if (reports > 0) {
-          this.iconPath = new vscode.ThemeIcon("inbox", new vscode.ThemeColor("notificationsInfoIcon.foreground"));
-        } else if (pending > 0) {
-          this.iconPath = new vscode.ThemeIcon("mail", new vscode.ThemeColor("notificationsInfoIcon.foreground"));
-        } else if (isWorking) {
+        if (isWorking) {
           this.iconPath = new vscode.ThemeIcon("sync~spin", agentColor(peer.agentType));
         } else {
           this.iconPath = new vscode.ThemeIcon("circle-filled", agentColor(peer.agentType));

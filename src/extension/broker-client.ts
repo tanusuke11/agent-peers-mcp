@@ -144,12 +144,6 @@ export class BrokerClient {
     }
   }
 
-  async markRead(id: string): Promise<void> {
-    try {
-      await this.post("/mark-read", { id });
-    } catch { /* best effort */ }
-  }
-
   async peekMessages(id: string): Promise<Message[]> {
     try {
       const result = await this.post<{ found: boolean; messages: Message[] }>("/peek-messages", { id });
@@ -157,21 +151,6 @@ export class BrokerClient {
     } catch {
       return [];
     }
-  }
-
-  async listReports(id: string, unreadOnly = false): Promise<Message[]> {
-    try {
-      const result = await this.post<{ reports: Message[] }>("/list-reports", { id, unreadOnly });
-      return result.reports;
-    } catch {
-      return [];
-    }
-  }
-
-  async markReportsRead(id: string): Promise<void> {
-    try {
-      await this.post("/mark-reports-read", { id });
-    } catch { /* best effort */ }
   }
 
   async listMessages(peerId: string): Promise<Message[]> {
@@ -199,9 +178,9 @@ export class BrokerClient {
     }
   }
 
-  async updateConfig(config: { maxMessagesPerDirection?: number }): Promise<{ ok: boolean; maxMessagesPerDirection: number } | null> {
+  async updateConfig(config: { autoConflictCheck?: boolean }): Promise<{ ok: boolean; autoConflictCheck: boolean } | null> {
     try {
-      return await this.post<{ ok: boolean; maxMessagesPerDirection: number }>("/update-config", config);
+      return await this.post<{ ok: boolean; autoConflictCheck: boolean }>("/update-config", config);
     } catch {
       return null;
     }
@@ -235,14 +214,12 @@ export class BrokerClient {
     const brokerPath = vscode.Uri.joinPath(extensionUri, "out", "broker", "index.js").fsPath;
     const { spawn } = require("child_process") as typeof import("child_process");
     const cfg = vscode.workspace.getConfiguration("agentPeers");
-    const maxMsg = cfg.get<number>("maxMessagesPerDirection", 8);
     const autoConflict = cfg.get<boolean>("autoConflictCheck", true);
     const proc = spawn("node", [brokerPath], {
       stdio: "ignore",
       detached: true,
       env: {
         ...process.env,
-        AGENT_PEERS_MAX_MESSAGES_PER_DIRECTION: String(maxMsg),
         AGENT_PEERS_AUTO_CONFLICT_CHECK: String(autoConflict),
       },
     });
