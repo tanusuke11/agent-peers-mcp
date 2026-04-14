@@ -603,8 +603,6 @@ function getRecentExchanges(): string {
 
 // ─── Conversation Digest (AI-generated summary) ─────────────
 
-const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
-const DIGEST_MODEL = "claude-haiku-4-5-20251001";
 
 /**
  * Generate a digest locally without any API call.
@@ -646,9 +644,7 @@ function generateLocalDigest(
 }
 
 /**
- * Generate a 1-2 sentence digest of recent conversation exchanges.
- * If ANTHROPIC_API_KEY is set, uses Haiku for semantic summarization.
- * Falls back to local rule-based digest (always available, zero cost).
+ * Generate a 1-2 sentence digest of recent conversation exchanges (local, no API key required).
  */
 async function generateConversationDigest(
   recentContext: string | undefined,
@@ -657,50 +653,6 @@ async function generateConversationDigest(
   git?: import("../shared/types.ts").GitContext | null,
 ): Promise<string | null> {
   if (!recentContext && !summary && !currentTask) return null;
-
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (apiKey && recentContext) {
-    const conversation = recentContext;
-
-    try {
-      const res = await fetch(ANTHROPIC_API_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": apiKey,
-          "anthropic-version": "2023-06-01",
-        },
-        body: JSON.stringify({
-          model: DIGEST_MODEL,
-          max_tokens: 150,
-          messages: [
-            {
-              role: "user",
-              content: `Summarize this AI agent conversation in 1-2 concise sentences. Focus on what was decided, what is being worked on, and any key outcomes. Write in the same language as the conversation.\n\n${conversation}`,
-            },
-          ],
-        }),
-        signal: AbortSignal.timeout(5000),
-      });
-
-      if (res.ok) {
-        const data = (await res.json()) as {
-          content?: Array<{ type: string; text?: string }>;
-        };
-        const text = data.content
-          ?.filter((b) => b.type === "text")
-          .map((b) => b.text ?? "")
-          .join("");
-        if (text) return text;
-      } else {
-        log(`Digest API error: ${res.status} — falling back to local digest`);
-      }
-    } catch (err) {
-      log(`Digest generation failed: ${err} — falling back to local digest`);
-    }
-  }
-
-  // Fallback: local rule-based digest (案1 + 案3)
   return generateLocalDigest(recentContext, summary, currentTask, git);
 }
 

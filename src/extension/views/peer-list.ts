@@ -47,7 +47,7 @@ export class PeerListProvider implements vscode.TreeDataProvider<PeerItem> {
           item.command = {
             command: "agentPeers.openMessageInEditor",
             title: "Open in Editor",
-            arguments: [m],
+            arguments: [{ ...m, title: `Message ${m.id}: ${m.fromId}` }],
           };
           return item;
         });
@@ -299,18 +299,8 @@ function buildContextItems(peer: Peer): PeerItem[] {
     chatChildren.push(rawItem);
   }
 
-  if (chatChildren.length === 1) {
-    items.push(chatChildren[0]!);
-  } else if (chatChildren.length > 1) {
-    const chatItem = leaf(
-      "Conversation",
-      undefined,
-      "comment-discussion",
-      dim ?? new vscode.ThemeColor("charts.foreground"),
-    );
-    chatItem.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
-    chatItem.children = chatChildren;
-    items.push(chatItem);
+  for (const child of chatChildren) {
+    items.push(child);
   }
 
   // Incoming messages + reports subtree — lazily loaded when expanded

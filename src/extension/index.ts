@@ -207,6 +207,8 @@ function configureConflictHook(extensionUri: vscode.Uri): { configured: boolean;
 
 class MessageContentProvider implements vscode.TextDocumentContentProvider {
   private readonly _contents = new Map<string, string>();
+  private readonly _onDidChange = new vscode.EventEmitter<vscode.Uri>();
+  readonly onDidChange = this._onDidChange.event;
 
   provideTextDocumentContent(uri: vscode.Uri): string {
     return this._contents.get(uri.toString()) ?? "";
@@ -217,6 +219,20 @@ class MessageContentProvider implements vscode.TextDocumentContentProvider {
     const key = Date.now().toString(36) + Math.random().toString(36).slice(2);
     const uri = vscode.Uri.parse(`agent-peers-msg:/${key}.md`);
     this._contents.set(uri.toString(), content);
+    return uri;
+  }
+
+  /**
+   * Store content under a stable key derived from `title`.
+   * If the URI already exists (same title), update its content and fire onDidChange
+   * so VS Code refreshes the already-open editor without opening a new tab.
+   */
+  storeWithKey(title: string, content: string): vscode.Uri {
+    // Normalize title to a safe path segment
+    const key = title.replace(/[^a-zA-Z0-9_\-. ]/g, "_");
+    const uri = vscode.Uri.parse(`agent-peers-msg:/${encodeURIComponent(key)}.md`);
+    this._contents.set(uri.toString(), content);
+    this._onDidChange.fire(uri);
     return uri;
   }
 }
@@ -740,9 +756,21 @@ AGENT_PEERS_AGENT_TYPE = "codex"
         // Use virtual document provider (agent-peers-msg: scheme) instead of untitled document.
         // This avoids the "Do you want to terminate running processes?" dialog that appears
         // when VS Code tries to close a terminal editor tab to make room for an untitled doc.
-        const uri = messageContentProvider.store(content);
+        // When a stable title is provided (e.g. "Recent Context: <peer>"), reuse the same URI
+        // so repeated clicks refresh the existing tab instead of opening a new one.
+        const uri = item.title
+          ? messageContentProvider.storeWithKey(item.title, content)
+          : messageContentProvider.store(content);
         const doc = await vscode.workspace.openTextDocument(uri);
-        await vscode.window.showTextDocument(doc, { preview: true, viewColumn: vscode.ViewColumn.Beside });
+        // If the document is already visible in any editor column, focus it there.
+        const existing = vscode.window.visibleTextEditors.find(
+          (e) => e.document.uri.toString() === uri.toString(),
+        );
+        if (existing) {
+          await vscode.window.showTextDocument(existing.document, { viewColumn: existing.viewColumn, preserveFocus: false });
+        } else {
+          await vscode.window.showTextDocument(doc, { preview: true, viewColumn: vscode.ViewColumn.Beside });
+        }
       } catch (e) {
         vscode.window.showErrorMessage(`Failed to open document: ${e}`);
       }
