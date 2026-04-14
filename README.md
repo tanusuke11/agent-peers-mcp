@@ -151,7 +151,7 @@ bun src/cli.ts context <id>    # Show peer's full context
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `agentPeers.brokerPort` | `7899` | Broker daemon port |
-| `agentPeers.autoStartBroker` | `true` | Auto-start broker on activation |
+| `agentPeers.autoStartBroker` | `false` | Auto-start broker on activation |
 | `agentPeers.pollIntervalMs` | `1000` | Message polling interval |
 
 ## License

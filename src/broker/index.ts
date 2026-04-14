@@ -77,14 +77,19 @@ db.exec(`
     context_json TEXT NOT NULL DEFAULT '{}',
     registered_at TEXT NOT NULL,
     last_seen TEXT NOT NULL,
-    suspended INTEGER NOT NULL DEFAULT 0
+    sleep INTEGER NOT NULL DEFAULT 0
   )
 `);
 
-// Migration: add suspended column if missing
+// Migration: add sleep column if missing (fresh installs)
 try {
-  db.exec("ALTER TABLE peers ADD COLUMN suspended INTEGER NOT NULL DEFAULT 0");
+  db.exec("ALTER TABLE peers ADD COLUMN sleep INTEGER NOT NULL DEFAULT 0");
 } catch { /* column already exists */ }
+
+// Migration: rename suspended → sleep for existing databases
+try {
+  db.exec("ALTER TABLE peers RENAME COLUMN suspended TO sleep");
+} catch { /* column already renamed or does not exist */ }
 
 // Migration: add source column if missing
 try {
@@ -155,11 +160,11 @@ function sendToPeer(peerId: string, event: WsEvent): boolean {
 // ─── Stale peer cleanup ────────────────────────────────────────
 
 function cleanStalePeers() {
-  const peers = db.prepare("SELECT id, pid, last_seen, suspended FROM peers").all() as unknown as { id: string; pid: number; last_seen: string; suspended: number }[];
+  const peers = db.prepare("SELECT id, pid, last_seen, sleep FROM peers").all() as unknown as { id: string; pid: number; last_seen: string; sleep: number }[];
   const now = Date.now();
   for (const peer of peers) {
-    // Skip already-suspended peers — they have no active session, so stale checks don't apply
-    if (peer.suspended) continue;
+    // Skip already-sleeping peers — they have no active session, so stale checks don't apply
+    if (peer.sleep) continue;
 
     const staleByTime = now - new Date(peer.last_seen).getTime() > PEER_TIMEOUT_MS;
     let deadByPid = false;
@@ -194,9 +199,9 @@ const deleteMessagesForPeer = db.prepare(`DELETE FROM messages WHERE from_id = ?
 const selectAllPeers = db.prepare(`SELECT * FROM peers`);
 const selectPeersByDirectory = db.prepare(`SELECT * FROM peers WHERE cwd = ?`);
 const selectPeerById = db.prepare(`SELECT * FROM peers WHERE id = ?`);
-const selectActiveByPid = db.prepare(`SELECT * FROM peers WHERE pid = ? AND suspended = 0 LIMIT 1`);
-const selectSuspendedByRepo = db.prepare(`SELECT * FROM peers WHERE agent_type = ? AND git_root = ? AND suspended = 1 ORDER BY last_seen DESC LIMIT 1`);
-const selectSuspendedByCwd = db.prepare(`SELECT * FROM peers WHERE agent_type = ? AND cwd = ? AND suspended = 1 ORDER BY last_seen DESC LIMIT 1`);
+const selectActiveByPid = db.prepare(`SELECT * FROM peers WHERE pid = ? AND sleep = 0 LIMIT 1`);
+const selectSuspendedByRepo = db.prepare(`SELECT * FROM peers WHERE agent_type = ? AND git_root = ? AND sleep = 1 ORDER BY last_seen DESC LIMIT 1`);
+const selectSuspendedByCwd = db.prepare(`SELECT * FROM peers WHERE agent_type = ? AND cwd = ? AND sleep = 1 ORDER BY last_seen DESC LIMIT 1`);
 const selectMessageById = db.prepare(`SELECT * FROM messages WHERE id = ?`);
 
 const insertMessage = db.prepare(`
@@ -253,7 +258,7 @@ interface RawPeerRow {
   context_json: string;
   registered_at: string;
   last_seen: string;
-  suspended: number;
+  sleep: number;
 }
 
 const countAllMessages = db.prepare(`SELECT COUNT(*) as cnt FROM messages WHERE to_id = ?`);
@@ -273,8 +278,8 @@ function rowToPeer(row: RawPeerRow): Peer {
     context: JSON.parse(row.context_json) as AgentContext,
     registeredAt: row.registered_at,
     lastSeen: row.last_seen,
-    connected: !row.suspended,
-    suspended: !!row.suspended,
+    connected: !row.sleep,
+    suspended: !!row.sleep,
     totalMessages: (() => {
       const cnt = (countAllMessages.get(row.id) as unknown as { cnt: number })?.cnt ?? 0;
       return cnt > 0 ? cnt : undefined;
@@ -323,7 +328,7 @@ function isAlive(pid: number): boolean {
  * When multiple MCP server instances read the same Claude Code session JSONL file
  * (e.g. because an older MCP server's fallback picked the most-recent file), they
  * report identical session-derived context: summary (session title) AND
- * recentExchanges.  This function detects duplicates and keeps the data only on
+ * recentContext.  This function detects duplicates and keeps the data only on
  * the peer that registered earliest (most likely the true session owner).
  */
 function deduplicateExchanges(peers: Peer[]): void {
@@ -332,7 +337,7 @@ function deduplicateExchanges(peers: Peer[]): void {
   const seen = new Map<string, string>(); // fingerprint → peerId (earliest owner)
 
   for (const peer of peers) {
-    const exchanges = peer.context.recentExchanges;
+    const exchanges = peer.context.recentContext;
     const hasExchanges = exchanges && exchanges.length > 0;
     if (!hasExchanges) continue;
 
@@ -355,7 +360,7 @@ function deduplicateExchanges(peers: Peer[]): void {
 
 /** Clear context fields that are derived from reading the Claude Code session file. */
 function clearSessionContext(peer: Peer): void {
-  peer.context.recentExchanges = [];
+  peer.context.recentContext = [];
   peer.context.summary = "";
   peer.context.conversationDigest = undefined;
 }
@@ -373,7 +378,7 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
   try {
     // 1. If preferredId is given (e.g. extension peers), use that stable identity.
     // 2. Else, if the same owner PID is already active, keep that identity (prevents ID churn).
-    // 3. Else, claim a suspended peer of the same agentType in the same project.
+    // 3. Else, claim a sleeping peer of the same agentType in the same project.
     let existingRow: RawPeerRow | undefined;
     if (body.preferredId) {
       existingRow = selectPeerById.get(body.preferredId) as unknown as RawPeerRow | undefined;
@@ -403,7 +408,7 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
         git: incoming.git ?? existingContext.git,
         currentTask: incoming.currentTask || existingContext.currentTask,
         taskIntent: incoming.taskIntent ?? existingContext.taskIntent,
-        recentExchanges: incoming.recentExchanges?.length ? incoming.recentExchanges : existingContext.recentExchanges,
+        recentContext: incoming.recentContext?.length ? incoming.recentContext : existingContext.recentContext,
         conversationDigest: incoming.conversationDigest || existingContext.conversationDigest,
         metadata: incoming.metadata ?? existingContext.metadata,
         updatedAt: now,
@@ -411,13 +416,13 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
       db.prepare(`
         UPDATE peers
         SET pid = ?, cwd = ?, git_root = ?, tty = ?, source = ?,
-            agent_type = ?, context_json = ?, last_seen = ?, suspended = 0
+            agent_type = ?, context_json = ?, last_seen = ?, sleep = 0
         WHERE id = ?
       `).run(body.pid, body.cwd, body.gitRoot, body.tty, source,
              body.agentType, JSON.stringify(mergedContext), now, id);
-      log(`Peer ${id} resumed (was suspended=${!!existingRow.suspended})`);
+      log(`Peer ${id} resumed (was sleep=${!!existingRow.sleep})`);
     } else {
-      // No suspended peer of this kind — create new one
+      // No sleeping peer of this kind — create new one
       const existingIds = new Set((selectAllPeers.all() as unknown as RawPeerRow[]).map((r) => r.id));
       if (body.preferredId && !existingIds.has(body.preferredId)) {
         id = body.preferredId;
@@ -448,9 +453,9 @@ function handleHeartbeat(body: HeartbeatRequest): { ok: boolean } {
   const now = new Date().toISOString();
   const pid = body.pid ?? row.pid;
   const source = body.source ?? row.source;
-  if (row.suspended) {
+  if (row.sleep) {
     // Peer is alive (sending heartbeats) — resume it
-    db.prepare("UPDATE peers SET suspended = 0, pid = ?, source = ?, last_seen = ? WHERE id = ?")
+    db.prepare("UPDATE peers SET sleep = 0, pid = ?, source = ?, last_seen = ? WHERE id = ?")
       .run(pid, source, now, body.id);
     const peer = rowToPeer(selectPeerById.get(body.id) as unknown as RawPeerRow);
     broadcast({ type: "peer-joined", data: peer, timestamp: now } satisfies WsPeerJoinedEvent);
@@ -522,7 +527,7 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
 
   const peers = rows.map(rowToPeer);
 
-  // Deduplicate recentExchanges: when multiple peers report identical conversation
+  // Deduplicate recentContext: when multiple peers report identical conversation
   // histories (caused by MCP servers reading the same session file), keep the
   // exchanges only on the peer that registered earliest (most likely the true owner)
   // and clear them from the others.
@@ -609,11 +614,11 @@ function handleSendMessage(body: SendMessageRequest): SendMessageResponse {
     return { ok: false, error: `Peer ${body.toId} not found` };
   }
 
-  // Reject messages to suspended (sleeping) peers — they have no active session to receive them
+  // Reject messages to sleeping peers — they have no active session to receive them
   if (target.suspended) {
     return {
       ok: false,
-      error: `Cannot send message to peer ${body.toId}: peer is currently sleeping/suspended. Wait for it to resume or choose a different peer.`,
+      error: `Cannot send message to peer ${body.toId}: peer is currently sleeping. Wait for it to resume or choose a different peer.`,
     };
   }
 
@@ -743,19 +748,19 @@ function handlePeekMessages(body: PollMessagesRequest): PollMessagesResponse {
   return { found: true, messages: rows.map(rowToMessage) };
 }
 
-/** Detach a session from a peer: mark suspended, clear PID, but keep data & messages. */
+/** Detach a session from a peer: put to sleep, clear PID, but keep data & messages. */
 function detachPeer(id: string): void {
   const row = selectPeerById.get(id) as unknown as RawPeerRow | undefined;
   if (!row) return;
-  if (row.suspended) return; // already detached
-  db.prepare("UPDATE peers SET suspended = 1, pid = 0 WHERE id = ?").run(id);
+  if (row.sleep) return; // already detached
+  db.prepare("UPDATE peers SET sleep = 1, pid = 0 WHERE id = ?").run(id);
   const now = new Date().toISOString();
   broadcast({
     type: "context-updated",
     data: { id, context: { ...JSON.parse(row.context_json), updatedAt: now } },
     timestamp: now,
   } satisfies WsContextUpdatedEvent);
-  log(`Peer ${id} detached (suspended)`);
+  log(`Peer ${id} detached (sleep)`);
 }
 
 /** Hard-remove a peer and all its messages. */
@@ -793,8 +798,8 @@ function handleSuspendPeer(body: { id: string }): { ok: boolean } {
 function handleResumePeer(body: { id: string }): { ok: boolean } {
   const row = selectPeerById.get(body.id) as unknown as RawPeerRow | undefined;
   if (!row) return { ok: false };
-  if (!row.suspended) return { ok: true }; // already active
-  db.prepare("UPDATE peers SET suspended = 0, last_seen = ? WHERE id = ?").run(new Date().toISOString(), body.id);
+  if (!row.sleep) return { ok: true }; // already active
+  db.prepare("UPDATE peers SET sleep = 0, last_seen = ? WHERE id = ?").run(new Date().toISOString(), body.id);
   const peer = rowToPeer(selectPeerById.get(body.id) as unknown as RawPeerRow);
   broadcast({
     type: "peer-joined",
@@ -820,19 +825,19 @@ function handlePurge(): { purged: number } {
 
 function handleCleanup(): { suspended: number; remaining: number } {
   const peers = selectAllPeers.all() as unknown as RawPeerRow[];
-  let suspended = 0;
+  let slept = 0;
   for (const peer of peers) {
-    if (peer.suspended) continue; // already suspended
+    if (peer.sleep) continue; // already sleeping
     let dead = false;
     if (peer.pid !== process.pid && peer.pid !== 0) {
       try { process.kill(peer.pid, 0); } catch { dead = true; }
     }
     if (dead) {
       detachPeer(peer.id);
-      suspended++;
+      slept++;
     }
   }
-  return { suspended, remaining: (selectAllPeers.all() as unknown as RawPeerRow[]).length };
+  return { suspended: slept, remaining: (selectAllPeers.all() as unknown as RawPeerRow[]).length };
 }
 
 // ─── Conflict detection ──────────────────────────────────────
@@ -898,6 +903,20 @@ function handleCheckConflicts(body: CheckConflictsRequest): CheckConflictsRespon
     if (commonTokens.length >= 2) {
       score += commonTokens.length;
       reasons.push(`Related keywords: ${commonTokens.join(", ")}`);
+    }
+
+    // Check 4: Recent context overlap — digest or assistant turns vs prompt
+    const ctx = peer.context;
+    const contextText = ctx.conversationDigest
+      ?? ctx.recentContext?.filter(e => e.role === "assistant").map(e => e.text).join(" ")
+      ?? "";
+    if (contextText) {
+      const contextTokens = extractTokens(contextText);
+      const contextCommon = contextTokens.filter(t => promptTokens.includes(t));
+      if (contextCommon.length >= 2) {
+        score += Math.min(contextCommon.length, 3); // cap at +3 to avoid overweight
+        reasons.push(`Context overlap: ${contextCommon.slice(0, 5).join(", ")}`);
+      }
     }
 
     if (score >= 3) {
@@ -1161,18 +1180,18 @@ wss.on("connection", (ws) => {
         wsClients.delete(ws);
         identifiedPeerId = msg.id;
         wsPeerClients.set(msg.id, ws);
-        // Resume suspended peer on WS re-identify (e.g. after reconnect)
+        // Resume sleeping peer on WS re-identify (e.g. after reconnect)
         const row = selectPeerById.get(msg.id) as unknown as RawPeerRow | undefined;
-        if (row?.suspended) {
+        if (row?.sleep) {
           const pid = typeof msg.pid === "number" ? msg.pid : row.pid;
           const source = (msg.source === "extension" || msg.source === "terminal") ? msg.source : row.source;
-          db.prepare("UPDATE peers SET suspended = 0, pid = ?, source = ?, last_seen = ? WHERE id = ?")
+          db.prepare("UPDATE peers SET sleep = 0, pid = ?, source = ?, last_seen = ? WHERE id = ?")
             .run(pid, source, new Date().toISOString(), msg.id);
           const peer = rowToPeer(selectPeerById.get(msg.id) as unknown as RawPeerRow);
           broadcast({ type: "peer-joined", data: peer, timestamp: new Date().toISOString() } satisfies WsPeerJoinedEvent);
           log(`Peer ${msg.id} resumed via WS identify (pid=${pid}, source=${source})`);
         } else if (row) {
-          // Not suspended but source/pid may need updating
+          // Not sleeping but source/pid may need updating
           const pid = typeof msg.pid === "number" ? msg.pid : row.pid;
           const source = (msg.source === "extension" || msg.source === "terminal") ? msg.source : row.source;
           if (pid !== row.pid || source !== row.source) {

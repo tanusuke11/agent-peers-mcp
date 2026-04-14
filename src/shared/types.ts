@@ -70,7 +70,7 @@ export interface AgentContext {
   /** Structured task intent for conflict detection */
   taskIntent?: TaskIntent;
   /** Recent conversation exchanges (truncated, last N turns) */
-  recentExchanges?: RecentExchange[];
+  recentContext?: RecentExchange[];
   /** AI-generated 1-2 sentence digest of the recent conversation */
   conversationDigest?: string;
   /** Key-value metadata (extensible) */
@@ -103,7 +103,7 @@ export interface Peer {
   lastSeen: string;
   /** Whether the peer is connected via MCP (true) or discovered via process scan (false) */
   connected?: boolean;
-  /** Whether the peer has been suspended from context sharing */
+  /** Whether the peer is sleeping (session ended, data retained) */
   suspended?: boolean;
   /** Total number of messages stored for this peer in the sidebar */
   totalMessages?: number;
@@ -148,7 +148,7 @@ export interface RegisterResponse {
 
 export interface HeartbeatRequest {
   id: PeerId;
-  /** Owner (CLI session) PID — used to resume suspended peers and update liveness */
+  /** Owner (CLI session) PID — used to resume sleeping peers and update liveness */
   pid?: number;
   /** How the peer connects: "terminal" or "extension" */
   source?: PeerSource;

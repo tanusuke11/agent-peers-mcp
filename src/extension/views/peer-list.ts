@@ -271,7 +271,7 @@ function buildContextItems(peer: Peer): PeerItem[] {
     items.push(filesItem);
   }
 
-  const exchanges = peer.context.recentExchanges ?? [];
+  const exchanges = peer.context.recentContext ?? [];
   const digest = peer.context.conversationDigest;
   const chatChildren: PeerItem[] = [];
 

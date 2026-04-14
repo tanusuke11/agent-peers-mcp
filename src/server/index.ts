@@ -827,7 +827,7 @@ mcp.registerTool("list_peers", {
 });
 
 mcp.registerTool("send_message", {
-  description: "Send a message to another AI agent instance. Supports types: 'text' (general), 'context-request' (ask for context), 'task-handoff' (delegate a task to another peer — see guidance below), 'report' (reply to a task-handoff with a work report — NOT delivered to the requester's terminal, only visible in their UI). All peer types (terminal and extension) accept all message types. For 'report' messages to extension peers, reply_to must point to the original task-handoff. For task-handoff, the broker checks for duplicate/similar tasks already in progress and blocks if found — use force=true to override. Suspended/sleeping peers (suspended=true in list_peers) are not valid recipients — messages to them will be rejected. IMPORTANT GUIDANCE FOR TASK-HANDOFF: When delegating a task via task-handoff, perform minimal investigation/analysis before sending — don't parallelize your own work. Wait for the recipient to send a 'report' back with their results before resuming your own tasks.",
+  description: "Send a message to another AI agent instance. Supports types: 'text' (general), 'context-request' (ask for context), 'task-handoff' (delegate a task to another peer — see guidance below), 'report' (reply to a task-handoff with a work report — NOT delivered to the requester's terminal, only visible in their UI). All peer types (terminal and extension) accept all message types. For 'report' messages to extension peers, reply_to must point to the original task-handoff. For task-handoff, the broker checks for duplicate/similar tasks already in progress and blocks if found — use force=true to override. Sleeping peers (suspended=true in list_peers) are not valid recipients — messages to them will be rejected. IMPORTANT GUIDANCE FOR TASK-HANDOFF: When delegating a task via task-handoff, perform minimal investigation/analysis before sending — don't parallelize your own work. Wait for the recipient to send a 'report' back with their results before resuming your own tasks.",
   inputSchema: {
     to_id: z.string().describe("The peer ID of the target agent (from list_peers)"),
     message: z.string().describe("The message text"),
@@ -941,9 +941,9 @@ mcp.registerTool("request_context", {
     if (ctx.conversationDigest) {
       parts.push(`\nConversation digest: ${ctx.conversationDigest}`);
     }
-    if (ctx.recentExchanges?.length) {
-      parts.push(`\nRecent conversation (last ${ctx.recentExchanges.length} exchanges):`);
-      for (const ex of ctx.recentExchanges) {
+    if (ctx.recentContext?.length) {
+      parts.push(`\nRecent conversation (last ${ctx.recentContext.length} exchanges):`);
+      for (const ex of ctx.recentContext) {
         parts.push(`  [${ex.role}] ${ex.text}`);
       }
     }
@@ -1131,7 +1131,7 @@ async function registerWithBroker(): Promise<void> {
     updatedAt: new Date().toISOString(),
   };
   const source = mySource;
-  // Let the broker decide: claim a suspended peer of the same kind, or create a new one.
+  // Let the broker decide: claim a sleeping peer of the same kind, or create a new one.
   // Register with the owner (CLI session) PID so liveness checks target the long-lived process.
   const reg = await brokerFetch<RegisterResponse>("/register", {
     agentType: AGENT_TYPE,
@@ -1268,7 +1268,7 @@ async function main() {
       const exchangesJson = JSON.stringify(exchanges);
       if (exchangesJson !== lastExchangesJson) {
         lastExchangesJson = exchangesJson;
-        contextUpdate.recentExchanges = exchanges;
+        contextUpdate.recentContext = exchanges;
         // Generate digest asynchronously — don't block heartbeat
         generateConversationDigest(exchanges).then((digest) => {
           if (digest && myId) {
