@@ -64,7 +64,7 @@ export interface AgentContext {
   /** Structured task intent for conflict detection */
   taskIntent?: TaskIntent;
   /** Recent conversation as a single markdown document */
-  recentContext?: string;
+  recentExchange?: string;
   /** AI-generated 1-2 sentence digest of the recent conversation */
   conversationDigest?: string;
   /** Key-value metadata (extensible) */
@@ -248,12 +248,99 @@ export interface WsContextUpdatedEvent extends WsEvent {
   data: { id: PeerId; context: AgentContext };
 }
 
+// ─── Repo Memory ─────────────────────────────────────────────
+
+export type MemoryCategory = "decision" | "learning" | "architecture" | "bug-fix" | "convention";
+
+export interface RepoMemory {
+  id: number;
+  gitRoot: string;
+  category: MemoryCategory;
+  title: string;
+  content: string;
+  files: string[];
+  areas: string[];
+  sourcePeerId: string | null;
+  contentHash: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AddMemoryRequest {
+  gitRoot: string;
+  category: MemoryCategory;
+  title: string;
+  content: string;
+  files?: string[];
+  areas?: string[];
+  sourcePeerId?: string;
+  sourceExchange?: string;
+}
+
+export interface AddMemoryResponse {
+  ok: boolean;
+  id?: number;
+  duplicate?: boolean;
+  error?: string;
+}
+
+export interface SearchMemoryRequest {
+  gitRoot: string;
+  query: string;
+  files?: string[];
+  areas?: string[];
+  category?: MemoryCategory;
+  limit?: number;
+}
+
+export interface SearchMemoryResponse {
+  memories: (RepoMemory & { score: number })[];
+}
+
+export interface ListMemoriesRequest {
+  gitRoot: string;
+  category?: MemoryCategory;
+  limit?: number;
+  offset?: number;
+}
+
+export interface ListMemoriesResponse {
+  memories: RepoMemory[];
+  total: number;
+}
+
+export interface DeleteMemoryRequest {
+  id: number;
+}
+
+export interface DeleteMemoryResponse {
+  ok: boolean;
+}
+
+/** A memory extracted from session exchanges by the compression module */
+export interface ExtractedMemory {
+  category: MemoryCategory;
+  title: string;
+  content: string;
+  files: string[];
+  areas: string[];
+  sourceExchange?: string;
+}
+
 // ─── Conflict Detection ───────────────────────────────────────
 
 export interface CheckConflictsRequest {
   prompt: string;
   callerId: string;
   gitRoot: string | null;
+}
+
+/** Advisory from repo memory surfaced during conflict detection (non-blocking) */
+export interface ConflictAdvisory {
+  memoryId: number;
+  category: string;
+  title: string;
+  content: string;
 }
 
 export interface ConflictResult {
@@ -263,8 +350,12 @@ export interface ConflictResult {
   taskIntent: TaskIntent;
   reason: string;
   confidence: "high" | "medium" | "low";
+  /** Relevant repo memories surfaced during conflict detection */
+  relatedMemories?: Array<{ id: number; category: string; title: string; createdAt: string }>;
 }
 
 export interface CheckConflictsResponse {
   conflicts: ConflictResult[];
+  /** Architecture decisions or conventions relevant to the prompt (non-blocking) */
+  advisories?: ConflictAdvisory[];
 }

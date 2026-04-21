@@ -175,7 +175,7 @@ bun src/cli.ts context <id>    # Show peer's full context
 | `AGENT_PEERS_PORT` | `7899` | Broker HTTP port |
 | `AGENT_PEERS_WS_PORT` | `7900` | Broker WebSocket port |
 | `AGENT_PEERS_AGENT_TYPE` | `claude-code` | Agent type identifier |
-| `AGENT_PEERS_DB` | `~/.agent-peers.db` | SQLite database path |
+| `AGENT_PEERS_DB` | `~/.agent-peers.db` | SQLite database path (default: shared across workspaces for the current OS user) |
 | `AGENT_PEERS_SOURCE` | auto-detected | Force peer source: `terminal` or `extension` |
 | `AGENT_PEERS_TRUST_BROKER_ID_ONLY` | `true` | Instruct the agent to always call `whoami` for its peer ID |
 
@@ -188,7 +188,7 @@ bun src/cli.ts context <id>    # Show peer's full context
 | `agentPeers.pollIntervalMs` | `1000` | Message polling interval (ms) |
 | `agentPeers.autoDeliveryMessage` | `true` | Auto-deliver incoming messages to the terminal; when off, messages require manual approval |
 | `agentPeers.autoConflictCheck` | `true` | Run conflict check automatically before every prompt (via hook) and on `share_context` |
-| `agentPeers.maxContextLength` | `10` | Number of recent conversation exchanges to include in the shared context digest |
+| `agentPeers.maxContextLength` | `30` | Number of recent conversation exchanges to include in the shared context digest |
 
 ## Build & Install
 

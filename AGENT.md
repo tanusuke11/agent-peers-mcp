@@ -122,7 +122,7 @@ bun run build:extension → out/extension/index.js (platform=node, format=cjs, e
 ```
 VSCode Extension (out/extension/index.js)
   └── spawns/connects to →  Broker daemon (out/broker/index.js)  :7899 HTTP / :7900 WS
-                                └── SQLite DB (~/.agent-peers.db)
+                                └── SQLite DB (~/.agent-peers.db, shared across workspaces for the current OS user)
 
 AI agent (Claude Code, Codex, etc.)
   └── runs MCP server (out/server/index.js) via stdio

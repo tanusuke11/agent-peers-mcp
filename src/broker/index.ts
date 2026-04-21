@@ -18,6 +18,7 @@
 import { DatabaseSync } from "node:sqlite";
 import http from "http";
 import { WebSocketServer, WebSocket } from "ws";
+import crypto from "crypto";
 import type {
   RegisterRequest,
   RegisterResponse,
@@ -37,6 +38,16 @@ import type {
   CheckConflictsRequest,
   ConflictResult,
   CheckConflictsResponse,
+  ConflictAdvisory,
+  AddMemoryRequest,
+  AddMemoryResponse,
+  SearchMemoryRequest,
+  SearchMemoryResponse,
+  ListMemoriesRequest,
+  ListMemoriesResponse,
+  DeleteMemoryRequest,
+  DeleteMemoryResponse,
+  RepoMemory,
   WsEvent,
   WsMessageEvent,
   WsPeerJoinedEvent,
@@ -56,7 +67,7 @@ const PORT = parseInt(process.env.AGENT_PEERS_PORT ?? String(DEFAULT_BROKER_PORT
 const WS_PORT = parseInt(process.env.AGENT_PEERS_WS_PORT ?? String(DEFAULT_WS_PORT), 10);
 const DB_PATH = process.env.AGENT_PEERS_DB ?? BROKER_DB_PATH;
 let AUTO_CONFLICT_CHECK = process.env.AGENT_PEERS_AUTO_CONFLICT_CHECK !== "false";
-let MAX_CONTEXT_LENGTH = parseInt(process.env.AGENT_PEERS_MAX_CONTEXT_LENGTH ?? "10", 10) || 10;
+let MAX_CONTEXT_LENGTH = parseInt(process.env.AGENT_PEERS_MAX_CONTEXT_LENGTH ?? "30", 10) || 30;
 const startTime = Date.now();
 
 // ─── Database setup ────────────────────────────────────────────
@@ -91,6 +102,14 @@ try {
 try {
   db.exec("ALTER TABLE peers RENAME COLUMN suspended TO sleep");
 } catch { /* column already renamed or does not exist */ }
+
+// Migration: copy stale suspended values into sleep and drop the old column.
+// The ADD + RENAME sequence above can leave both columns when the DB already
+// had a "suspended" column — the RENAME fails because "sleep" already exists.
+try {
+  db.exec("UPDATE peers SET sleep = suspended WHERE suspended = 1 AND sleep = 0");
+  db.exec("ALTER TABLE peers DROP COLUMN suspended");
+} catch { /* suspended column may not exist */ }
 
 // Migration: add source column if missing
 try {
@@ -127,6 +146,54 @@ db.exec(`
     FOREIGN KEY (to_id) REFERENCES peers(id)
   )
 `);
+
+// ─── Repo Memory tables ──────────────────────────────────────
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS repo_memories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    git_root TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT 'learning',
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    files_json TEXT DEFAULT '[]',
+    areas_json TEXT DEFAULT '[]',
+    source_peer_id TEXT,
+    source_exchange TEXT,
+    content_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )
+`);
+
+db.exec("CREATE INDEX IF NOT EXISTS idx_repo_memories_git_root ON repo_memories(git_root)");
+db.exec("CREATE INDEX IF NOT EXISTS idx_repo_memories_hash ON repo_memories(content_hash)");
+
+// FTS5 full-text search (may not be available in all SQLite builds)
+let hasFts5 = false;
+try {
+  db.exec(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS repo_memories_fts USING fts5(
+      title, content,
+      content=repo_memories, content_rowid=id,
+      tokenize='porter unicode61'
+    )
+  `);
+  // Sync triggers
+  db.exec(`CREATE TRIGGER IF NOT EXISTS repo_memories_ai AFTER INSERT ON repo_memories BEGIN
+    INSERT INTO repo_memories_fts(rowid, title, content) VALUES (new.id, new.title, new.content);
+  END`);
+  db.exec(`CREATE TRIGGER IF NOT EXISTS repo_memories_ad AFTER DELETE ON repo_memories BEGIN
+    INSERT INTO repo_memories_fts(repo_memories_fts, rowid, title, content) VALUES('delete', old.id, old.title, old.content);
+  END`);
+  db.exec(`CREATE TRIGGER IF NOT EXISTS repo_memories_au AFTER UPDATE ON repo_memories BEGIN
+    INSERT INTO repo_memories_fts(repo_memories_fts, rowid, title, content) VALUES('delete', old.id, old.title, old.content);
+    INSERT INTO repo_memories_fts(rowid, title, content) VALUES (new.id, new.title, new.content);
+  END`);
+  hasFts5 = true;
+} catch {
+  // FTS5 not available — fall back to token-based search
+}
 
 // ─── WebSocket clients ─────────────────────────────────────────
 
@@ -213,6 +280,21 @@ const selectUndelivered = db.prepare(`
   SELECT * FROM messages WHERE to_id = ? AND delivered = 0 ORDER BY sent_at ASC
 `);
 const markDelivered = db.prepare(`UPDATE messages SET delivered = 1 WHERE id = ?`);
+
+// ─── Repo Memory prepared statements ────────────────────────
+
+const insertMemory = db.prepare(`
+  INSERT INTO repo_memories (git_root, category, title, content, files_json, areas_json, source_peer_id, source_exchange, content_hash, created_at, updated_at)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`);
+const selectMemoryByHash = db.prepare(`SELECT id FROM repo_memories WHERE content_hash = ? AND git_root = ?`);
+const selectMemoryById = db.prepare(`SELECT * FROM repo_memories WHERE id = ?`);
+const selectMemoriesByRepo = db.prepare(`SELECT * FROM repo_memories WHERE git_root = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?`);
+const selectMemoriesByRepoAndCategory = db.prepare(`SELECT * FROM repo_memories WHERE git_root = ? AND category = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?`);
+const countMemoriesByRepo = db.prepare(`SELECT COUNT(*) as cnt FROM repo_memories WHERE git_root = ?`);
+const deleteMemoryById = db.prepare(`DELETE FROM repo_memories WHERE id = ?`);
+const updateMemoryTimestamp = db.prepare(`UPDATE repo_memories SET updated_at = ? WHERE id = ?`);
+const selectRecentMemoriesByRepo = db.prepare(`SELECT * FROM repo_memories WHERE git_root = ? ORDER BY updated_at DESC LIMIT ?`);
 
 // ─── Stale peer cleanup (deferred until prepared statements are ready) ──
 cleanStalePeers();
@@ -329,19 +411,19 @@ function isAlive(pid: number): boolean {
  * When multiple MCP server instances read the same Claude Code session JSONL file
  * (e.g. because an older MCP server's fallback picked the most-recent file), they
  * report identical session-derived context: summary (session title) AND
- * recentContext.  This function detects duplicates and keeps the data only on
+ * recentExchange.  This function detects duplicates and keeps the data only on
  * the peer that registered earliest (most likely the true session owner).
  */
 function deduplicateExchanges(peers: Peer[]): void {
-  // Fingerprint each peer's session-derived data (recentContext markdown + summary).
+  // Fingerprint each peer's session-derived data (recentExchange markdown + summary).
   // Two peers sharing the same session file will have identical fingerprints.
   const seen = new Map<string, string>(); // fingerprint → peerId (earliest owner)
 
   for (const peer of peers) {
-    const recentContext = peer.context.recentContext;
-    if (!recentContext) continue;
+    const recentExchange = peer.context.recentExchange;
+    if (!recentExchange) continue;
 
-    const fp = recentContext;
+    const fp = recentExchange;
     const existing = seen.get(fp);
     if (existing === undefined) {
       seen.set(fp, peer.id);
@@ -360,7 +442,7 @@ function deduplicateExchanges(peers: Peer[]): void {
 
 /** Clear context fields that are derived from reading the Claude Code session file. */
 function clearSessionContext(peer: Peer): void {
-  peer.context.recentContext = undefined;
+  peer.context.recentExchange = undefined;
   peer.context.summary = "";
   peer.context.conversationDigest = undefined;
 }
@@ -408,7 +490,7 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
         git: incoming.git ?? existingContext.git,
         currentTask: incoming.currentTask || existingContext.currentTask,
         taskIntent: incoming.taskIntent ?? existingContext.taskIntent,
-        recentContext: incoming.recentContext || existingContext.recentContext,
+        recentExchange: incoming.recentExchange || existingContext.recentExchange,
         conversationDigest: incoming.conversationDigest || existingContext.conversationDigest,
         metadata: incoming.metadata ?? existingContext.metadata,
         updatedAt: now,
@@ -527,7 +609,7 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
 
   const peers = rows.map(rowToPeer);
 
-  // Deduplicate recentContext: when multiple peers report identical conversation
+  // Deduplicate recentExchange: when multiple peers report identical conversation
   // histories (caused by MCP servers reading the same session file), keep the
   // exchanges only on the peer that registered earliest (most likely the true owner)
   // and clear them from the others.
@@ -615,7 +697,7 @@ function handleSendMessage(body: SendMessageRequest): SendMessageResponse {
   }
 
   // Reject messages to sleeping peers — they have no active session to receive them
-  if (target.suspended) {
+  if (target.sleep) {
     return {
       ok: false,
       error: `Cannot send message to peer ${body.toId}: peer is currently sleeping. Wait for it to resume or choose a different peer.`,
@@ -908,7 +990,7 @@ function handleCheckConflicts(body: CheckConflictsRequest): CheckConflictsRespon
     // Check 4: Recent context overlap — digest or assistant turns vs prompt
     const ctx = peer.context;
     const contextText = ctx.conversationDigest
-      ?? ctx.recentContext?.filter(e => e.role === "assistant").map(e => e.text).join(" ")
+      ?? ctx.recentExchange?.filter(e => e.role === "assistant").map(e => e.text).join(" ")
       ?? "";
     if (contextText) {
       const contextTokens = extractTokens(contextText);
@@ -932,7 +1014,185 @@ function handleCheckConflicts(body: CheckConflictsRequest): CheckConflictsRespon
     }
   }
 
-  return { conflicts };
+  // Check 5: Historical memory overlap — past memories about the same files/areas
+  const advisories: ConflictAdvisory[] = [];
+  if (body.gitRoot) {
+    const repoMemories = (selectRecentMemoriesByRepo.all(body.gitRoot, 100) as unknown as RawMemoryRow[]);
+    for (const row of repoMemories) {
+      const memFiles = JSON.parse(row.files_json || "[]") as string[];
+      const memAreas = JSON.parse(row.areas_json || "[]") as string[];
+      const memTokens = extractTokens(`${row.title} ${row.content}`);
+      const tokenOverlap = memTokens.filter(t => promptTokens.includes(t)).length;
+      const fileOverlap = memFiles.filter(f => {
+        const basename = f.split("/").pop()!.toLowerCase();
+        return promptLower.includes(basename) || promptLower.includes(f.toLowerCase());
+      }).length;
+      const areaOverlap = memAreas.filter(a => promptLower.includes(a.toLowerCase())).length;
+
+      const memScore = fileOverlap * 3 + areaOverlap * 2 + Math.min(tokenOverlap, 3);
+      if (memScore >= 3) {
+        if (row.category === "bug-fix" || row.category === "learning") {
+          // Boost existing conflict scores for peers working on same area
+          for (const c of conflicts) {
+            c.relatedMemories = c.relatedMemories ?? [];
+            c.relatedMemories.push({ id: row.id, category: row.category, title: row.title, createdAt: row.created_at });
+          }
+        }
+        // Check 6: Advisory surfacing — decisions/conventions/architecture as non-blocking info
+        if (row.category === "decision" || row.category === "convention" || row.category === "architecture") {
+          advisories.push({
+            memoryId: row.id,
+            category: row.category,
+            title: row.title,
+            content: row.content.length > 200 ? row.content.slice(0, 200) + "\u2026" : row.content,
+          });
+        }
+      }
+    }
+  }
+
+  return { conflicts, advisories: advisories.length > 0 ? advisories : undefined };
+}
+
+// ─── Repo Memory handlers ────────────────────────────────────
+
+interface RawMemoryRow {
+  id: number;
+  git_root: string;
+  category: string;
+  title: string;
+  content: string;
+  files_json: string;
+  areas_json: string;
+  source_peer_id: string | null;
+  source_exchange: string | null;
+  content_hash: string;
+  created_at: string;
+  updated_at: string;
+}
+
+function rowToMemory(row: RawMemoryRow): RepoMemory {
+  return {
+    id: row.id,
+    gitRoot: row.git_root,
+    category: row.category as RepoMemory["category"],
+    title: row.title,
+    content: row.content,
+    files: JSON.parse(row.files_json || "[]") as string[],
+    areas: JSON.parse(row.areas_json || "[]") as string[],
+    sourcePeerId: row.source_peer_id,
+    contentHash: row.content_hash,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function computeContentHash(category: string, title: string, content: string): string {
+  const normalized = `${category}|${title.toLowerCase().trim()}|${content.toLowerCase().trim().slice(0, 500)}`;
+  return crypto.createHash("sha256").update(normalized).digest("hex");
+}
+
+/** Sanitize user query for FTS5 MATCH syntax */
+function sanitizeFtsQuery(query: string): string {
+  // Extract meaningful tokens and join with OR for broad matching
+  const tokens = extractTokens(query);
+  if (tokens.length === 0) return '""'; // empty query
+  // Escape double quotes, wrap each token for safe FTS5 matching
+  return tokens.map(t => `"${t.replace(/"/g, "")}"`).join(" OR ");
+}
+
+function handleAddMemory(body: AddMemoryRequest): AddMemoryResponse {
+  const hash = computeContentHash(body.category, body.title, body.content);
+  const existing = selectMemoryByHash.get(hash, body.gitRoot) as unknown as { id: number } | undefined;
+  if (existing) {
+    updateMemoryTimestamp.run(new Date().toISOString(), existing.id);
+    return { ok: true, id: existing.id, duplicate: true };
+  }
+  const now = new Date().toISOString();
+  insertMemory.run(
+    body.gitRoot, body.category, body.title, body.content,
+    JSON.stringify(body.files ?? []), JSON.stringify(body.areas ?? []),
+    body.sourcePeerId ?? null, body.sourceExchange ?? null,
+    hash, now, now,
+  );
+  const lastId = (db.prepare("SELECT last_insert_rowid() as id").get() as unknown as { id: number }).id;
+  return { ok: true, id: lastId };
+}
+
+function handleSearchMemory(body: SearchMemoryRequest): SearchMemoryResponse {
+  const limit = Math.min(body.limit ?? 20, 100);
+  const queryTokens = extractTokens(body.query);
+  if (queryTokens.length === 0) return { memories: [] };
+
+  let candidates: RawMemoryRow[];
+
+  // Try FTS5 search first
+  if (hasFts5) {
+    try {
+      const ftsQuery = sanitizeFtsQuery(body.query);
+      const stmt = body.category
+        ? db.prepare(`SELECT m.*, fts.rank FROM repo_memories_fts fts JOIN repo_memories m ON m.id = fts.rowid WHERE repo_memories_fts MATCH ? AND m.git_root = ? AND m.category = ? ORDER BY fts.rank LIMIT ?`)
+        : db.prepare(`SELECT m.*, fts.rank FROM repo_memories_fts fts JOIN repo_memories m ON m.id = fts.rowid WHERE repo_memories_fts MATCH ? AND m.git_root = ? ORDER BY fts.rank LIMIT ?`);
+      candidates = (body.category
+        ? stmt.all(ftsQuery, body.gitRoot, body.category, limit * 2)
+        : stmt.all(ftsQuery, body.gitRoot, limit * 2)
+      ) as unknown as RawMemoryRow[];
+    } catch {
+      // FTS5 query error — fall back to token-based
+      candidates = getFallbackCandidates(body);
+    }
+  } else {
+    candidates = getFallbackCandidates(body);
+  }
+
+  // Post-score with file/area overlap
+  const scored = candidates.map(row => {
+    let score = (row as unknown as { rank?: number }).rank ? Math.abs((row as unknown as { rank: number }).rank) : 0;
+    const memTokens = extractTokens(`${row.title} ${row.content}`);
+    score += memTokens.filter(t => queryTokens.includes(t)).length;
+
+    if (body.files?.length) {
+      const memFiles = JSON.parse(row.files_json || "[]") as string[];
+      const overlap = body.files.filter(f => memFiles.some(mf => mf === f || f.endsWith(mf) || mf.endsWith(f)));
+      score += overlap.length * 3;
+    }
+    if (body.areas?.length) {
+      const memAreas = JSON.parse(row.areas_json || "[]") as string[];
+      const overlap = body.areas.filter(a => memAreas.some(ma => ma.includes(a) || a.includes(ma)));
+      score += overlap.length * 1.5;
+    }
+    // Recency bonus
+    const ageMs = Date.now() - new Date(row.updated_at).getTime();
+    if (ageMs < 7 * 24 * 60 * 60 * 1000) score += 0.5;
+
+    return { ...rowToMemory(row), score };
+  });
+
+  scored.sort((a, b) => b.score - a.score);
+  return { memories: scored.slice(0, limit) };
+}
+
+function getFallbackCandidates(body: SearchMemoryRequest): RawMemoryRow[] {
+  return body.category
+    ? selectMemoriesByRepoAndCategory.all(body.gitRoot, body.category, 200, 0) as unknown as RawMemoryRow[]
+    : selectMemoriesByRepo.all(body.gitRoot, 200, 0) as unknown as RawMemoryRow[];
+}
+
+function handleListMemories(body: ListMemoriesRequest): ListMemoriesResponse {
+  const limit = Math.min(body.limit ?? 20, 100);
+  const offset = body.offset ?? 0;
+  const rows = body.category
+    ? selectMemoriesByRepoAndCategory.all(body.gitRoot, body.category, limit, offset) as unknown as RawMemoryRow[]
+    : selectMemoriesByRepo.all(body.gitRoot, limit, offset) as unknown as RawMemoryRow[];
+  const total = (countMemoriesByRepo.get(body.gitRoot) as unknown as { cnt: number }).cnt;
+  return { memories: rows.map(rowToMemory), total };
+}
+
+function handleDeleteMemory(body: DeleteMemoryRequest): DeleteMemoryResponse {
+  const row = selectMemoryById.get(body.id) as unknown as RawMemoryRow | undefined;
+  if (!row) return { ok: false };
+  deleteMemoryById.run(body.id);
+  return { ok: true };
 }
 
 /** List report messages for a peer (reports sent TO this peer). */
@@ -1076,6 +1336,18 @@ async function handleRequest(req: Request): Promise<Response> {
         break;
       case "/check-conflicts":
         result = handleCheckConflicts(body as CheckConflictsRequest);
+        break;
+      case "/repo-memory/add":
+        result = handleAddMemory(body as AddMemoryRequest);
+        break;
+      case "/repo-memory/search":
+        result = handleSearchMemory(body as SearchMemoryRequest);
+        break;
+      case "/repo-memory/list":
+        result = handleListMemories(body as ListMemoriesRequest);
+        break;
+      case "/repo-memory/delete":
+        result = handleDeleteMemory(body as DeleteMemoryRequest);
         break;
       case "/list-reports":
         result = handleListReports(body as { id: string });

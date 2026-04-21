@@ -41,9 +41,13 @@ import type {
   GitContext,
   CheckConflictsResponse,
   ConflictResult,
+  ConflictAdvisory,
   SendMessageResponse,
   DuplicateTaskInfo,
   PeerSource,
+  AddMemoryResponse,
+  SearchMemoryResponse,
+  ListMemoriesResponse,
 } from "../shared/types.ts";
 import path from "path";
 import WebSocket from "ws";
@@ -54,6 +58,7 @@ import {
   HEARTBEAT_INTERVAL_MS,
 } from "../shared/constants.ts";
 import { onProcessTermination, findNodeBinary } from "../shared/process.ts";
+import { extractMemoriesFromExchanges } from "../shared/memory-compression.ts";
 import {
   gatherGitContext,
   getGitRoot,
@@ -513,7 +518,7 @@ function findCodexSessionFileUncached(): string | null {
 }
 
 const EXCHANGE_MAX_CHARS = 200;
-let cachedMaxContextLength = 10; // updated from broker health on each heartbeat
+let cachedMaxContextLength = 30; // updated from broker health on each heartbeat
 
 /** Format a list of raw exchanges into a single markdown document. */
 function buildRecentContextMarkdown(
@@ -611,7 +616,7 @@ function getRecentExchanges(): string {
  *   2. Otherwise use the last assistant block from the markdown document (案1)
  */
 function generateLocalDigest(
-  recentContext: string | undefined,
+  recentExchange: string | undefined,
   summary?: string,
   currentTask?: string,
   git?: import("../shared/types.ts").GitContext | null,
@@ -631,8 +636,8 @@ function generateLocalDigest(
   }
 
   // 案1: 最後の ## Assistant ブロックの先頭150文字
-  if (recentContext) {
-    const blocks = recentContext.split(/\n(?=## )/);
+  if (recentExchange) {
+    const blocks = recentExchange.split(/\n(?=## )/);
     const lastAssistant = [...blocks].reverse().find(b => b.startsWith("## Assistant"));
     if (lastAssistant) {
       const text = lastAssistant.replace(/^## Assistant[^\n]*\n\n?/, "").trimStart();
@@ -647,13 +652,13 @@ function generateLocalDigest(
  * Generate a 1-2 sentence digest of recent conversation exchanges (local, no API key required).
  */
 async function generateConversationDigest(
-  recentContext: string | undefined,
+  recentExchange: string | undefined,
   summary?: string,
   currentTask?: string,
   git?: import("../shared/types.ts").GitContext | null,
 ): Promise<string | null> {
-  if (!recentContext && !summary && !currentTask) return null;
-  return generateLocalDigest(recentContext, summary, currentTask, git);
+  if (!recentExchange && !summary && !currentTask) return null;
+  return generateLocalDigest(recentExchange, summary, currentTask, git);
 }
 
 // ─── Task Intent computation ────────────────────────────────
@@ -783,8 +788,11 @@ Available tools:
 - set_summary: Set a brief summary of what you're working on
 - check_messages: Manually check for new messages
 - check_conflicts: Check if planned work conflicts with other agents before starting
+- save_memory: Save a decision, learning, or convention to the shared repo memory
+- search_memory: Search repo memory for past decisions, conventions, and learnings
+- list_memories: List recent entries from the shared repo memory
 
-When you start, proactively call share_context to publish your current state. This helps other agents understand what you're working on. Before starting a new task, use check_conflicts to verify no other agents are working on the same files.`,
+When you start, proactively call share_context to publish your current state. This helps other agents understand what you're working on. Before starting a new task, use check_conflicts to verify no other agents are working on the same files. When you make important decisions or discover conventions, save them with save_memory so future agents benefit.`,
   }
 );
 
@@ -948,8 +956,8 @@ mcp.registerTool("request_context", {
     if (ctx.conversationDigest) {
       parts.push(`\nConversation digest: ${ctx.conversationDigest}`);
     }
-    if (ctx.recentContext) {
-      parts.push(`\nRecent conversation:\n${ctx.recentContext}`);
+    if (ctx.recentExchange) {
+      parts.push(`\nRecent conversation:\n${ctx.recentExchange}`);
     }
     if (ctx.metadata) parts.push(`Metadata: ${JSON.stringify(ctx.metadata)}`);
     parts.push(`Last updated: ${ctx.updatedAt}`);
@@ -1002,25 +1010,125 @@ mcp.registerTool("check_conflicts", {
       callerId: myId,
       gitRoot: myGitRoot,
     });
-    if (!result.conflicts || result.conflicts.length === 0) {
+    const hasConflicts = result.conflicts && result.conflicts.length > 0;
+    const hasAdvisories = result.advisories && result.advisories.length > 0;
+    if (!hasConflicts && !hasAdvisories) {
       return { content: [{ type: "text" as const, text: "No conflicts detected. Safe to proceed." }] };
     }
-    const lines = ["⚠ Potential conflict(s) detected:\n"];
-    for (const c of result.conflicts) {
-      lines.push(`- Peer "${c.peerId}" (${c.agentType}): ${c.summary}`);
-      lines.push(`  Working on: ${c.taskIntent.description}`);
-      const files = c.taskIntent.targetFiles.slice(0, 5);
-      lines.push(`  Files: ${files.join(", ")}${c.taskIntent.targetFiles.length > 5 ? " ..." : ""}`);
-      lines.push(`  Conflict: ${c.reason} (confidence: ${c.confidence})`);
+    const lines: string[] = [];
+    if (hasConflicts) {
+      lines.push("⚠ Potential conflict(s) detected:\n");
+      for (const c of result.conflicts) {
+        lines.push(`- Peer "${c.peerId}" (${c.agentType}): ${c.summary}`);
+        lines.push(`  Working on: ${c.taskIntent.description}`);
+        const files = c.taskIntent.targetFiles.slice(0, 5);
+        lines.push(`  Files: ${files.join(", ")}${c.taskIntent.targetFiles.length > 5 ? " ..." : ""}`);
+        lines.push(`  Conflict: ${c.reason} (confidence: ${c.confidence})`);
+        if (c.relatedMemories?.length) {
+          lines.push(`  Related memories: ${c.relatedMemories.map(m => `#${m.id} [${m.category}] ${m.title}`).join("; ")}`);
+        }
+      }
+      lines.push("");
+      lines.push("Consider:");
+      lines.push("1. Coordinate with the other agent (use send_message)");
+      lines.push("2. Revise your approach to avoid overlapping files/areas");
+      lines.push("3. Proceed anyway (risk merge conflicts later)");
     }
-    lines.push("");
-    lines.push("Consider:");
-    lines.push("1. Coordinate with the other agent (use send_message)");
-    lines.push("2. Revise your approach to avoid overlapping files/areas");
-    lines.push("3. Proceed anyway (risk merge conflicts later)");
+    if (hasAdvisories) {
+      lines.push("");
+      lines.push("Relevant repo memory (decisions/conventions):");
+      for (const a of result.advisories!) {
+        lines.push(`- [${a.category}] ${a.title}: ${a.content}`);
+      }
+    }
     return { content: [{ type: "text" as const, text: lines.join("\n") }] };
   } catch (e) {
     return { content: [{ type: "text" as const, text: `Error checking conflicts: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
+  }
+});
+
+// ─── Repo Memory MCP Tools ──────────────────────────────────
+
+mcp.registerTool("save_memory", {
+  description: "Save a learning, decision, or insight to the shared repo memory. All peers in the same repo can search and retrieve these memories. Use this to record important decisions, bug fixes, architectural patterns, or conventions discovered during your work.",
+  inputSchema: {
+    category: z.enum(["decision", "learning", "architecture", "bug-fix", "convention"]).describe("Category of the memory"),
+    title: z.string().describe("Short title summarizing the memory (under 100 chars)"),
+    content: z.string().describe("Detailed content: WHAT was done, WHY, and the OUTCOME (under 500 chars)"),
+    files: z.array(z.string()).optional().describe("Related file paths"),
+    areas: z.array(z.string()).optional().describe("Related directory/module areas (e.g. 'src/broker')"),
+  },
+}, async ({ category, title, content, files, areas }) => {
+  if (!myId || !myGitRoot) {
+    return { content: [{ type: "text" as const, text: "Not registered or not in a git repo." }], isError: true };
+  }
+  try {
+    const result = await brokerFetch<AddMemoryResponse>("/repo-memory/add", {
+      gitRoot: myGitRoot,
+      sourcePeerId: myId,
+      category, title, content, files, areas,
+    });
+    if (result.duplicate) {
+      return { content: [{ type: "text" as const, text: `Memory already exists (id: ${result.id}). Updated timestamp.` }] };
+    }
+    return { content: [{ type: "text" as const, text: `Memory saved (id: ${result.id}).` }] };
+  } catch (e) {
+    return { content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
+  }
+});
+
+mcp.registerTool("search_memory", {
+  description: "Search the shared repo memory for relevant context. Returns memories saved by any peer in the same repo that match the query keywords. Use before starting work to check for relevant historical context, past decisions, or known issues.",
+  inputSchema: {
+    query: z.string().describe("Search query (keywords describing what you're looking for)"),
+    category: z.enum(["decision", "learning", "architecture", "bug-fix", "convention"]).optional().describe("Filter by category"),
+    files: z.array(z.string()).optional().describe("Filter by related file paths"),
+    areas: z.array(z.string()).optional().describe("Filter by related directory/module areas"),
+    limit: z.number().optional().describe("Max results (default 10)"),
+  },
+}, async ({ query, category, files, areas, limit }) => {
+  if (!myGitRoot) {
+    return { content: [{ type: "text" as const, text: "Not in a git repo." }], isError: true };
+  }
+  try {
+    const result = await brokerFetch<SearchMemoryResponse>("/repo-memory/search", {
+      gitRoot: myGitRoot, query, category, files, areas, limit: limit ?? 10,
+    });
+    if (result.memories.length === 0) {
+      return { content: [{ type: "text" as const, text: "No matching memories found." }] };
+    }
+    const lines = result.memories.map(m =>
+      `#${m.id} [${m.category}] ${m.title} (score: ${m.score.toFixed(1)}, by: ${m.sourcePeerId ?? "unknown"}, ${m.createdAt})\n  ${m.content}`
+    );
+    return { content: [{ type: "text" as const, text: `Found ${result.memories.length} memory(ies):\n\n${lines.join("\n\n")}` }] };
+  } catch (e) {
+    return { content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
+  }
+});
+
+mcp.registerTool("list_memories", {
+  description: "List recent memories from the shared repo memory store. Shows what the team of agents has learned about this repository.",
+  inputSchema: {
+    category: z.enum(["decision", "learning", "architecture", "bug-fix", "convention"]).optional().describe("Filter by category"),
+    limit: z.number().optional().describe("Max results (default 20)"),
+  },
+}, async ({ category, limit }) => {
+  if (!myGitRoot) {
+    return { content: [{ type: "text" as const, text: "Not in a git repo." }], isError: true };
+  }
+  try {
+    const result = await brokerFetch<ListMemoriesResponse>("/repo-memory/list", {
+      gitRoot: myGitRoot, category, limit: limit ?? 20,
+    });
+    if (result.memories.length === 0) {
+      return { content: [{ type: "text" as const, text: "No memories yet for this repo." }] };
+    }
+    const lines = result.memories.map(m =>
+      `#${m.id} [${m.category}] ${m.title} (by: ${m.sourcePeerId ?? "unknown"}, ${m.updatedAt})\n  ${m.content}`
+    );
+    return { content: [{ type: "text" as const, text: `${result.total} total memories. Showing ${result.memories.length}:\n\n${lines.join("\n\n")}` }] };
+  } catch (e) {
+    return { content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
   }
 });
 
@@ -1238,6 +1346,9 @@ async function main() {
   let lastGitJson = ""; // Cache to avoid redundant context updates
   let lastExchangesJson = ""; // Cache to avoid redundant exchange updates
   let lastTaskIntentJson = ""; // Cache to avoid redundant taskIntent updates
+  let lastMemoryExtractionTime = 0;
+  let lastCommitCount = 0;
+  const MEMORY_EXTRACTION_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
   const heartbeatTimer = setInterval(async () => {
     if (!myId) return;
     try {
@@ -1273,14 +1384,14 @@ async function main() {
         contextUpdate.git = gitCtx;
       }
 
-      // Update recent context (only if changed) and regenerate digest
-      const recentContext = getRecentExchanges();
+      // Update recent exchange (only if changed) and regenerate digest
+      const recentExchange = getRecentExchanges();
       const currentSummary = cachedSessionTitle ?? "";
-      if (recentContext !== lastExchangesJson) {
-        lastExchangesJson = recentContext;
-        contextUpdate.recentContext = recentContext;
+      if (recentExchange !== lastExchangesJson) {
+        lastExchangesJson = recentExchange;
+        contextUpdate.recentExchange = recentExchange;
         // Generate digest asynchronously — don't block heartbeat
-        generateConversationDigest(recentContext, currentSummary, undefined, gitCtx).then((digest) => {
+        generateConversationDigest(recentExchange, currentSummary, undefined, gitCtx).then((digest) => {
           if (digest && myId) {
             brokerFetch("/update-context", {
               id: myId,
@@ -1319,6 +1430,32 @@ async function main() {
       if (Object.keys(contextUpdate).length > 0) {
         await brokerFetch("/update-context", { id: myId, context: contextUpdate });
       }
+
+      // Periodic memory extraction (every 5 minutes if significant work detected)
+      const now = Date.now();
+      if (myGitRoot && now - lastMemoryExtractionTime > MEMORY_EXTRACTION_INTERVAL_MS) {
+        const currentCommitCount = gitCtx?.recentCommits?.length ?? 0;
+        const newCommits = currentCommitCount > lastCommitCount;
+        const agentModifiedFiles = (gitCtx?.modifiedFiles ?? []).filter(
+          f => !new Set(baselineModifiedFiles).has(f),
+        );
+        if (newCommits || agentModifiedFiles.length >= 1) {
+          lastMemoryExtractionTime = now;
+          lastCommitCount = currentCommitCount;
+          // Run extraction asynchronously to not block heartbeat
+          try {
+            const exchange = getRecentExchanges();
+            const memories = extractMemoriesFromExchanges(exchange, gitCtx, cachedSessionTitle);
+            for (const mem of memories) {
+              brokerFetch("/repo-memory/add", {
+                gitRoot: myGitRoot!, sourcePeerId: myId!,
+                category: mem.category, title: mem.title, content: mem.content,
+                files: mem.files, areas: mem.areas, sourceExchange: mem.sourceExchange,
+              }).catch(() => {}); // Non-critical
+            }
+          } catch { /* non-critical */ }
+        }
+      }
     } catch {
       // Broker temporarily down — will retry next heartbeat
     }
@@ -1336,6 +1473,22 @@ async function main() {
     if (titleWatchTimer) clearTimeout(titleWatchTimer);
     gitWatcher?.close();
     clearInterval(parentWatchTimer);
+    // Extract memories from session before sleeping
+    if (myId && myGitRoot) {
+      try {
+        const exchange = getRecentExchanges();
+        const gitCtx = await gatherGitContext(myCwd);
+        const memories = extractMemoriesFromExchanges(exchange, gitCtx, cachedSessionTitle);
+        for (const mem of memories) {
+          await brokerFetch("/repo-memory/add", {
+            gitRoot: myGitRoot, sourcePeerId: myId,
+            category: mem.category, title: mem.title, content: mem.content,
+            files: mem.files, areas: mem.areas, sourceExchange: mem.sourceExchange,
+          }).catch(() => {}); // Non-critical
+        }
+        if (memories.length > 0) log(`Extracted ${memories.length} memory(ies) to repo memory`);
+      } catch { /* non-critical */ }
+    }
     if (myId) {
       try { await brokerFetch("/suspend-peer", { id: myId }); log("Sleep (session detached)"); } catch { /* */ }
     }

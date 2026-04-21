@@ -7,7 +7,7 @@
 import * as path from "path";
 import * as vscode from "vscode";
 import type { BrokerClient } from "../broker-client";
-import type { Peer } from "../../shared/types";
+import type { Peer, RepoMemory } from "../../shared/types";
 
 export class PeerListProvider implements vscode.TreeDataProvider<PeerItem> {
   private _onDidChangeTreeData = new vscode.EventEmitter<PeerItem | undefined>();
@@ -52,6 +52,10 @@ export class PeerListProvider implements vscode.TreeDataProvider<PeerItem> {
           return item;
         });
       }
+      // Lazily load repo memories when the "Repo Memory" node is expanded
+      if (element.repoMemoryGitRoot) {
+        return this.loadRepoMemories(element.repoMemoryGitRoot);
+      }
       return element.children ?? [];
     }
 
@@ -84,7 +88,7 @@ export class PeerListProvider implements vscode.TreeDataProvider<PeerItem> {
           .map((p) => formatPeerDescription(p))
           .filter((description) => !!description),
       );
-      header.children = group.peers
+      const peerItems = group.peers
         .map((p) => {
           const displayType = agentDisplayName(p.agentType);
           const tag = sourceTag(p.source);
@@ -94,13 +98,109 @@ export class PeerListProvider implements vscode.TreeDataProvider<PeerItem> {
           return new PeerItem(label, p.id, "peer", p, undefined, undefined, descriptionForPeerRow(p, activeDescriptions));
         })
         .sort((a, b) => {
-          const rank = (p: Peer | undefined) => (p?.suspended ? 2 : 1);
-          return rank(a.peer) - rank(b.peer);
+          const sourceRank = (p: Peer | undefined) => (p?.source === "extension" ? 0 : 1);
+          const suspendedRank = (p: Peer | undefined) => (p?.suspended ? 1 : 0);
+          const sourceDiff = sourceRank(a.peer) - sourceRank(b.peer);
+          if (sourceDiff !== 0) return sourceDiff;
+          return suspendedRank(a.peer) - suspendedRank(b.peer);
         });
+
+      // Add "Repo Memory" node per project (lazily loaded on expand)
+      const gitRoot = group.peers.find(p => p.gitRoot)?.gitRoot;
+      if (gitRoot) {
+        const memoryItem = new PeerItem(
+          "Repo Memory", "", "detail", undefined,
+          "book", new vscode.ThemeColor("charts.purple"),
+        );
+        memoryItem.id = `project:${groupKey}:repo-memory`;
+        memoryItem.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
+        memoryItem.repoMemoryGitRoot = gitRoot;
+        memoryItem.contextValue = "repoMemoryHeader";
+        header.children = [...peerItems, memoryItem];
+      } else {
+        header.children = peerItems;
+      }
       items.push(header);
     }
 
     return items;
+  }
+
+  /** Lazily load repo memories for a given git root */
+  private async loadRepoMemories(gitRoot: string): Promise<PeerItem[]> {
+    try {
+      const memories = await this.client.listRepoMemories(gitRoot, undefined, 30);
+      if (memories.length === 0) {
+        return [leaf("No memories yet", undefined, "info", new vscode.ThemeColor("charts.foreground"))];
+      }
+
+      // Group by category
+      const byCategory = new Map<string, RepoMemory[]>();
+      for (const m of memories) {
+        const list = byCategory.get(m.category) ?? [];
+        list.push(m);
+        byCategory.set(m.category, list);
+      }
+
+      const CATEGORY_ICONS: Record<string, { icon: string; color: string }> = {
+        "decision": { icon: "law", color: "charts.red" },
+        "learning": { icon: "mortar-board", color: "charts.blue" },
+        "architecture": { icon: "symbol-structure", color: "charts.purple" },
+        "bug-fix": { icon: "bug", color: "charts.orange" },
+        "convention": { icon: "checklist", color: "charts.green" },
+      };
+
+      const items: PeerItem[] = [];
+      for (const [category, mems] of byCategory) {
+        const cfg = CATEGORY_ICONS[category] ?? { icon: "note", color: "charts.foreground" };
+        const catItem = new PeerItem(
+          `${category} (${mems.length})`, "", "detail", undefined,
+          cfg.icon, new vscode.ThemeColor(cfg.color),
+        );
+        catItem.id = `repo-memory:${gitRoot}:cat:${category}`;
+        catItem.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
+        catItem.children = mems.map(m => {
+          const item = leaf(
+            m.title,
+            m.sourcePeerId ?? undefined,
+            cfg.icon,
+            new vscode.ThemeColor(cfg.color),
+          );
+          item.id = `repo-memory:${gitRoot}:${m.id}`;
+          item.tooltip = new vscode.MarkdownString(
+            `**[${m.category}] ${m.title}**\n\n${m.content}\n\n` +
+            (m.files.length ? `Files: ${m.files.join(", ")}\n\n` : "") +
+            `By: ${m.sourcePeerId ?? "unknown"} · ${m.updatedAt}`,
+          );
+          item.command = {
+            command: "agentPeers.openMessageInEditor",
+            title: "Open in Editor",
+            arguments: [{
+              title: `Memory #${m.id}: ${m.title}`,
+              header: [
+                `# Repo Memory #${m.id}`,
+                "",
+                `- **Category:** ${m.category}`,
+                `- **By:** ${m.sourcePeerId ?? "unknown"}`,
+                `- **Created:** ${m.createdAt}`,
+                `- **Updated:** ${m.updatedAt}`,
+                m.files.length ? `- **Files:** ${m.files.join(", ")}` : "",
+                m.areas.length ? `- **Areas:** ${m.areas.join(", ")}` : "",
+                "",
+                "---",
+                "",
+              ].filter(Boolean).join("\n"),
+              text: m.content,
+            }],
+          };
+          return item;
+        });
+        items.push(catItem);
+      }
+      return items;
+    } catch {
+      return [leaf("Failed to load memories", undefined, "warning", new vscode.ThemeColor("charts.red"))];
+    }
   }
 }
 
@@ -271,38 +371,6 @@ function buildContextItems(peer: Peer): PeerItem[] {
     items.push(filesItem);
   }
 
-  const recentContext = peer.context.recentContext;
-  const digest = peer.context.conversationDigest;
-  const chatChildren: PeerItem[] = [];
-
-  // Show AI-generated digest prominently at top
-  if (digest) {
-    const digestItem = leaf(`📋 ${digest}`, undefined, "lightbulb", dim ?? new vscode.ThemeColor("charts.yellow"));
-    digestItem.tooltip = `Conversation digest:\n\n${digest}`;
-    chatChildren.push(digestItem);
-  }
-
-  // Recent context as a single collapsible entry (opens full markdown in editor)
-  if (recentContext) {
-    const rawItem = leaf(
-      "Recent Context",
-      undefined,
-      "history",
-      dim ?? new vscode.ThemeColor("charts.foreground"),
-    );
-    rawItem.collapsibleState = vscode.TreeItemCollapsibleState.None;
-    rawItem.command = {
-      command: "agentPeers.openMessageInEditor",
-      title: "Open in Editor",
-      arguments: [buildRecentContextDocument(peer, recentContext)],
-    };
-    chatChildren.push(rawItem);
-  }
-
-  for (const child of chatChildren) {
-    items.push(child);
-  }
-
   // Incoming messages + reports subtree — lazily loaded when expanded
   const totalMessages = peer.totalMessages ?? 0;
   if (totalMessages > 0) {
@@ -334,28 +402,14 @@ function leaf(label: string, value: string | undefined, iconId: string, iconColo
   return item;
 }
 
-function buildRecentContextDocument(peer: Peer, recentContext: string) {
-  return {
-    title: `Recent Context: ${peer.id}`,
-    header: [
-      `# Recent Context for ${peer.id}`,
-      "",
-      `- **Agent:** ${peer.agentType}`,
-      `- **Workspace:** ${peer.cwd}`,
-      "",
-      "---",
-      "",
-    ].join("\n"),
-    text: recentContext,
-  };
-}
-
 class PeerItem extends vscode.TreeItem {
   children?: PeerItem[];
   /** When set, getChildren will lazily fetch all messages for this peer ID */
   incomingForPeerId?: string;
   /** Message ID for individual message items — used by delete command */
   messageId?: number;
+  /** When set, getChildren will lazily fetch repo memories for this git root */
+  repoMemoryGitRoot?: string;
 
   static projectHeader(projectName: string, peerCount: number, projectKey: string): PeerItem {
     const item = new PeerItem(projectName, "", "header");

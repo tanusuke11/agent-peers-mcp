@@ -9,6 +9,9 @@ import type {
   Message,
   MessageType,
   BrokerHealthResponse,
+  RepoMemory,
+  SearchMemoryResponse,
+  ListMemoriesResponse,
   WsEvent,
 } from "../shared/types";
 import { findNodeBinary } from "../shared/process";
@@ -216,7 +219,7 @@ export class BrokerClient {
     const { spawn } = require("child_process") as typeof import("child_process");
     const cfg = vscode.workspace.getConfiguration("agentPeers");
     const autoConflict = cfg.get<boolean>("autoConflictCheck", true);
-    const maxContextLength = cfg.get<number>("maxContextLength", 10);
+    const maxContextLength = cfg.get<number>("maxContextLength", 30);
     const proc = spawn(findNodeBinary(), [brokerPath], {
       stdio: "ignore",
       detached: true,
@@ -300,6 +303,18 @@ export class BrokerClient {
         handler(data);
       }
     }
+  }
+
+  // ─── Repo Memory ────────────────────────────────────────
+
+  async listRepoMemories(gitRoot: string, category?: string, limit?: number): Promise<RepoMemory[]> {
+    const result = await this.post<ListMemoriesResponse>("/repo-memory/list", { gitRoot, category, limit });
+    return result.memories;
+  }
+
+  async searchRepoMemories(gitRoot: string, query: string): Promise<RepoMemory[]> {
+    const result = await this.post<SearchMemoryResponse>("/repo-memory/search", { gitRoot, query });
+    return result.memories;
   }
 
   // ─── Cleanup ──────────────────────────────────────────

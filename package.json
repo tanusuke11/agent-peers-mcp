@@ -217,8 +217,8 @@
         },
         "agentPeers.maxContextLength": {
           "type": "number",
-          "default": 10,
-          "description": "Number of recent conversation exchanges to include in the shared context (recentContext markdown document)."
+          "default": 30,
+          "description": "Number of recent conversation exchanges to include in the shared context (recentExchange markdown document)."
         }
       }
     }

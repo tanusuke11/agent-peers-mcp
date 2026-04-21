@@ -34,6 +34,14 @@ interface ConflictEntry {
   taskIntent: { description: string; targetFiles: string[]; action: string };
   reason: string;
   confidence: string;
+  relatedMemories?: Array<{ id: number; category: string; title: string; createdAt: string }>;
+}
+
+interface AdvisoryEntry {
+  memoryId: number;
+  category: string;
+  title: string;
+  content: string;
 }
 
 async function main() {
@@ -100,25 +108,38 @@ async function main() {
     });
     if (!res.ok) process.exit(0);
 
-    const result = (await res.json()) as { conflicts: ConflictEntry[] };
-    if (!result.conflicts || result.conflicts.length === 0) process.exit(0);
+    const result = (await res.json()) as { conflicts: ConflictEntry[]; advisories?: AdvisoryEntry[] };
+    const hasConflicts = result.conflicts && result.conflicts.length > 0;
+    const hasAdvisories = result.advisories && result.advisories.length > 0;
+    if (!hasConflicts && !hasAdvisories) process.exit(0);
 
     // Format conflict context for Claude
-    const lines = [
-      "[Agent Peers] Potential conflict detected with other AI agent(s) in this repo:\n",
-    ];
-    for (const c of result.conflicts) {
-      lines.push(`- Peer "${c.peerId}" (${c.agentType}): ${c.summary}`);
-      lines.push(`  Working on: ${c.taskIntent.description}`);
-      const files = c.taskIntent.targetFiles.slice(0, 5);
-      lines.push(`  Files: ${files.join(", ")}${c.taskIntent.targetFiles.length > 5 ? " ..." : ""}`);
-      lines.push(`  Conflict: ${c.reason} (confidence: ${c.confidence})`);
+    const lines: string[] = [];
+    if (hasConflicts) {
+      lines.push("[Agent Peers] Potential conflict detected with other AI agent(s) in this repo:\n");
+      for (const c of result.conflicts) {
+        lines.push(`- Peer "${c.peerId}" (${c.agentType}): ${c.summary}`);
+        lines.push(`  Working on: ${c.taskIntent.description}`);
+        const files = c.taskIntent.targetFiles.slice(0, 5);
+        lines.push(`  Files: ${files.join(", ")}${c.taskIntent.targetFiles.length > 5 ? " ..." : ""}`);
+        lines.push(`  Conflict: ${c.reason} (confidence: ${c.confidence})`);
+        if (c.relatedMemories?.length) {
+          lines.push(`  Related memories: ${c.relatedMemories.map(m => `#${m.id} [${m.category}] ${m.title}`).join("; ")}`);
+        }
+      }
+      lines.push("");
+      lines.push("Before proceeding, ask the user how to handle this conflict:");
+      lines.push("1. Pause the other peer's work (use send_message to ask them to stop)");
+      lines.push("2. Proceed anyway (risk merge conflicts later)");
+      lines.push("3. Revise the current request to avoid overlapping files/areas");
     }
-    lines.push("");
-    lines.push("Before proceeding, ask the user how to handle this conflict:");
-    lines.push("1. Pause the other peer's work (use send_message to ask them to stop)");
-    lines.push("2. Proceed anyway (risk merge conflicts later)");
-    lines.push("3. Revise the current request to avoid overlapping files/areas");
+    if (hasAdvisories) {
+      lines.push("");
+      lines.push("[Agent Peers] Relevant repo memory (decisions/conventions):");
+      for (const a of result.advisories!) {
+        lines.push(`- [${a.category}] ${a.title}: ${a.content}`);
+      }
+    }
 
     process.stdout.write(JSON.stringify({ additionalContext: lines.join("\n") }));
   } catch {

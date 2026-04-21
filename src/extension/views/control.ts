@@ -52,7 +52,7 @@ export class ControlProvider implements vscode.TreeDataProvider<ControlItem> {
     ));
 
     // Max context length (number of recent exchanges in shared context)
-    const maxContextLength = vscode.workspace.getConfiguration("agentPeers").get<number>("maxContextLength", 10);
+    const maxContextLength = vscode.workspace.getConfiguration("agentPeers").get<number>("maxContextLength", 30);
     items.push(ControlItem.action(
       "Max Context Length", "agentPeers.setMaxContextLength",
       "list-ordered", "charts.foreground",
@@ -83,6 +83,23 @@ export class ControlProvider implements vscode.TreeDataProvider<ControlItem> {
       "Config Codex", "agentPeers.addMcpServerCodex",
       "gear", "charts.green",
       "Add to Codex config",
+    ));
+
+    // Terminal grid launchers
+    items.push(ControlItem.action(
+      "Open Terminal Grid", "agentPeers.openTerminalGrid",
+      "terminal", "charts.foreground",
+      "Select grid size",
+    ));
+    items.push(ControlItem.action(
+      "Open Claude Grid", "agentPeers.openClaudeGrid",
+      "terminal", "charts.blue",
+      "Launch claude in each cell",
+    ));
+    items.push(ControlItem.action(
+      "Open Codex Grid", "agentPeers.openCodexGrid",
+      "terminal", "charts.green",
+      "Launch codex in each cell",
     ));
 
     return items;
