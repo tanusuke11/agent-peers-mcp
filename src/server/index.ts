@@ -186,6 +186,37 @@ function findOwnerPid(): number {
   return process.ppid;
 }
 
+function getTerminalSessionEnvId(): string | null {
+  return (
+    process.env.TERM_SESSION_ID
+    ?? process.env.WT_SESSION
+    ?? process.env.TMUX
+    ?? process.env.STY
+    ?? process.env.ZELLIJ_SESSION_NAME
+    ?? null
+  );
+}
+
+/**
+ * Resolve a stable terminal/session anchor for peer reuse.
+ *
+ * Prefer explicit terminal session environment variables when available.
+ * Otherwise, use the parent shell of the CLI process; that PID is typically
+ * stable across repeated codex/claude launches from the same terminal tab.
+ */
+function resolveStableTty(owner: number): string | null {
+  const envTty = getTerminalSessionEnvId();
+  if (envTty) return envTty;
+
+  const shellPid = getParentPid(owner);
+  if (shellPid > 1 && shellPid !== owner && shellPid !== process.pid) {
+    return `shell:${shellPid}`;
+  }
+
+  const fallback = getTty();
+  return fallback ? `fallback:${fallback}` : null;
+}
+
 /** Cached owner PID — resolved once at startup */
 let ownerPid = 0;
 
@@ -1274,8 +1305,8 @@ async function main() {
 
   myCwd = process.cwd();
   myGitRoot = await getGitRoot(myCwd);
-  myTty = getTty();
   ownerPid = findOwnerPid();
+  myTty = resolveStableTty(ownerPid);
   mySource = resolvePeerSource(ownerPid);
 
   log(`Agent type: ${AGENT_TYPE}`);
@@ -1347,7 +1378,7 @@ async function main() {
   let lastExchangesJson = ""; // Cache to avoid redundant exchange updates
   let lastTaskIntentJson = ""; // Cache to avoid redundant taskIntent updates
   let lastMemoryExtractionTime = 0;
-  let lastCommitCount = 0;
+  let lastLatestCommit = "";
   const MEMORY_EXTRACTION_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
   const heartbeatTimer = setInterval(async () => {
     if (!myId) return;
@@ -1434,14 +1465,14 @@ async function main() {
       // Periodic memory extraction (every 5 minutes if significant work detected)
       const now = Date.now();
       if (myGitRoot && now - lastMemoryExtractionTime > MEMORY_EXTRACTION_INTERVAL_MS) {
-        const currentCommitCount = gitCtx?.recentCommits?.length ?? 0;
-        const newCommits = currentCommitCount > lastCommitCount;
+        const latestCommit = gitCtx?.recentCommits?.[0] ?? "";
+        const newCommits = !!latestCommit && latestCommit !== lastLatestCommit;
+        lastLatestCommit = latestCommit;
         const agentModifiedFiles = (gitCtx?.modifiedFiles ?? []).filter(
           f => !new Set(baselineModifiedFiles).has(f),
         );
         if (newCommits || agentModifiedFiles.length >= 1) {
           lastMemoryExtractionTime = now;
-          lastCommitCount = currentCommitCount;
           // Run extraction asynchronously to not block heartbeat
           try {
             const exchange = getRecentExchanges();
@@ -1478,6 +1509,9 @@ async function main() {
       try {
         const exchange = getRecentExchanges();
         const gitCtx = await gatherGitContext(myCwd);
+        if (gitCtx) {
+          gitCtx.baselineModifiedFiles = baselineModifiedFiles;
+        }
         const memories = extractMemoriesFromExchanges(exchange, gitCtx, cachedSessionTitle);
         for (const mem of memories) {
           await brokerFetch("/repo-memory/add", {

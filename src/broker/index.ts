@@ -53,6 +53,7 @@ import type {
   WsPeerJoinedEvent,
   WsPeerLeftEvent,
   WsContextUpdatedEvent,
+  WsMemoryAddedEvent,
 } from "../shared/types.ts";
 import {
   DEFAULT_BROKER_PORT,
@@ -60,6 +61,7 @@ import {
   BROKER_DB_PATH,
   STALE_PEER_CLEANUP_MS,
   PEER_TIMEOUT_MS,
+  SLEEPING_PEER_MAX_AGE_MS,
 } from "../shared/constants.ts";
 import { terminateProcess } from "../shared/process.ts";
 
@@ -231,8 +233,16 @@ function cleanStalePeers() {
   const peers = db.prepare("SELECT id, pid, last_seen, sleep FROM peers").all() as unknown as { id: string; pid: number; last_seen: string; sleep: number }[];
   const now = Date.now();
   for (const peer of peers) {
-    // Skip already-sleeping peers — they have no active session, so stale checks don't apply
-    if (peer.sleep) continue;
+    if (peer.sleep) {
+      // Hard-delete sleeping peers that have been dormant longer than the max age.
+      // Without this, sleeping peers accumulate indefinitely across session restarts.
+      const dormantMs = now - new Date(peer.last_seen).getTime();
+      if (dormantMs > SLEEPING_PEER_MAX_AGE_MS) {
+        removePeer(peer.id);
+        log(`Sleeping peer ${peer.id} deleted (dormant ${Math.round(dormantMs / 60000)} min)`);
+      }
+      continue;
+    }
 
     const staleByTime = now - new Date(peer.last_seen).getTime() > PEER_TIMEOUT_MS;
     let deadByPid = false;
@@ -249,6 +259,11 @@ function cleanStalePeers() {
       detachPeer(peer.id);
     }
   }
+
+  // Also collapse redundant sleeping peers on every cleanup cycle,
+  // not just at startup and registration time.
+  const allPeers = selectAllPeers.all() as unknown as RawPeerRow[];
+  collapseRedundantSleepingPeers(allPeers);
 }
 
 // NOTE: cleanStalePeers() is called after prepared statements are defined (see below)
@@ -268,8 +283,16 @@ const selectAllPeers = db.prepare(`SELECT * FROM peers`);
 const selectPeersByDirectory = db.prepare(`SELECT * FROM peers WHERE cwd = ?`);
 const selectPeerById = db.prepare(`SELECT * FROM peers WHERE id = ?`);
 const selectActiveByPid = db.prepare(`SELECT * FROM peers WHERE pid = ? AND sleep = 0 LIMIT 1`);
-const selectSuspendedByRepo = db.prepare(`SELECT * FROM peers WHERE agent_type = ? AND git_root = ? AND sleep = 1 ORDER BY last_seen DESC LIMIT 1`);
-const selectSuspendedByCwd = db.prepare(`SELECT * FROM peers WHERE agent_type = ? AND cwd = ? AND sleep = 1 ORDER BY last_seen DESC LIMIT 1`);
+const selectSuspendedByRepo = db.prepare(`
+  SELECT * FROM peers
+  WHERE agent_type = ? AND source = ? AND git_root = ? AND sleep = 1
+  ORDER BY registered_at ASC, last_seen DESC
+`);
+const selectSuspendedByCwd = db.prepare(`
+  SELECT * FROM peers
+  WHERE agent_type = ? AND source = ? AND cwd = ? AND sleep = 1
+  ORDER BY registered_at ASC, last_seen DESC
+`);
 const selectMessageById = db.prepare(`SELECT * FROM messages WHERE id = ?`);
 
 const insertMessage = db.prepare(`
@@ -298,6 +321,7 @@ const selectRecentMemoriesByRepo = db.prepare(`SELECT * FROM repo_memories WHERE
 
 // ─── Stale peer cleanup (deferred until prepared statements are ready) ──
 cleanStalePeers();
+collapseRedundantSleepingPeers(selectAllPeers.all() as unknown as RawPeerRow[]);
 setInterval(cleanStalePeers, STALE_PEER_CLEANUP_MS);
 
 // ─── Helpers ───────────────────────────────────────────────────
@@ -348,6 +372,14 @@ const countAllMessages = db.prepare(`SELECT COUNT(*) as cnt FROM messages WHERE 
 const selectAllMessagesForPeer = db.prepare(`SELECT * FROM messages WHERE to_id = ? ORDER BY sent_at ASC`);
 const deleteMessageById = db.prepare(`DELETE FROM messages WHERE id = ?`);
 const clearMessagesForPeer = db.prepare(`DELETE FROM messages WHERE to_id = ?`);
+const reassignMessagesFromPeer = db.prepare(`UPDATE messages SET from_id = ? WHERE from_id = ?`);
+const reassignMessagesToPeer = db.prepare(`UPDATE messages SET to_id = ? WHERE to_id = ?`);
+const reassignMemorySourcePeer = db.prepare(`UPDATE repo_memories SET source_peer_id = ? WHERE source_peer_id = ?`);
+const updatePeerAfterSleepMerge = db.prepare(`
+  UPDATE peers
+  SET cwd = ?, git_root = ?, tty = ?, context_json = ?, last_seen = ?, pid = 0, sleep = 1
+  WHERE id = ?
+`);
 
 function rowToPeer(row: RawPeerRow): Peer {
   return {
@@ -447,6 +479,187 @@ function clearSessionContext(peer: Peer): void {
   peer.context.conversationDigest = undefined;
 }
 
+function countMessagesForPeer(peerId: string): number {
+  return (countAllMessages.get(peerId) as unknown as { cnt: number } | undefined)?.cnt ?? 0;
+}
+
+function parseTimestamp(value: string | undefined): number {
+  if (!value) return 0;
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
+
+function hasMeaningfulSummary(summary: string | undefined): boolean {
+  return !!summary && summary !== "Untitled";
+}
+
+function getPeerProjectKey(row: Pick<RawPeerRow, "git_root" | "cwd">): string {
+  return row.git_root ? `repo:${row.git_root}` : `cwd:${row.cwd}`;
+}
+
+function getSleepFingerprint(row: Pick<RawPeerRow, "agent_type" | "source" | "git_root" | "cwd" | "tty">): string {
+  const anchor = row.tty ? `tty:${row.tty}` : `cwd:${row.cwd}`;
+  return [row.agent_type, row.source ?? "terminal", getPeerProjectKey(row), anchor].join("|");
+}
+
+function mergeStoredContexts(primary: AgentContext, secondary: AgentContext, now: string): AgentContext {
+  const primaryNewer = parseTimestamp(primary.updatedAt) >= parseTimestamp(secondary.updatedAt);
+  const preferred = primaryNewer ? primary : secondary;
+  const fallback = primaryNewer ? secondary : primary;
+
+  return {
+    ...fallback,
+    ...preferred,
+    summary: hasMeaningfulSummary(preferred.summary)
+      ? preferred.summary
+      : hasMeaningfulSummary(fallback.summary)
+        ? fallback.summary
+        : preferred.summary || fallback.summary || "",
+    activeFiles: preferred.activeFiles?.length ? preferred.activeFiles : fallback.activeFiles,
+    git: preferred.git ?? fallback.git,
+    currentTask: preferred.currentTask || fallback.currentTask,
+    taskIntent: preferred.taskIntent ?? fallback.taskIntent,
+    recentExchange: preferred.recentExchange || fallback.recentExchange,
+    conversationDigest: preferred.conversationDigest || fallback.conversationDigest,
+    metadata: preferred.metadata ?? fallback.metadata,
+    updatedAt: preferred.updatedAt || fallback.updatedAt || now,
+  };
+}
+
+function chooseCanonicalSleepingPeer(rows: RawPeerRow[]): RawPeerRow {
+  return [...rows].sort((a, b) => {
+    const registeredDelta = parseTimestamp(a.registered_at) - parseTimestamp(b.registered_at);
+    if (registeredDelta !== 0) return registeredDelta;
+
+    const messageDelta = countMessagesForPeer(b.id) - countMessagesForPeer(a.id);
+    if (messageDelta !== 0) return messageDelta;
+
+    const seenDelta = parseTimestamp(b.last_seen) - parseTimestamp(a.last_seen);
+    if (seenDelta !== 0) return seenDelta;
+
+    return a.id.localeCompare(b.id);
+  })[0];
+}
+
+function chooseRegisterReuseCandidate(rows: RawPeerRow[], body: RegisterRequest): RawPeerRow {
+  return [...rows].sort((a, b) => {
+    const aTty = body.tty && a.tty === body.tty ? 1 : 0;
+    const bTty = body.tty && b.tty === body.tty ? 1 : 0;
+    if (aTty !== bTty) return bTty - aTty;
+
+    const aCwd = a.cwd === body.cwd ? 1 : 0;
+    const bCwd = b.cwd === body.cwd ? 1 : 0;
+    if (aCwd !== bCwd) return bCwd - aCwd;
+
+    const messageDelta = countMessagesForPeer(b.id) - countMessagesForPeer(a.id);
+    if (messageDelta !== 0) return messageDelta;
+
+    const registeredDelta = parseTimestamp(a.registered_at) - parseTimestamp(b.registered_at);
+    if (registeredDelta !== 0) return registeredDelta;
+
+    const seenDelta = parseTimestamp(b.last_seen) - parseTimestamp(a.last_seen);
+    if (seenDelta !== 0) return seenDelta;
+
+    return a.id.localeCompare(b.id);
+  })[0];
+}
+
+function mergeSleepingPeerIntoCanonical(canonical: RawPeerRow, duplicate: RawPeerRow): RawPeerRow {
+  const now = new Date().toISOString();
+  const canonicalContext = JSON.parse(canonical.context_json) as AgentContext;
+  const duplicateContext = JSON.parse(duplicate.context_json) as AgentContext;
+  const mergedContext = mergeStoredContexts(canonicalContext, duplicateContext, now);
+  const mergedTty = canonical.tty ?? duplicate.tty;
+  const mergedGitRoot = canonical.git_root ?? duplicate.git_root;
+  const mergedLastSeen = parseTimestamp(canonical.last_seen) >= parseTimestamp(duplicate.last_seen)
+    ? canonical.last_seen
+    : duplicate.last_seen;
+
+  updatePeerAfterSleepMerge.run(
+    canonical.cwd,
+    mergedGitRoot,
+    mergedTty,
+    JSON.stringify(mergedContext),
+    mergedLastSeen,
+    canonical.id,
+  );
+  reassignMessagesFromPeer.run(canonical.id, duplicate.id);
+  reassignMessagesToPeer.run(canonical.id, duplicate.id);
+  reassignMemorySourcePeer.run(canonical.id, duplicate.id);
+  deletePeer.run(duplicate.id);
+
+  broadcast({
+    type: "peer-left",
+    data: { id: duplicate.id },
+    timestamp: now,
+  } satisfies WsPeerLeftEvent);
+  broadcast({
+    type: "context-updated",
+    data: { id: canonical.id, context: mergedContext },
+    timestamp: now,
+  } satisfies WsContextUpdatedEvent);
+  log(`Collapsed sleeping peer ${duplicate.id} into ${canonical.id}`);
+
+  return selectPeerById.get(canonical.id) as unknown as RawPeerRow;
+}
+
+function collapseRedundantSleepingPeers(rows: RawPeerRow[]): number {
+  const sleeping = rows.filter((row) => row.sleep);
+  if (sleeping.length < 2) return 0;
+
+  // First pass: collapse peers with identical fingerprint (same TTY anchor)
+  const groups = new Map<string, RawPeerRow[]>();
+  for (const row of sleeping) {
+    const fingerprint = getSleepFingerprint(row);
+    const group = groups.get(fingerprint);
+    if (group) {
+      group.push(row);
+    } else {
+      groups.set(fingerprint, [row]);
+    }
+  }
+
+  let collapsed = 0;
+  for (const group of groups.values()) {
+    if (group.length < 2) continue;
+
+    let canonical = chooseCanonicalSleepingPeer(group);
+    for (const row of group) {
+      if (row.id === canonical.id) continue;
+      canonical = mergeSleepingPeerIntoCanonical(canonical, row);
+      collapsed++;
+    }
+  }
+
+  // Second pass: collapse by project key only (ignoring TTY anchor).
+  // This handles the common case where session restarts in a different terminal/shell,
+  // producing a different TTY anchor that prevents first-pass deduplication.
+  // Re-query to get fresh state after first pass.
+  const remainingSleeping = (selectAllPeers.all() as unknown as RawPeerRow[]).filter(r => r.sleep);
+  if (remainingSleeping.length >= 2) {
+    const projectGroups = new Map<string, RawPeerRow[]>();
+    for (const row of remainingSleeping) {
+      const key = [row.agent_type, row.source ?? "terminal", getPeerProjectKey(row)].join("|");
+      const group = projectGroups.get(key);
+      if (group) group.push(row);
+      else projectGroups.set(key, [row]);
+    }
+    for (const group of projectGroups.values()) {
+      if (group.length < 2) continue;
+      let canonical = chooseCanonicalSleepingPeer(group);
+      for (const row of group) {
+        if (row.id === canonical.id) continue;
+        // Verify still exists (may have been removed in first pass)
+        if (!selectPeerById.get(row.id)) continue;
+        canonical = mergeSleepingPeerIntoCanonical(canonical, row);
+        collapsed++;
+      }
+    }
+  }
+
+  return collapsed;
+}
+
 // ─── Request handlers ──────────────────────────────────────────
 
 function handleRegister(body: RegisterRequest): RegisterResponse {
@@ -460,8 +673,10 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
   try {
     // 1. If preferredId is given (e.g. extension peers), use that stable identity.
     // 2. Else, if the same owner PID is already active, keep that identity (prevents ID churn).
-    // 3. Else, claim a sleeping peer of the same agentType in the same project.
+    // 3. Else, prefer a sleeping peer with an exact tty anchor in the same project.
+    // 4. Else, claim the best sleeping peer of the same kind in the same project.
     let existingRow: RawPeerRow | undefined;
+    let suspendedRows: RawPeerRow[] = [];
     if (body.preferredId) {
       existingRow = selectPeerById.get(body.preferredId) as unknown as RawPeerRow | undefined;
     } else {
@@ -469,9 +684,20 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     }
 
     if (!existingRow && body.gitRoot) {
-      existingRow = selectSuspendedByRepo.get(body.agentType, body.gitRoot) as unknown as RawPeerRow | undefined;
+      suspendedRows = selectSuspendedByRepo.all(body.agentType, source, body.gitRoot) as unknown as RawPeerRow[];
     } else if (!existingRow) {
-      existingRow = selectSuspendedByCwd.get(body.agentType, body.cwd) as unknown as RawPeerRow | undefined;
+      suspendedRows = selectSuspendedByCwd.all(body.agentType, source, body.cwd) as unknown as RawPeerRow[];
+    }
+
+    if (!existingRow && suspendedRows.length > 0) {
+      const ttyMatches = body.tty
+        ? suspendedRows.filter((row) => row.tty === body.tty)
+        : [];
+      existingRow = chooseRegisterReuseCandidate(ttyMatches.length > 0 ? ttyMatches : suspendedRows, body);
+      collapseRedundantSleepingPeers(
+        suspendedRows.filter((row) => getSleepFingerprint(row) === getSleepFingerprint(existingRow!)),
+      );
+      existingRow = selectPeerById.get(existingRow.id) as unknown as RawPeerRow | undefined;
     }
 
     if (existingRow) {
@@ -483,7 +709,7 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
       const mergedContext: AgentContext = {
         ...existingContext,
         // Only overwrite with incoming values when they carry real data
-        summary: (incoming.summary && incoming.summary !== "Untitled")
+        summary: hasMeaningfulSummary(incoming.summary)
           ? incoming.summary
           : existingContext.summary ?? "",
         activeFiles: incoming.activeFiles?.length ? incoming.activeFiles : existingContext.activeFiles,
@@ -1116,6 +1342,11 @@ function handleAddMemory(body: AddMemoryRequest): AddMemoryResponse {
     hash, now, now,
   );
   const lastId = (db.prepare("SELECT last_insert_rowid() as id").get() as unknown as { id: number }).id;
+  broadcast({
+    type: "memory-added",
+    data: { gitRoot: body.gitRoot, memoryId: lastId },
+    timestamp: now,
+  } satisfies WsMemoryAddedEvent);
   return { ok: true, id: lastId };
 }
 

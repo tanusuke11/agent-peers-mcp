@@ -220,6 +220,7 @@ export type WsEventType =
   | "peer-left"       // a peer left the network
   | "context-updated" // a peer updated their context
   | "wake"            // wake up signal to deliver pending messages
+  | "memory-added"    // a new repo memory was saved
   ;
 
 export interface WsEvent {
@@ -246,6 +247,11 @@ export interface WsPeerLeftEvent extends WsEvent {
 export interface WsContextUpdatedEvent extends WsEvent {
   type: "context-updated";
   data: { id: PeerId; context: AgentContext };
+}
+
+export interface WsMemoryAddedEvent extends WsEvent {
+  type: "memory-added";
+  data: { gitRoot: string; memoryId: number };
 }
 
 // ─── Repo Memory ─────────────────────────────────────────────

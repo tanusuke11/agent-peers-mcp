@@ -11,6 +11,9 @@ import * as vscode from "vscode";
 import { BrokerClient } from "./broker-client";
 import { PeerListProvider } from "./views/peer-list";
 import { ControlProvider } from "./views/control";
+import { MessageDetailProvider } from "./views/message-detail";
+import { RepoMemoryDetailProvider } from "./views/repo-memory-detail";
+import type { MarkdownViewItem } from "./views/webview-content";
 import { forceKillProcess, findNodeBinary } from "../shared/process";
 import type { Peer } from "../shared/types";
 import * as fs from "fs";
@@ -85,7 +88,7 @@ async function findTerminalForPid(pid: number): Promise<vscode.Terminal | null> 
   const ancestors = getAncestorPids(pid);
   for (const terminal of vscode.window.terminals) {
     const shellPid = await terminal.processId;
-    if (shellPid && ancestors.has(shellPid)) {
+    if (shellPid && (shellPid === pid || ancestors.has(shellPid))) {
       return terminal;
     }
   }
@@ -94,6 +97,9 @@ async function findTerminalForPid(pid: number): Promise<vscode.Terminal | null> 
 
 const terminalPeerTitles = new WeakMap<vscode.Terminal, string>();
 const peerTerminalAssignments = new Map<string, vscode.Terminal>();
+/** Tracks the owner PID that was active when a terminal was assigned to a peer.
+ * Used to detect stale assignments when a peer is resumed by a new session (new PID). */
+const peerTerminalPids = new Map<string, number>();
 const pendingGridTerminals = new Map<string, vscode.Terminal[]>();
 
 function getTerminalKeyForAgent(agentType: Peer["agentType"]): string {
@@ -127,6 +133,10 @@ function enqueuePendingGridTerminal(command: string | undefined, terminal: vscod
   pendingGridTerminals.set(key, queue);
 }
 
+function hasActiveTerminalTab(group: vscode.TabGroup): boolean {
+  return group.activeTab?.input instanceof vscode.TabInputTerminal;
+}
+
 function claimPendingGridTerminal(peer: Peer): vscode.Terminal | null {
   const key = getTerminalKeyForAgent(peer.agentType);
   const queue = pendingGridTerminals.get(key);
@@ -136,6 +146,7 @@ function claimPendingGridTerminal(peer: Peer): vscode.Terminal | null {
     const terminal = queue.shift()!;
     if (isKnownTerminal(terminal)) {
       peerTerminalAssignments.set(peer.id, terminal);
+      peerTerminalPids.set(peer.id, peer.pid);
       return terminal;
     }
   }
@@ -147,15 +158,23 @@ function claimPendingGridTerminal(peer: Peer): vscode.Terminal | null {
 async function resolveTerminalForPeer(peer: Peer): Promise<vscode.Terminal | null> {
   const assigned = peerTerminalAssignments.get(peer.id);
   if (assigned && isKnownTerminal(assigned)) {
-    return assigned;
-  }
-  if (assigned) {
+    // If the peer was resumed with a new session (PID changed), the stored
+    // assignment points to the old terminal. Clear it and re-resolve by new PID.
+    const assignedPid = peerTerminalPids.get(peer.id);
+    if (assignedPid === undefined || assignedPid === peer.pid) {
+      return assigned;
+    }
     peerTerminalAssignments.delete(peer.id);
+    peerTerminalPids.delete(peer.id);
+  } else if (assigned) {
+    peerTerminalAssignments.delete(peer.id);
+    peerTerminalPids.delete(peer.id);
   }
 
   const byPid = await findTerminalForPid(peer.pid);
   if (byPid) {
     peerTerminalAssignments.set(peer.id, byPid);
+    peerTerminalPids.set(peer.id, peer.pid);
     return byPid;
   }
 
@@ -322,17 +341,29 @@ async function openTerminalGrid(command: string | undefined): Promise<void> {
   await vscode.commands.executeCommand("vscode.setEditorLayout", buildLayout());
   await new Promise(resolve => setTimeout(resolve, 300));
 
-  // Create a terminal editor tab in each editor group.
-  // We create terminals with an explicit `location: { viewColumn }` so each
+  const groups = [...vscode.window.tabGroups.all]
+    .sort((a, b) => Number(a.viewColumn) - Number(b.viewColumn))
+    .slice(0, total);
+
+  // Create a terminal editor tab only in groups that do not already have an
+  // active terminal session. Existing terminal editors are preserved in place
+  // and only participate in the arranged layout.
+  //
+  // We create new terminals with an explicit `location: { viewColumn }` so each
   // one lands in the intended group regardless of which group is currently
   // focused. `createTerminalEditor` (the command) targets the active group
   // only, which is unreliable when some groups are still empty — new empty
   // groups can get merged/collapsed before the command runs.
-  for (let i = 0; i < total; i++) {
-    const viewColumn = i + 1;
+  for (const group of groups) {
+    if (hasActiveTerminalTab(group)) {
+      continue;
+    }
+
+    const viewColumn = group.viewColumn;
+    const terminalIndex = Number(viewColumn);
 
     const terminal = vscode.window.createTerminal({
-      name: `${prefix} ${i + 1}`,
+      name: `${prefix} ${terminalIndex}`,
       location: { viewColumn } as vscode.TerminalEditorLocationOptions,
     });
     enqueuePendingGridTerminal(command, terminal);
@@ -403,55 +434,19 @@ function configureConflictHook(extensionUri: vscode.Uri): { configured: boolean;
   }
 }
 
-// ─── Virtual document provider ──────────────────────────────
-// Serves message content via a custom URI scheme (agent-peers-msg:).
-// Using a virtual document avoids the untitled-document pipeline entirely,
-// which prevents VS Code from showing the "Terminate running processes?" dialog
-// that appears when an untitled editor tab tries to replace a terminal editor tab.
+// ─── Message Detail Items ─────────────────────────────────────
 
-class MessageContentProvider implements vscode.TextDocumentContentProvider {
-  private readonly _contents = new Map<string, string>();
-  private readonly _onDidChange = new vscode.EventEmitter<vscode.Uri>();
-  readonly onDidChange = this._onDidChange.event;
-
-  provideTextDocumentContent(uri: vscode.Uri): string {
-    return this._contents.get(uri.toString()) ?? "";
-  }
-
-  /** Store content and return a URI that can be opened as a virtual document. */
-  store(content: string): vscode.Uri {
-    const key = Date.now().toString(36) + Math.random().toString(36).slice(2);
-    const uri = vscode.Uri.parse(`agent-peers-msg:/${key}.md`);
-    this._contents.set(uri.toString(), content);
-    return uri;
-  }
-
-  /**
-   * Store content under a stable key derived from `title`.
-   * If the URI already exists (same title), update its content and fire onDidChange
-   * so VS Code refreshes the already-open editor without opening a new tab.
-   */
-  storeWithKey(title: string, content: string): vscode.Uri {
-    // Normalize title to a safe path segment
-    const key = title.replace(/[^a-zA-Z0-9_\-. ]/g, "_");
-    const uri = vscode.Uri.parse(`agent-peers-msg:/${encodeURIComponent(key)}.md`);
-    this._contents.set(uri.toString(), content);
-    this._onDidChange.fire(uri);
-    return uri;
-  }
+interface MessageViewItem extends MarkdownViewItem {
+  fromId?: string;
+  toId?: string;
+  type?: string;
+  sentAt?: string;
 }
-
-const messageContentProvider = new MessageContentProvider();
 
 export function activate(extensionContext: vscode.ExtensionContext) {
   const config = vscode.workspace.getConfiguration("agentPeers");
   const brokerPort = config.get<number>("brokerPort", 7899);
   const wsPort = brokerPort + 1; // Convention: WS port = HTTP port + 1
-
-  // Register virtual document provider for message viewing (prevents terminal dialogs)
-  extensionContext.subscriptions.push(
-    vscode.workspace.registerTextDocumentContentProvider("agent-peers-msg", messageContentProvider),
-  );
 
   // Initialize broker client
   brokerClient = new BrokerClient(brokerPort, wsPort);
@@ -459,12 +454,16 @@ export function activate(extensionContext: vscode.ExtensionContext) {
   // Initialize tree data providers
   const controlProvider = new ControlProvider(brokerClient);
   const peerListProvider = new PeerListProvider(brokerClient);
+  const messageDetailProvider = new MessageDetailProvider();
+  const repoMemoryDetailProvider = new RepoMemoryDetailProvider();
   // Register tree views
   const peerListView = vscode.window.createTreeView("agentPeers.peerList", {
     treeDataProvider: peerListProvider,
   });
   extensionContext.subscriptions.push(
     vscode.window.registerTreeDataProvider("agentPeers.control", controlProvider),
+    vscode.window.registerWebviewViewProvider(MessageDetailProvider.viewId, messageDetailProvider),
+    vscode.window.registerWebviewViewProvider(RepoMemoryDetailProvider.viewId, repoMemoryDetailProvider),
     peerListView,
   );
 
@@ -475,6 +474,9 @@ export function activate(extensionContext: vscode.ExtensionContext) {
   });
   brokerClient.on("peer-left", () => { peerListProvider.refresh(); });
   brokerClient.on("context-updated", () => {
+    peerListProvider.refresh();
+  });
+  brokerClient.on("memory-added", () => {
     peerListProvider.refresh();
   });
   /**
@@ -490,7 +492,9 @@ export function activate(extensionContext: vscode.ExtensionContext) {
    */
   function deliverToTerminal(terminal: vscode.Terminal, text: string, agentType: string) {
     if (agentType === "claude-code") {
-      // Raw-mode TUI: send text without trailing LF, then CR to submit
+      // Raw-mode TUI: send ESC first to exit any modal state (e.g. "accept edits on"),
+      // then send text without trailing LF, then CR to submit.
+      terminal.sendText("\x1b", false);
       terminal.sendText(text, false);
       terminal.sendText("\r", false);
     } else {
@@ -506,17 +510,28 @@ export function activate(extensionContext: vscode.ExtensionContext) {
       `${typeLabel} from ${fromId} → ${toId}:\n${preview}`,
       { modal: false },
       "Copy to Clipboard",
-      "Open in Editor",
+      "Open in Sidebar",
     );
     if (choice === "Copy to Clipboard") {
       await vscode.env.clipboard.writeText(combined);
-    } else if (choice === "Open in Editor") {
+    } else if (choice === "Open in Sidebar") {
       try {
-        const uri = messageContentProvider.store(`[Message from ${fromId} (${type})]\n\n${combined}`);
-        const doc = await vscode.workspace.openTextDocument(uri);
-        await vscode.window.showTextDocument(doc, { preview: true, viewColumn: vscode.ViewColumn.Beside });
+        const header = [
+          `# Message from ${fromId}`,
+          "",
+          `- **Type:** ${type}`,
+          `- **To:** ${toId}`,
+          "",
+          "---",
+          "",
+        ].join("\n");
+        await messageDetailProvider.show({
+          title: `${typeLabel}: ${fromId}`,
+          header,
+          text: combined,
+        });
       } catch (e) {
-        vscode.window.showErrorMessage(`Failed to open document: ${e}`);
+        vscode.window.showErrorMessage(`Failed to open message detail: ${e}`);
       }
     }
     peerListProvider.refresh();
@@ -619,6 +634,7 @@ export function activate(extensionContext: vscode.ExtensionContext) {
       for (const [peerId, assigned] of peerTerminalAssignments.entries()) {
         if (assigned === terminal) {
           peerTerminalAssignments.delete(peerId);
+          peerTerminalPids.delete(peerId);
         }
       }
       for (const [key, queue] of pendingGridTerminals.entries()) {
@@ -764,6 +780,14 @@ export function activate(extensionContext: vscode.ExtensionContext) {
       );
       if (confirm !== "Delete") return;
       try {
+        // Close and clean up the terminal associated with this peer, if any.
+        const assignedTerminal = peerTerminalAssignments.get(peerId);
+        if (assignedTerminal && isKnownTerminal(assignedTerminal)) {
+          assignedTerminal.dispose();
+        }
+        peerTerminalAssignments.delete(peerId);
+        peerTerminalPids.delete(peerId);
+
         await brokerClient.deletePeer(peerId);
         peerListProvider.refresh();
       } catch (e) {
@@ -951,17 +975,7 @@ AGENT_PEERS_AGENT_TYPE = "codex"
       controlProvider.refresh();
     }),
 
-    vscode.commands.registerCommand("agentPeers.openMessageInEditor", async (
-      item?: {
-        fromId?: string;
-        toId?: string;
-        type?: string;
-        text?: string;
-        sentAt?: string;
-        title?: string;
-        header?: string;
-      },
-    ) => {
+    vscode.commands.registerCommand("agentPeers.openMessageInEditor", async (item?: MessageViewItem) => {
       if (!item?.text) return;
       const header = item.header ?? [
         `# Message from ${item.fromId ?? "unknown"}`,
@@ -973,29 +987,16 @@ AGENT_PEERS_AGENT_TYPE = "codex"
         "---",
         "",
       ].filter(Boolean).join("\n");
-      const content = header + item.text;
-      try {
-        // Use virtual document provider (agent-peers-msg: scheme) instead of untitled document.
-        // This avoids the "Do you want to terminate running processes?" dialog that appears
-        // when VS Code tries to close a terminal editor tab to make room for an untitled doc.
-        // When a stable title is provided (e.g. "Recent Exchange: <peer>"), reuse the same URI
-        // so repeated clicks refresh the existing tab instead of opening a new one.
-        const uri = item.title
-          ? messageContentProvider.storeWithKey(item.title, content)
-          : messageContentProvider.store(content);
-        const doc = await vscode.workspace.openTextDocument(uri);
-        // If the document is already visible in any editor column, focus it there.
-        const existing = vscode.window.visibleTextEditors.find(
-          (e) => e.document.uri.toString() === uri.toString(),
-        );
-        if (existing) {
-          await vscode.window.showTextDocument(existing.document, { viewColumn: existing.viewColumn, preserveFocus: false });
-        } else {
-          await vscode.window.showTextDocument(doc, { preview: true, viewColumn: vscode.ViewColumn.Beside });
-        }
-      } catch (e) {
-        vscode.window.showErrorMessage(`Failed to open document: ${e}`);
-      }
+      await messageDetailProvider.show({
+        title: item.title ?? "Message Detail",
+        header,
+        text: item.text,
+      });
+    }),
+
+    vscode.commands.registerCommand("agentPeers.showRepoMemoryDetail", async (item?: MarkdownViewItem) => {
+      if (!item?.text) return;
+      await repoMemoryDetailProvider.show(item);
     }),
 
     vscode.commands.registerCommand("agentPeers.deleteMessage", async (item?: { messageId?: number; peerId?: string }) => {
@@ -1037,8 +1038,6 @@ AGENT_PEERS_AGENT_TYPE = "codex"
     }),
 
     vscode.commands.registerCommand("agentPeers.openTerminalGrid", () => openTerminalGrid(undefined)),
-    vscode.commands.registerCommand("agentPeers.openClaudeGrid", () => openTerminalGrid("claude")),
-    vscode.commands.registerCommand("agentPeers.openCodexGrid", () => openTerminalGrid("codex")),
 
   );
 

@@ -46,7 +46,7 @@ export class PeerListProvider implements vscode.TreeDataProvider<PeerItem> {
           item.messageId = m.id;
           item.command = {
             command: "agentPeers.openMessageInEditor",
-            title: "Open in Editor",
+            title: "Open Message Detail",
             arguments: [{ ...m, title: `Message ${m.id}: ${m.fromId}` }],
           };
           return item;
@@ -173,8 +173,8 @@ export class PeerListProvider implements vscode.TreeDataProvider<PeerItem> {
             `By: ${m.sourcePeerId ?? "unknown"} · ${m.updatedAt}`,
           );
           item.command = {
-            command: "agentPeers.openMessageInEditor",
-            title: "Open in Editor",
+            command: "agentPeers.showRepoMemoryDetail",
+            title: "Show Repo Memory Detail",
             arguments: [{
               title: `Memory #${m.id}: ${m.title}`,
               header: [

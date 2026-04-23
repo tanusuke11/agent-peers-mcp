@@ -87,19 +87,9 @@ export class ControlProvider implements vscode.TreeDataProvider<ControlItem> {
 
     // Terminal grid launchers
     items.push(ControlItem.action(
-      "Open Terminal Grid", "agentPeers.openTerminalGrid",
+      "Align Terminal Grid", "agentPeers.openTerminalGrid",
       "terminal", "charts.foreground",
       "Select grid size",
-    ));
-    items.push(ControlItem.action(
-      "Open Claude Grid", "agentPeers.openClaudeGrid",
-      "terminal", "charts.blue",
-      "Launch claude in each cell",
-    ));
-    items.push(ControlItem.action(
-      "Open Codex Grid", "agentPeers.openCodexGrid",
-      "terminal", "charts.green",
-      "Launch codex in each cell",
     ));
 
     return items;

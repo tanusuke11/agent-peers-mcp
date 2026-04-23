@@ -35,6 +35,16 @@
         {
           "id": "agentPeers.peerList",
           "name": "Peers"
+        },
+        {
+          "id": "agentPeers.messageDetail",
+          "name": "Message Detail",
+          "type": "webview"
+        },
+        {
+          "id": "agentPeers.repoMemoryDetail",
+          "name": "Repo Memory Detail",
+          "type": "webview"
         }
       ]
     },
@@ -125,7 +135,7 @@
       },
       {
         "command": "agentPeers.openMessageInEditor",
-        "title": "Open Message in Editor",
+        "title": "Open Message Detail",
         "icon": "$(go-to-file)",
         "category": "Agent Peers"
       },
