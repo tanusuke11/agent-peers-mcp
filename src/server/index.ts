@@ -20,6 +20,7 @@
  */
 
 import { spawn } from "child_process";
+import { createHash } from "crypto";
 import fs from "fs";
 import os from "os";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -164,6 +165,17 @@ function getParentPid(pid: number): number {
   } catch { return 0; }
 }
 
+function getProcessTty(pid: number): string | null {
+  try {
+    if (process.platform === "linux" || process.platform === "darwin") {
+      const { execSync } = require("child_process") as typeof import("child_process");
+      const tty = execSync(`ps -o tty= -p ${pid}`, { encoding: "utf8", timeout: 3000 }).trim();
+      return tty && tty !== "?" ? tty : null;
+    }
+    return null;
+  } catch { return null; }
+}
+
 /**
  * Walk up the process tree to find the CLI session (Claude Code / Codex) PID.
  * This is the long-lived process whose liveness indicates the session is active.
@@ -220,13 +232,12 @@ function resolveStableTty(owner: number): string | null {
 /** Cached owner PID — resolved once at startup */
 let ownerPid = 0;
 
-function looksLikeExtensionOwner(cmdLine: string): boolean {
-  const cmd = cmdLine.toLowerCase();
+function looksLikeExtensionOwner(cmdLine: string, owner: number): boolean {
+  const lower = cmdLine.toLowerCase();
+  if (getProcessTty(owner)) return false;
   return (
-    cmd.includes("/.vscode/extensions/") ||
-    cmd.includes("\\.vscode\\extensions\\") ||
-    cmd.includes("openai.chatgpt-") ||
-    cmd.includes("anthropic.claude-code-")
+    lower.includes("anthropic.claude-code")
+    || (lower.includes("resources/native-binary/claude") && lower.includes("--input-format stream-json"))
   );
 }
 
@@ -234,16 +245,37 @@ function resolvePeerSource(owner: number): PeerSource {
   const override = process.env.AGENT_PEERS_SOURCE;
   if (override === "extension" || override === "terminal") return override;
 
-  // True extension-host launches are extension peers.
-  if (process.env.ELECTRON_RUN_AS_NODE) return "extension";
-
-  // VSCode integrated terminals also set VSCODE_PID, so don't rely on it alone.
-  // Instead, inspect the owner process command line for extension binary paths.
-  const ownerArgs = getProcessArgs(owner);
-  const ownerCmd = ownerArgs?.join(" ") ?? "";
-  if (ownerCmd && looksLikeExtensionOwner(ownerCmd)) return "extension";
+  const cmdArgs = getProcessArgs(owner);
+  if (cmdArgs && looksLikeExtensionOwner(cmdArgs.join(" "), owner)) {
+    return "extension";
+  }
 
   return "terminal";
+}
+
+function getWorkspacePreferredId(agentType: AgentType, cwd: string, gitRoot: string | null): string {
+  const workspaceKey = gitRoot ?? cwd;
+  const wsHash = createHash("sha1").update(workspaceKey).digest("hex").slice(0, 8);
+  return `ext-${agentType}-${wsHash}`;
+}
+
+async function cleanupMisclassifiedExtensionPeers(preferredId: string): Promise<void> {
+  try {
+    const peers = await brokerFetch<Peer[]>("/list-peers", {
+      scope: "repo",
+      cwd: myCwd,
+      gitRoot: myGitRoot,
+    });
+    for (const peer of peers) {
+      if (peer.id === preferredId) continue;
+      if (peer.agentType !== AGENT_TYPE) continue;
+      if (peer.source !== "terminal") continue;
+      if (peer.terminalId || peer.extHostId) continue;
+      const cmdArgs = peer.pid > 0 ? getProcessArgs(peer.pid) : null;
+      if (!cmdArgs || !looksLikeExtensionOwner(cmdArgs.join(" "), peer.pid)) continue;
+      await brokerFetch("/delete-peer", { id: peer.id }).catch(() => {});
+    }
+  } catch { /* best effort cleanup */ }
 }
 
 /**
@@ -884,11 +916,11 @@ Available tools:
 - set_summary: Set a brief summary of what you're working on
 - check_messages: Manually check for new messages
 - check_conflicts: Check if planned work conflicts with other agents before starting
-- save_memory: Save a decision, learning, or insight to the shared repo memory
-- search_memory: Search repo memory for past decisions, conventions, and learnings
+- save_memory: Save a task record, issue, or architecture note to the shared repo memory
+- search_memory: Search repo memory for past architecture decisions, known issues, and task records
 - list_memories: List recent entries from the shared repo memory
 
-When you start, proactively call share_context to publish your current state. This helps other agents understand what you're working on. Before starting a new task, use check_conflicts to verify no other agents are working on the same files. When you make important decisions or discover conventions, save them with save_memory so future agents benefit.`,
+When you start, proactively call share_context to publish your current state. This helps other agents understand what you're working on. Before starting a new task, use check_conflicts to verify no other agents are working on the same files. When you make important architectural decisions, discover open issues, or finish significant tasks, save them with save_memory so future agents benefit.`,
   }
 );
 
@@ -1341,9 +1373,11 @@ async function registerWithBroker(): Promise<void> {
   const source = mySource;
   // Let the broker decide: claim a sleeping peer of the same kind, or create a new one.
   // Register with the owner (CLI session) PID so liveness checks target the long-lived process.
-  const terminalId = process.env.AGENT_PEERS_TERMINAL_ID || null;
+  const terminalId = source === "terminal" ? process.env.AGENT_PEERS_TERMINAL_ID || null : null;
   const extHostId = process.env.AGENT_PEERS_EXT_HOST || null;
+  const preferredId = source === "extension" ? getWorkspacePreferredId(AGENT_TYPE, myCwd, myGitRoot) : undefined;
   const reg = await brokerFetch<RegisterResponse>("/register", {
+    preferredId,
     agentType: AGENT_TYPE,
     source,
     pid: ownerPid,
@@ -1356,6 +1390,10 @@ async function registerWithBroker(): Promise<void> {
   });
   myId = reg.id;
   log(`Registered as peer ${myId}`);
+
+  if (source === "extension" && preferredId) {
+    await cleanupMisclassifiedExtensionPeers(preferredId);
+  }
 
   // Try to restore session title immediately after (re-)registration
   if (AGENT_TYPE === "claude-code") {

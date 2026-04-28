@@ -8,11 +8,14 @@ import type {
   Peer,
   Message,
   MessageType,
+  AgentType,
   BrokerHealthResponse,
   RepoMemory,
   SearchMemoryResponse,
   ListMemoriesResponse,
   WsEvent,
+  ReservePeerRequest,
+  ReservePeerResponse,
 } from "../shared/types";
 import { findNodeBinary } from "../shared/process";
 
@@ -190,11 +193,20 @@ export class BrokerClient {
     }
   }
 
-  async registerPeer(agentType: string, pid: number, cwd: string, gitRoot: string | null, source: "terminal" | "extension" = "extension", opts?: { extHostId?: string; terminalId?: string }): Promise<{ id: string }> {
+  async reservePeer(terminalId: string, extHostId: string, agentType: AgentType): Promise<ReservePeerResponse> {
+    return await this.post<ReservePeerResponse>("/reserve-peer", {
+      terminalId,
+      extHostId,
+      agentType,
+    } satisfies ReservePeerRequest);
+  }
+
+  async registerPeer(agentType: string, pid: number, cwd: string, gitRoot: string | null, source: "terminal" | "extension" = "extension", opts?: { extHostId?: string; terminalId?: string; preferredId?: string }): Promise<{ id: string }> {
     const now = new Date().toISOString();
     return await this.post<{ id: string }>("/register", {
       agentType,
       source,
+      preferredId: opts?.preferredId ?? undefined,
       pid,
       cwd,
       gitRoot,

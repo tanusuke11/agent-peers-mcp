@@ -75,6 +75,11 @@ export interface AgentContext {
 
 // ─── Peer ──────────────────────────────────────────────────────
 
+/** Lifecycle status of a terminal-bound peer.
+ *  pending = terminal exists but CLI not yet running (or CLI just exited).
+ *  active  = CLI connected via MCP. */
+export type PeerStatus = "pending" | "active";
+
 export interface Peer {
   id: PeerId;
   /** Type of AI agent */
@@ -97,6 +102,8 @@ export interface Peer {
    *  (or that registered itself as the extension peer). Lets each extension host
    *  ignore peers that belong to other windows. */
   extHostId?: string | null;
+  /** Lifecycle status: pending = terminal exists, CLI not running; active = CLI connected */
+  status: PeerStatus;
   /** Structured context shared by this peer */
   context: AgentContext;
   /** When the peer first registered */
@@ -212,6 +219,20 @@ export interface PollMessagesResponse {
   messages: Message[];
 }
 
+/** Reserve a terminal slot before spawning the terminal.
+ *  Extension calls this to get the animal name before createTerminal. */
+export interface ReservePeerRequest {
+  terminalId: string;
+  extHostId: string;
+  agentType: AgentType;
+}
+
+export interface ReservePeerResponse {
+  id: PeerId;
+  /** The animal noun assigned as the peer id (e.g. "goat") */
+  name: string;
+}
+
 export interface BrokerHealthResponse {
   status: "ok";
   pid: number;
@@ -225,8 +246,9 @@ export interface BrokerHealthResponse {
 
 export type WsEventType =
   | "message"         // new message received
-  | "peer-joined"     // a peer joined the network
-  | "peer-left"       // a peer left the network
+  | "peer-joined"     // a peer joined the network (CLI connected to reserved slot)
+  | "peer-left"       // a peer left the network (terminal closed)
+  | "peer-updated"    // a peer changed status (pending↔active) without joining/leaving
   | "context-updated" // a peer updated their context
   | "wake"            // wake up signal to deliver pending messages
   | "memory-added"    // a new repo memory was saved
@@ -251,6 +273,11 @@ export interface WsPeerJoinedEvent extends WsEvent {
 export interface WsPeerLeftEvent extends WsEvent {
   type: "peer-left";
   data: { id: PeerId };
+}
+
+export interface WsPeerUpdatedEvent extends WsEvent {
+  type: "peer-updated";
+  data: Peer;
 }
 
 export interface WsContextUpdatedEvent extends WsEvent {

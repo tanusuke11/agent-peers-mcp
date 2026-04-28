@@ -80,9 +80,11 @@ export class PeerListProvider implements vscode.TreeDataProvider<PeerItem> {
       const header = PeerItem.projectHeader(group.label, group.peers.length, groupKey);
       const peerItems = group.peers
         .map((p) => {
+          const isExtPeer = p.source === "extension";
           const displayType = agentDisplayName(p.agentType);
-          const tag = sourceTag(p.source);
-          const label = `${agentEmoji(p.agentType)} ${displayType} (${animalEmoji(p.id)}${p.id})${tag}`;
+          const label = isExtPeer
+            ? `${agentEmoji(p.agentType)} ${displayType} [ext]`
+            : `${agentEmoji(p.agentType)} ${displayType} (${animalEmoji(p.id)}${p.id})${sourceTag(p.source)}`;
           const description = formatPeerDescription(p) || undefined;
           return new PeerItem(label, p.id, "peer", p, undefined, undefined, description);
         })
@@ -320,12 +322,14 @@ class PeerItem extends vscode.TreeItem {
       const description = displayDescription;
 
       if (description) this.description = description;
-      this.contextValue = "peer";
+      this.contextValue = peer.source === "extension" ? "extensionPeer" : "peer";
       const hasInformativeSummary = isInformativeSummary(summary, peer);
       const hasConversationCue = !!preferredConversationCue(peer);
       const recentlyActive = isRecentlyActive(peer, 2 * 60_000);
       const isWorking = !!task || hasInformativeSummary || hasConversationCue || recentlyActive;
-      if (isWorking) {
+      if (peer.status === "pending") {
+        this.iconPath = new vscode.ThemeIcon("circle-outline", new vscode.ThemeColor("disabledForeground"));
+      } else if (isWorking) {
         this.iconPath = new vscode.ThemeIcon("sync~spin", agentColor(peer.agentType));
       } else {
         this.iconPath = new vscode.ThemeIcon("circle-filled", agentColor(peer.agentType));
@@ -349,7 +353,7 @@ class PeerItem extends vscode.TreeItem {
   private buildTooltip(p: Peer): string {
     const parts = [
       `**${p.agentType}** — \`${p.id}\``,
-      `- Status: Active`,
+      `- Status: ${p.status === "pending" ? "Pending (CLI not running)" : "Active"}`,
       `- Source: ${p.source === "extension" ? "IDE extension" : "Terminal (MCP)"}`,
       `- CWD: \`${p.cwd}\``,
     ];

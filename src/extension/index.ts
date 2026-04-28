@@ -15,7 +15,7 @@ import { DetailPanelProvider } from "./views/detail-panel";
 import { MemoryProvider } from "./views/memory";
 import type { MarkdownViewItem } from "./views/webview-content";
 import { forceKillProcess, findNodeBinary } from "../shared/process";
-import type { Peer } from "../shared/types";
+import type { Peer, AgentType } from "../shared/types";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
@@ -53,10 +53,6 @@ const terminalIdsByTerminal = new WeakMap<vscode.Terminal, string>();
 /** Maps peerId → terminalId, populated on peer-joined for our terminals. */
 const peerTerminalIdById = new Map<string, string>();
 
-const terminalPeerTitles = new WeakMap<vscode.Terminal, string>();
-/** Stores the original terminal name before peer renaming, so we can restore it on peer-left. */
-const terminalOriginalTitles = new WeakMap<vscode.Terminal, string>();
-
 function isKnownTerminal(terminal: vscode.Terminal): boolean {
   return vscode.window.terminals.includes(terminal);
 }
@@ -65,7 +61,7 @@ function hasActiveTerminalTab(group: vscode.TabGroup): boolean {
   return group.activeTab?.input instanceof vscode.TabInputTerminal;
 }
 
-function getTerminalAgentLabel(agentType: Peer["agentType"]): string {
+function getTerminalAgentLabel(agentType: AgentType): string {
   switch (agentType) {
     case "claude-code":
       return "claude";
@@ -76,64 +72,156 @@ function getTerminalAgentLabel(agentType: Peer["agentType"]): string {
   }
 }
 
-function getTerminalPeerTitle(peer: Pick<Peer, "agentType" | "id">): string {
-  return `${getTerminalAgentLabel(peer.agentType)} • ${peer.id}`;
-}
-
-async function focusTerminalAndRename(terminal: vscode.Terminal, name: string): Promise<void> {
-  const previouslyActive = vscode.window.activeTerminal;
-
-  terminal.show(false);
-  await vscode.commands.executeCommand("workbench.action.terminal.focus");
-  await new Promise((resolve) => setTimeout(resolve, 50));
-
-  await vscode.commands.executeCommand("workbench.action.terminal.renameWithArg", { name });
-
-  if (previouslyActive && previouslyActive !== terminal) {
-    previouslyActive.show(false);
-  }
-}
-
-async function renameTerminalWithPeerTitle(terminal: vscode.Terminal, title: string): Promise<void> {
-  if (terminal.name === title || terminalPeerTitles.get(terminal) === title) return;
-
-  // Save original title before first peer rename so we can restore on peer-left
-  if (!terminalOriginalTitles.has(terminal)) {
-    terminalOriginalTitles.set(terminal, terminal.name);
-  }
-
-  await focusTerminalAndRename(terminal, title);
-  terminalPeerTitles.set(terminal, title);
-}
-
-/** Reset a terminal's title back to its original name (before peer renaming). */
-async function resetTerminalTitle(terminal: vscode.Terminal): Promise<void> {
-  const original = terminalOriginalTitles.get(terminal);
-  // Fall back to a generic "Terminal" name if we never captured the original
-  const resetName = original || "Terminal";
-  await focusTerminalAndRename(terminal, resetName);
-  terminalOriginalTitles.delete(terminal);
-}
-
-/** Bind a newly-joined peer to its terminal tab (rename). Only acts on our own terminals. */
+/** Bind a newly-joined peer to its terminal maps. Only acts on our own terminals. */
 async function bindPeerToTerminal(peer: Peer): Promise<void> {
   if (peer.source !== "terminal") return;
-  if (peer.extHostId !== extHostId) return;
-  if (!peer.terminalId) return;
-  const terminal = terminalsById.get(peer.terminalId);
-  if (!terminal || !isKnownTerminal(terminal)) return;
-  peerTerminalIdById.set(peer.id, peer.terminalId);
-  await renameTerminalWithPeerTitle(terminal, getTerminalPeerTitle(peer));
+
+  // Fast path: extension-spawned terminal (env-injected terminalId).
+  if (peer.extHostId === extHostId && peer.terminalId) {
+    peerTerminalIdById.set(peer.id, peer.terminalId);
+    // Rename terminal tab if it isn't already the expected "<agent> • <peer>" form.
+    // Note: we can't rely on `name.includes(peer.id)` alone — the reserved tab
+    // is initially named just the animal name (e.g. "swan"), which already
+    // contains peer.id but lacks the agent prefix.
+    const terminal = terminalsById.get(peer.terminalId);
+    const expectedName = `${getTerminalAgentLabel(peer.agentType)} • ${peer.id}`;
+    if (terminal && terminal.name !== expectedName) {
+      await renameTerminalForPeer(terminal, peer.agentType, peer.id);
+      await new Promise(r => setTimeout(r, 200));
+      return;
+    }
+    // If this extension host was reloaded, terminalsById may not contain the
+    // terminalId even though the running CLI still reports it. Fall through to
+    // PID ancestry binding so existing terminal editor tabs can be recovered.
+    if (terminal) return;
+  }
+
+  // Slow path: peer was launched outside this extension's createTerminal flow
+  // (e.g. user typed `claude` in a pre-existing terminal). Find the owning
+  // terminal by walking the process tree from peer.pid up to one of our shell PIDs.
+  if (!peer.pid || peer.pid <= 0) return;
+  const candidates = await Promise.all(
+    vscode.window.terminals.map(async t => ({ t, pid: await t.processId }))
+  );
+  const shellPids = new Map<number, vscode.Terminal>();
+  for (const c of candidates) {
+    if (c.pid) shellPids.set(c.pid, c.t);
+  }
+  let cur = peer.pid;
+  for (let i = 0; i < 12 && cur > 1; i++) {
+    const owner = shellPids.get(cur);
+    if (owner) {
+      const terminalId = peer.terminalId ?? terminalIdsByTerminal.get(owner) ?? randomUUID();
+      reservedTerminals.add(owner);
+      terminalsById.set(terminalId, owner);
+      terminalIdsByTerminal.set(owner, terminalId);
+      peerTerminalIdById.set(peer.id, terminalId);
+      const expectedName = `${getTerminalAgentLabel(peer.agentType)} • ${peer.id}`;
+      if (owner.name !== expectedName) {
+        await renameTerminalForPeer(owner, peer.agentType, peer.id);
+        await new Promise(r => setTimeout(r, 200));
+      }
+      return;
+    }
+    try {
+      if (process.platform === "linux") {
+        const st = fs.readFileSync(`/proc/${cur}/status`, "utf8");
+        const m = st.match(/PPid:\s*(\d+)/);
+        cur = m ? parseInt(m[1]!, 10) : 0;
+      } else {
+        break;
+      }
+    } catch { break; }
+  }
 }
 
-/** Unbind a peer from its terminal tab (reset title). Only acts on our own terminals. */
-async function unbindPeerFromTerminal(peer: Pick<Peer, "terminalId" | "extHostId">): Promise<void> {
-  if (peer.extHostId !== extHostId) return;
-  if (!peer.terminalId) return;
-  const terminal = terminalsById.get(peer.terminalId);
-  if (terminal && isKnownTerminal(terminal)) {
-    terminalPeerTitles.delete(terminal);
-    await resetTerminalTitle(terminal);
+/** Tracks terminals already reserved (to avoid re-processing). */
+const reservedTerminals = new WeakSet<vscode.Terminal>();
+
+/**
+ * Clean up stale peers from previous extension host sessions.
+ * Deletes peers whose extHostId doesn't match the current one
+ * and whose terminals no longer exist in this window.
+ */
+async function cleanupStalePeers(): Promise<void> {
+  try {
+    const peers = await brokerClient.listPeers("machine");
+    for (const peer of peers) {
+      if (peer.source === "extension") continue; // ext peers re-register themselves
+      if (!peer.extHostId) continue; // not managed by any extension host
+      if (peer.extHostId === extHostId) continue; // belongs to us
+      // Peer belongs to a previous extension host — check if terminal still exists
+      if (peer.terminalId && terminalsById.has(peer.terminalId)) continue;
+      await brokerClient.deletePeer(peer.id).catch(() => {});
+    }
+  } catch { /* broker may not be ready yet */ }
+}
+
+/**
+ * Reconcile terminal tab names with their peer IDs.
+ * After (re)connecting to the broker, some terminals may show just "claude"
+ * because the rename didn't happen (e.g. broker wasn't running when the
+ * terminal was created, or the extension was reloaded).
+ */
+async function reconcileTerminalNames(): Promise<void> {
+  try {
+    const peers = await brokerClient.listPeers("machine");
+    for (const peer of peers) {
+      if (peer.source !== "terminal" || peer.status !== "active") continue;
+      await bindPeerToTerminal(peer);
+      const terminalId = peer.terminalId ?? peerTerminalIdById.get(peer.id);
+      if (!terminalId) continue;
+      const terminal = terminalsById.get(terminalId);
+      if (!terminal || !isKnownTerminal(terminal)) continue;
+      // Rename if tab title isn't already in the expected "<agent> • <peer>" form
+      const expectedName = `${getTerminalAgentLabel(peer.agentType)} • ${peer.id}`;
+      if (terminal.name !== expectedName) {
+        await renameTerminalForPeer(terminal, peer.agentType, peer.id);
+        // Wait between renames to let VS Code settle focus state
+        await new Promise(r => setTimeout(r, 200));
+      }
+    }
+  } catch { /* broker may not be ready yet */ }
+}
+
+/** Detect agent type from a command line. Returns null if not an agent CLI. */
+function detectAgentFromCommand(cmd: string): AgentType | null {
+  const trimmed = cmd.trim().toLowerCase();
+  // Match the command word (first token, possibly with path or options after).
+  // Examples: "claude", "claude --resume foo", "/usr/bin/claude", "codex", "codex chat"
+  const firstWord = trimmed.split(/\s+/)[0] ?? "";
+  const basename = firstWord.split("/").pop() ?? firstWord;
+  if (basename === "claude") return "claude-code";
+  if (basename === "codex") return "codex";
+  return null;
+}
+
+/** Rename a terminal tab to include the peer's animal name.
+ *  Uses VSCode's internal rename command (requires briefly focusing the terminal).
+ *  Retries once if the rename didn't take effect. */
+async function renameTerminalForPeer(terminal: vscode.Terminal, agentType: AgentType, peerName: string): Promise<void> {
+  if (!isKnownTerminal(terminal)) return;
+  const newName = `${getTerminalAgentLabel(agentType)} • ${peerName}`;
+  const previouslyActive = vscode.window.activeTerminal;
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    // Focus the target terminal and wait for VS Code to settle
+    terminal.show(false);
+    await new Promise(r => setTimeout(r, 100));
+    // Verify the correct terminal got focus before renaming
+    if (vscode.window.activeTerminal !== terminal) {
+      terminal.show(true); // force focus
+      await new Promise(r => setTimeout(r, 150));
+    }
+    await vscode.commands.executeCommand("workbench.action.terminal.renameWithArg", { name: newName });
+    await new Promise(r => setTimeout(r, 100));
+    // Check if rename succeeded
+    if (terminal.name.includes(peerName)) break;
+  }
+
+  // Restore previously active terminal
+  if (previouslyActive && previouslyActive !== terminal && isKnownTerminal(previouslyActive)) {
+    previouslyActive.show(false);
   }
 }
 
@@ -265,7 +353,21 @@ async function openTerminalGrid(command: string | undefined): Promise<void> {
     const viewColumn = group.viewColumn;
 
     const terminalId = randomUUID();
+    // Reserve a peer slot first so the tab title is set at creation time.
+    // We don't yet know whether the user will run claude/codex/something else,
+    // so the initial title is just the animal name (e.g. "swan"). Once the CLI
+    // registers, bindPeerToTerminal will rename it to "claude • swan" or
+    // "codex • swan" based on the actual agent type.
+    let terminalName: string | undefined;
+    let reservedPeerId: string | null = null;
+    try {
+      const reservation = await brokerClient.reservePeer(terminalId, extHostId, "claude-code");
+      reservedPeerId = reservation.id;
+      terminalName = reservation.name;
+    } catch { /* broker not running — create unnamed terminal, CLI will register normally */ }
+
     const terminal = vscode.window.createTerminal({
+      name: terminalName,
       location: { viewColumn } as vscode.TerminalEditorLocationOptions,
       env: {
         AGENT_PEERS_TERMINAL_ID: terminalId,
@@ -274,6 +376,9 @@ async function openTerminalGrid(command: string | undefined): Promise<void> {
     });
     terminalsById.set(terminalId, terminal);
     terminalIdsByTerminal.set(terminal, terminalId);
+    if (reservedPeerId) {
+      peerTerminalIdById.set(reservedPeerId, terminalId);
+    }
     terminal.show(false);
 
     // Give VS Code a moment to actually open the terminal editor in the group
@@ -386,13 +491,12 @@ export function activate(extensionContext: vscode.ExtensionContext) {
   });
   brokerClient.on("peer-left", (data) => {
     const { id } = data as { id: string };
-    const terminalId = peerTerminalIdById.get(id);
-    if (terminalId) {
-      void unbindPeerFromTerminal({ terminalId, extHostId });
-      peerTerminalIdById.delete(id);
-    }
+    peerTerminalIdById.delete(id);
     peerListProvider.refresh();
     memoryProvider.refresh();
+  });
+  brokerClient.on("peer-updated", () => {
+    peerListProvider.refresh();
   });
   brokerClient.on("context-updated", () => {
     peerListProvider.refresh();
@@ -413,14 +517,17 @@ export function activate(extensionContext: vscode.ExtensionContext) {
    */
   async function deliverToTerminal(terminal: vscode.Terminal, text: string, agentType: string) {
     if (agentType === "claude-code") {
-      // Raw-mode TUI: send ESC first to exit any modal state (e.g. "accept edits on"),
-      // then send text without trailing LF.
-      terminal.sendText("\x1b", false);
+      // Claude Code uses raw-mode Ink TUI. sendText with addNewLine=true sends \n
+      // which raw-mode does NOT treat as Enter. We send \r (carriage return) separately.
+      //
+      // Do NOT send ESC before the text: ESC cancels any pending modal state but also
+      // clears the input buffer in Ink, so the pasted text gets dropped.
+      //
+      // Flow: paste text (no newline) → wait for bracketed-paste to finish → send \r.
+      // The 150ms delay is needed because multi-line pastes in bracketed-paste mode
+      // are processed asynchronously; a synchronous \r lands inside the bracket.
       terminal.sendText(text, false);
-      // Delay before CR so that bracketed-paste mode finishes processing the
-      // multi-line text. Without this, the CR lands inside the paste bracket
-      // and the terminal shows "[Pasted text]" without submitting.
-      await new Promise(r => setTimeout(r, 80));
+      await new Promise(r => setTimeout(r, 150));
       terminal.sendText("\r", false);
     } else {
       terminal.sendText(text);
@@ -481,8 +588,33 @@ export function activate(extensionContext: vscode.ExtensionContext) {
 
     const autoDeliver = vscode.workspace.getConfiguration("agentPeers").get<boolean>("autoDeliveryMessage", true);
 
-    // Resolve terminal for the target peer via terminalId map
-    const resolvedTerminal = peer?.terminalId ? terminalsById.get(peer.terminalId) ?? null : null;
+    // Resolve terminal: first via terminalId map (extension-spawned), then by PID ancestor (manual launch)
+    let resolvedTerminal: vscode.Terminal | null = peer?.terminalId
+      ? terminalsById.get(peer.terminalId) ?? null
+      : null;
+
+    if (!resolvedTerminal && peer?.pid && peer.pid > 0) {
+      // Fallback for manually-launched peers: find terminal whose shell is an ancestor of peer.pid
+      const candidates = await Promise.all(
+        vscode.window.terminals.map(async t => ({ t, pid: await t.processId }))
+      );
+      // Walk up the process tree from peer.pid, looking for any terminal's shell pid
+      const shellPids = new Set(candidates.map(c => c.pid).filter((p): p is number => !!p));
+      let cur = peer.pid;
+      for (let i = 0; i < 12 && cur > 1; i++) {
+        if (shellPids.has(cur)) {
+          resolvedTerminal = candidates.find(c => c.pid === cur)?.t ?? null;
+          break;
+        }
+        try {
+          if (process.platform === "linux") {
+            const st = fs.readFileSync(`/proc/${cur}/status`, "utf8");
+            const m = st.match(/PPid:\s*(\d+)/);
+            cur = m ? parseInt(m[1]!, 10) : 0;
+          } else { break; }
+        } catch { break; }
+      }
+    }
 
     if (!autoDeliver) {
       const typeLabel = pending.type === "task-handoff" ? "Task handoff" : pending.type === "context-request" ? "Context request" : "Message";
@@ -549,6 +681,11 @@ export function activate(extensionContext: vscode.ExtensionContext) {
       });
     }
   });
+
+  // Note: terminal naming for non-grid terminals happens reactively when a peer
+  // joins and `bindPeerToTerminal` walks the PID ancestry to find the owning
+  // terminal. This works regardless of how the terminal was opened (split, +,
+  // existing) because the env-based fast path is bypassed when the env is absent.
 
   // Register commands
   extensionContext.subscriptions.push(
@@ -965,10 +1102,16 @@ AGENT_PEERS_AGENT_TYPE = "codex"
   // React to WebSocket connection state changes
   brokerClient.on("broker-connected", () => {
     setBrokerConnected(true);
-    // Register the extension itself as a peer (source="extension", no terminalId)
+    // First recover existing terminal bindings, then remove truly stale peers.
+    void reconcileTerminalNames().then(() => cleanupStalePeers());
+    // Register the extension itself as a peer (source="extension", no terminalId).
+    // preferredId is per-workspace so each VSCode window gets a stable, distinct ext peer.
     const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
     void brokerClient.getGitRoot().then((gitRoot) => {
-      void brokerClient.registerPeer("claude-code", process.pid, cwd, gitRoot, "extension", { extHostId });
+      const workspaceKey = gitRoot ?? cwd;
+      const wsHash = require("crypto").createHash("sha1").update(workspaceKey).digest("hex").slice(0, 8);
+      const preferredId = `ext-claude-code-${wsHash}`;
+      void brokerClient.registerPeer("claude-code", process.pid, cwd, gitRoot, "extension", { extHostId, preferredId });
     });
   });
   brokerClient.on("broker-disconnected", () => {

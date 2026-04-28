@@ -52,8 +52,12 @@ import type {
   WsMessageEvent,
   WsPeerJoinedEvent,
   WsPeerLeftEvent,
+  WsPeerUpdatedEvent,
   WsContextUpdatedEvent,
   WsMemoryAddedEvent,
+  ReservePeerRequest,
+  ReservePeerResponse,
+  PeerStatus,
 } from "../shared/types.ts";
 import {
   DEFAULT_BROKER_PORT,
@@ -124,9 +128,14 @@ try {
 try {
   db.exec("ALTER TABLE peers ADD COLUMN ext_host_id TEXT");
 } catch { /* column already exists */ }
+// Migration: add status column
+try {
+  db.exec("ALTER TABLE peers ADD COLUMN status TEXT NOT NULL DEFAULT 'active'");
+} catch { /* column already exists */ }
 
 // Wipe all stale sleeping peers — sleep state is abolished
 db.exec("DELETE FROM peers WHERE sleep = 1");
+db.exec("UPDATE peers SET status = 'active' WHERE status IS NULL OR status = ''")
 
 // Legacy compatibility migration: keep the old read column if it exists in user databases
 try {
@@ -220,7 +229,7 @@ try {
 /** Anonymous clients (e.g. VSCode extension) */
 const wsClients = new Set<WebSocket>();
 /** Peer-identified clients (MCP servers that sent {"type":"identify","id":"..."}) */
-const wsPeerClients = new Map<string, WebSocket>();
+const wsPeerClients = new Map<string, Set<WebSocket>>();
 
 function broadcast(event: WsEvent) {
   const json = JSON.stringify(event);
@@ -229,34 +238,50 @@ function broadcast(event: WsEvent) {
       try { ws.send(json); } catch { wsClients.delete(ws); }
     }
   }
-  for (const [id, ws] of wsPeerClients) {
-    if (ws.readyState === WebSocket.OPEN) {
-      try { ws.send(json); } catch { wsPeerClients.delete(id); }
+  for (const [id, wsSet] of wsPeerClients) {
+    for (const ws of wsSet) {
+      if (ws.readyState === WebSocket.OPEN) {
+        try { ws.send(json); } catch { wsSet.delete(ws); }
+      }
     }
+    if (wsSet.size === 0) wsPeerClients.delete(id);
   }
 }
 
 /** Send an event to a specific peer (if connected via WS) */
 function sendToPeer(peerId: string, event: WsEvent): boolean {
-  const ws = wsPeerClients.get(peerId);
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    try { ws.send(JSON.stringify(event)); return true; } catch { wsPeerClients.delete(peerId); }
+  const wsSet = wsPeerClients.get(peerId);
+  if (!wsSet || wsSet.size === 0) return false;
+  const json = JSON.stringify(event);
+  let sent = false;
+  for (const ws of wsSet) {
+    if (ws.readyState === WebSocket.OPEN) {
+      try { ws.send(json); sent = true; } catch { wsSet.delete(ws); }
+    }
   }
-  return false;
+  return sent;
 }
 
 // ─── Stale peer cleanup ────────────────────────────────────────
 
 function cleanStalePeers() {
-  const peers = db.prepare("SELECT id, pid, last_seen FROM peers").all() as { id: string; pid: number; last_seen: string }[];
+  const peers = db.prepare("SELECT id, pid, last_seen, status FROM peers").all() as { id: string; pid: number; last_seen: string; status: string }[];
   const now = Date.now();
+  const fiveMin = 5 * 60 * 1000;
   for (const peer of peers) {
     const staleByTime = now - new Date(peer.last_seen).getTime() > PEER_TIMEOUT_MS;
+    const staleByFiveMin = now - new Date(peer.last_seen).getTime() > fiveMin;
     let deadByPid = false;
     if (peer.pid !== process.pid && peer.pid !== 0) {
       try { process.kill(peer.pid, 0); } catch { deadByPid = true; }
     }
-    if (staleByTime || deadByPid) removePeer(peer.id);
+    if (peer.status === "pending") {
+      // Pending peers: clean up if last_seen > 5 min AND pid=0
+      if (staleByFiveMin && peer.pid === 0) removePeer(peer.id);
+    } else {
+      // Active peers: clean up if stale by time AND dead pid
+      if (staleByTime && deadByPid) removePeer(peer.id);
+    }
   }
 }
 
@@ -266,8 +291,8 @@ function cleanStalePeers() {
 
 const insertPeer = db.prepare(`
   INSERT INTO peers (id, agent_type, source, pid, cwd, git_root, tty,
-                     terminal_id, ext_host_id, context_json, registered_at, last_seen)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     terminal_id, ext_host_id, context_json, registered_at, last_seen, status)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const updateLastSeen = db.prepare(`UPDATE peers SET last_seen = ? WHERE id = ?`);
@@ -347,6 +372,7 @@ interface RawPeerRow {
   registered_at: string;
   last_seen: string;
   sleep: number;
+  status: string;
 }
 
 const countAllMessages = db.prepare(`SELECT COUNT(*) as cnt FROM messages WHERE to_id = ?`);
@@ -369,6 +395,7 @@ function rowToPeer(row: RawPeerRow): Peer {
     terminalId: row.terminal_id,
     extHostId: row.ext_host_id,
     source: (row.source ?? "terminal") as Peer["source"],
+    status: (row.status ?? "active") as PeerStatus,
     context: JSON.parse(row.context_json) as AgentContext,
     registeredAt: row.registered_at,
     lastSeen: row.last_seen,
@@ -453,25 +480,70 @@ function clearSessionContext(peer: Peer): void {
 function handleRegister(body: RegisterRequest): RegisterResponse {
   const now = new Date().toISOString();
   const source = body.source ?? "terminal";
+  const terminalId = body.terminalId ?? null;
 
-  db.exec("BEGIN");
   let id: string;
-  try {
-    const existingIds = new Set((selectAllPeers.all() as unknown as RawPeerRow[]).map(r => r.id));
-    if (body.preferredId && !existingIds.has(body.preferredId)) {
-      id = body.preferredId;
-    } else {
-      id = generateId(existingIds);
-    }
-    insertPeer.run(id, body.agentType, source, body.pid, body.cwd, body.gitRoot,
-                   body.tty, body.terminalId ?? null, body.extHostId ?? null,
-                   JSON.stringify(body.context), now, now);
-    db.exec("COMMIT");
-  } catch (e) { db.exec("ROLLBACK"); throw e; }
+
+  // If terminalId matches a pending reservation → activate it
+  const pending = terminalId
+    ? db.prepare("SELECT * FROM peers WHERE terminal_id = ? AND status = 'pending' LIMIT 1")
+        .get(terminalId) as RawPeerRow | undefined
+    : undefined;
+
+  if (pending) {
+    db.prepare(`UPDATE peers SET pid=?, cwd=?, git_root=?, tty=?, source=?,
+                agent_type=?, context_json=?, last_seen=?, status='active' WHERE id=?`)
+      .run(body.pid, body.cwd, body.gitRoot, body.tty, source,
+           body.agentType, JSON.stringify(body.context), now, pending.id);
+    id = pending.id;
+  } else {
+    // Manual launch (no terminalId) or extension peer — create or update peer
+    db.exec("BEGIN");
+    try {
+      const allRows = selectAllPeers.all() as unknown as RawPeerRow[];
+      const existingIds = new Set(allRows.map(r => r.id));
+
+      if (body.preferredId && existingIds.has(body.preferredId)) {
+        // preferredId already exists → UPDATE in place (e.g. ext peer re-registering)
+        db.prepare(`UPDATE peers SET pid=?, cwd=?, git_root=?, tty=?, source=?, terminal_id=?,
+                    agent_type=?, ext_host_id=?, context_json=?, last_seen=?, status='active'
+                    WHERE id=?`)
+          .run(body.pid, body.cwd, body.gitRoot, body.tty, source,
+               terminalId, body.agentType, body.extHostId ?? null,
+               JSON.stringify(body.context), now, body.preferredId);
+        id = body.preferredId;
+      } else {
+        id = body.preferredId && !existingIds.has(body.preferredId)
+          ? body.preferredId
+          : generateId(existingIds);
+        insertPeer.run(id, body.agentType, source, body.pid, body.cwd, body.gitRoot,
+                       body.tty, terminalId, body.extHostId ?? null,
+                       JSON.stringify(body.context), now, now, "active");
+      }
+      db.exec("COMMIT");
+    } catch (e) { db.exec("ROLLBACK"); throw e; }
+  }
 
   const peer = rowToPeer(selectPeerById.get(id) as unknown as RawPeerRow);
-  broadcast({ type: "peer-joined", data: peer, timestamp: now } satisfies WsPeerJoinedEvent);
+  // Re-registration of an existing preferredId → peer-updated (not peer-joined) to avoid sidebar duplication
+  if (body.preferredId && peer.id === body.preferredId) {
+    broadcast({ type: "peer-updated", data: peer, timestamp: now } satisfies WsPeerUpdatedEvent);
+  } else {
+    broadcast({ type: "peer-joined", data: peer, timestamp: now } satisfies WsPeerJoinedEvent);
+  }
   return { id };
+}
+
+function handleReservePeer(body: ReservePeerRequest): ReservePeerResponse {
+  const now = new Date().toISOString();
+  const existingIds = new Set((selectAllPeers.all() as unknown as RawPeerRow[]).map(r => r.id));
+  const id = generateId(existingIds);
+  insertPeer.run(id, body.agentType, "terminal", 0, "", null,
+                 null, body.terminalId, body.extHostId,
+                 JSON.stringify({ summary: "", activeFiles: [], git: null, updatedAt: now }),
+                 now, now, "pending");
+  // Do NOT broadcast peer-joined yet — CLI hasn't started
+  return { id, name: id };
 }
 
 function handleHeartbeat(body: HeartbeatRequest): { ok: boolean } {
@@ -629,6 +701,10 @@ function handleSendMessage(body: SendMessageRequest): SendMessageResponse {
   const target = selectPeerById.get(body.toId) as unknown as RawPeerRow | undefined;
   if (!target) {
     return { ok: false, error: `Peer ${body.toId} not found` };
+  }
+
+  if (target.status === "pending") {
+    return { ok: false, error: `Peer ${body.toId} is pending (CLI not running).` };
   }
 
   // Reject task-handoff to extension peers — they cannot autonomously execute tasks
@@ -1205,6 +1281,9 @@ async function handleRequest(req: Request): Promise<Response> {
 
     let result: unknown;
     switch (path) {
+      case "/reserve-peer":
+        result = handleReservePeer(body as ReservePeerRequest);
+        break;
       case "/register":
         result = handleRegister(body as RegisterRequest);
         break;
@@ -1361,7 +1440,11 @@ wss.on("connection", (ws) => {
         // Promote from anonymous to peer-identified
         wsClients.delete(ws);
         identifiedPeerId = msg.id;
-        wsPeerClients.set(msg.id, ws);
+        // Add to Set (extension may have multiple windows connecting with same id)
+        if (!wsPeerClients.has(msg.id)) {
+          wsPeerClients.set(msg.id, new Set());
+        }
+        wsPeerClients.get(msg.id)!.add(ws);
         // Update PID/source if changed on WS re-identify
         const row = selectPeerById.get(msg.id) as unknown as RawPeerRow | undefined;
         if (row) {
@@ -1381,17 +1464,36 @@ wss.on("connection", (ws) => {
   ws.on("close", () => {
     wsClients.delete(ws);
     if (identifiedPeerId) {
-      wsPeerClients.delete(identifiedPeerId);
-      // Remove peer if the owner process is dead
-      const row = selectPeerById.get(identifiedPeerId) as unknown as RawPeerRow | undefined;
-      let ownerAlive = false;
-      if (row && row.pid > 0) {
-        try { process.kill(row.pid, 0); ownerAlive = true; } catch { /* dead */ }
-      }
-      if (!ownerAlive) {
-        removePeer(identifiedPeerId);
-      } else {
-        log(`WebSocket disconnected for ${identifiedPeerId} but owner pid ${row!.pid} alive — keeping peer`);
+      const wsSet = wsPeerClients.get(identifiedPeerId);
+      if (wsSet) {
+        wsSet.delete(ws);
+        if (wsSet.size === 0) {
+          wsPeerClients.delete(identifiedPeerId);
+          // All WS connections for this peer are gone — decide what to do
+          const row = selectPeerById.get(identifiedPeerId) as unknown as RawPeerRow | undefined;
+          if (row) {
+            let ownerAlive = false;
+            if (row.pid > 0) {
+              try { process.kill(row.pid, 0); ownerAlive = true; } catch { /* dead */ }
+            }
+            if (row.terminal_id && !ownerAlive) {
+              // CLI exited but terminal still exists → go pending
+              const now = new Date().toISOString();
+              db.prepare("UPDATE peers SET status='pending', pid=0, last_seen=? WHERE id=?")
+                .run(now, identifiedPeerId);
+              const updatedRow = selectPeerById.get(identifiedPeerId) as unknown as RawPeerRow;
+              broadcast({
+                type: "peer-updated",
+                data: rowToPeer(updatedRow),
+                timestamp: now,
+              } satisfies WsPeerUpdatedEvent);
+              log(`Peer ${identifiedPeerId} went pending (CLI exited, terminal alive)`);
+            } else {
+              // No terminal_id (manual launch or extension) → hard remove
+              removePeer(identifiedPeerId);
+            }
+          }
+        }
       }
     }
     log(`WebSocket client disconnected (anonymous: ${wsClients.size}, peers: ${wsPeerClients.size})`);
@@ -1400,14 +1502,32 @@ wss.on("connection", (ws) => {
     log(`WebSocket client error: ${err.message}`);
     wsClients.delete(ws);
     if (identifiedPeerId) {
-      wsPeerClients.delete(identifiedPeerId);
-      const row = selectPeerById.get(identifiedPeerId) as unknown as RawPeerRow | undefined;
-      let ownerAlive = false;
-      if (row && row.pid > 0) {
-        try { process.kill(row.pid, 0); ownerAlive = true; } catch { /* dead */ }
-      }
-      if (!ownerAlive) {
-        removePeer(identifiedPeerId);
+      const wsSet = wsPeerClients.get(identifiedPeerId);
+      if (wsSet) {
+        wsSet.delete(ws);
+        if (wsSet.size === 0) {
+          wsPeerClients.delete(identifiedPeerId);
+          const row = selectPeerById.get(identifiedPeerId) as unknown as RawPeerRow | undefined;
+          if (row) {
+            let ownerAlive = false;
+            if (row.pid > 0) {
+              try { process.kill(row.pid, 0); ownerAlive = true; } catch { /* dead */ }
+            }
+            if (row.terminal_id && !ownerAlive) {
+              const now = new Date().toISOString();
+              db.prepare("UPDATE peers SET status='pending', pid=0, last_seen=? WHERE id=?")
+                .run(now, identifiedPeerId);
+              const updatedRow = selectPeerById.get(identifiedPeerId) as unknown as RawPeerRow;
+              broadcast({
+                type: "peer-updated",
+                data: rowToPeer(updatedRow),
+                timestamp: now,
+              } satisfies WsPeerUpdatedEvent);
+            } else {
+              removePeer(identifiedPeerId);
+            }
+          }
+        }
       }
     }
   });
