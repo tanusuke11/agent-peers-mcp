@@ -31,7 +31,6 @@ export class ContextProvider implements vscode.TreeDataProvider<ContextItem> {
     const peers = await this.client.listPeers("repo");
 
     const contextPeers = peers
-      .filter((p) => p.connected !== false)
       .filter((p) => isInformativeSummary(p.context.summary, p) || p.context.activeFiles?.length || p.context.git);
 
     const header = ContextItem.projectHeader(projectName, peers.length);

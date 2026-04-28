@@ -298,7 +298,70 @@ function findSessionFileUncached(): string | null {
       }
     }
 
-    // No fallback — return null rather than guessing.
+    // Fallback: match session file by owner PID start time.
+    // Unlike a naive "most recent file" heuristic (which caused every peer in
+    // the same repo to converge on the same file), this uses the unique owner
+    // PID start time so each peer maps to its own session.
+    return findSessionFileByPidTiming(candidates);
+  } catch { return null; }
+}
+
+/**
+ * Fallback session file finder: match by owner PID start time.
+ * Lists all .jsonl files in the project directory and picks the one
+ * whose first timestamp is closest to the owner process start time.
+ */
+function findSessionFileByPidTiming(projectBases: string[]): string | null {
+  const ownerStartMs = getProcessStartTimeMs(ownerPid);
+  if (!ownerStartMs) {
+    log("Session file fallback: could not determine owner PID start time");
+    return null;
+  }
+
+  for (const base of projectBases) {
+    const projectHash = base.replace(/[\\/]/g, "-");
+    const projectDir = path.join(os.homedir(), ".claude", "projects", projectHash);
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(projectDir, { withFileTypes: true });
+    } catch { continue; }
+
+    const jsonlFiles = entries
+      .filter(e => e.isFile() && e.name.endsWith(".jsonl"))
+      .map(e => {
+        const fullPath = path.join(projectDir, e.name);
+        const startMs = readFirstTimestamp(fullPath);
+        return { path: fullPath, startMs };
+      })
+      .filter((f): f is { path: string; startMs: number } => f.startMs !== null)
+      .map(f => ({ ...f, delta: Math.abs(f.startMs - ownerStartMs) }))
+      .sort((a, b) => a.delta - b.delta);
+
+    // Accept if the closest file started within 2 minutes of the owner process
+    const MAX_DELTA_MS = 2 * 60 * 1000;
+    if (jsonlFiles.length > 0 && jsonlFiles[0]!.delta < MAX_DELTA_MS) {
+      log(`Session file fallback: matched ${path.basename(jsonlFiles[0]!.path)} (delta: ${Math.round(jsonlFiles[0]!.delta / 1000)}s)`);
+      return jsonlFiles[0]!.path;
+    }
+  }
+
+  log("Session file fallback: no matching session file found by timing");
+  return null;
+}
+
+/** Read the first timestamp from a session JSONL file (used for PID-based matching). */
+function readFirstTimestamp(file: string): number | null {
+  try {
+    const head = readFileHead(file, 4096);
+    for (const line of head.split("\n").filter(Boolean).slice(0, 5)) {
+      try {
+        const obj = JSON.parse(line) as Record<string, unknown>;
+        if (typeof obj.timestamp === "string") {
+          const ts = Date.parse(obj.timestamp);
+          if (!Number.isNaN(ts)) return ts;
+        }
+      } catch { /* skip */ }
+    }
     return null;
   } catch { return null; }
 }
@@ -549,6 +612,8 @@ function findCodexSessionFileUncached(): string | null {
 }
 
 const EXCHANGE_MAX_CHARS = 200;
+/** Larger limit for memory extraction — patterns like "decided to" often appear deeper in responses */
+const EXTRACTION_MAX_CHARS = 1500;
 let cachedMaxContextLength = 30; // updated from broker health on each heartbeat
 
 /** Format a list of raw exchanges into a single markdown document. */
@@ -561,7 +626,7 @@ function buildRecentContextMarkdown(
 }
 
 /** Read recent human/assistant exchanges from the session JSONL and return as a single markdown document. */
-function getRecentExchanges(): string {
+function getRecentExchanges(maxCharsPerExchange = EXCHANGE_MAX_CHARS): string {
   if (AGENT_TYPE === "codex") {
     try {
       const file = findCodexSessionFile();
@@ -583,7 +648,7 @@ function getRecentExchanges(): string {
 
           exchanges.push({
             role: role === "user" ? "human" : "assistant",
-            text: text.length > EXCHANGE_MAX_CHARS ? text.slice(0, EXCHANGE_MAX_CHARS) + "…" : text,
+            text: text.length > maxCharsPerExchange ? text.slice(0, maxCharsPerExchange) + "…" : text,
             timestamp: typeof obj.timestamp === "string" ? obj.timestamp : new Date().toISOString(),
           });
         } catch { /* skip */ }
@@ -626,7 +691,7 @@ function getRecentExchanges(): string {
 
           exchanges.push({
             role,
-            text: text.length > EXCHANGE_MAX_CHARS ? text.slice(0, EXCHANGE_MAX_CHARS) + "…" : text,
+            text: text.length > maxCharsPerExchange ? text.slice(0, maxCharsPerExchange) + "…" : text,
             timestamp: obj.timestamp ?? new Date().toISOString(),
           });
         }
@@ -819,7 +884,7 @@ Available tools:
 - set_summary: Set a brief summary of what you're working on
 - check_messages: Manually check for new messages
 - check_conflicts: Check if planned work conflicts with other agents before starting
-- save_memory: Save a decision, learning, or convention to the shared repo memory
+- save_memory: Save a decision, learning, or insight to the shared repo memory
 - search_memory: Search repo memory for past decisions, conventions, and learnings
 - list_memories: List recent entries from the shared repo memory
 
@@ -1067,7 +1132,7 @@ mcp.registerTool("check_conflicts", {
     }
     if (hasAdvisories) {
       lines.push("");
-      lines.push("Relevant repo memory (decisions/conventions):");
+      lines.push("Relevant repo memory (architecture/issues):");
       for (const a of result.advisories!) {
         lines.push(`- [${a.category}] ${a.title}: ${a.content}`);
       }
@@ -1081,9 +1146,9 @@ mcp.registerTool("check_conflicts", {
 // ─── Repo Memory MCP Tools ──────────────────────────────────
 
 mcp.registerTool("save_memory", {
-  description: "Save a learning, decision, or insight to the shared repo memory. All peers in the same repo can search and retrieve these memories. Use this to record important decisions, bug fixes, architectural patterns, or conventions discovered during your work.",
+  description: "Save a memory to the shared repo memory. All peers in the same repo can search and retrieve these memories. Use 'task' to record what a peer did or is doing, 'issue' to log open problems or bugs, 'architecture' to record how the project is built (modules, conventions, decisions, file layout).",
   inputSchema: {
-    category: z.enum(["decision", "learning", "architecture", "bug-fix", "convention"]).describe("Category of the memory"),
+    category: z.enum(["task", "issue", "architecture"]).describe("Category. Use 'task' to record what a peer did or is doing. Use 'issue' to log open problems or bugs. Use 'architecture' to record how the project is built (modules, conventions, decisions, file layout)."),
     title: z.string().describe("Short title summarizing the memory (under 100 chars)"),
     content: z.string().describe("Detailed content: WHAT was done, WHY, and the OUTCOME (under 500 chars)"),
     files: z.array(z.string()).optional().describe("Related file paths"),
@@ -1112,7 +1177,7 @@ mcp.registerTool("search_memory", {
   description: "Search the shared repo memory for relevant context. Returns memories saved by any peer in the same repo that match the query keywords. Use before starting work to check for relevant historical context, past decisions, or known issues.",
   inputSchema: {
     query: z.string().describe("Search query (keywords describing what you're looking for)"),
-    category: z.enum(["decision", "learning", "architecture", "bug-fix", "convention"]).optional().describe("Filter by category"),
+    category: z.enum(["task", "issue", "architecture"]).optional().describe("Filter by category"),
     files: z.array(z.string()).optional().describe("Filter by related file paths"),
     areas: z.array(z.string()).optional().describe("Filter by related directory/module areas"),
     limit: z.number().optional().describe("Max results (default 10)"),
@@ -1140,7 +1205,7 @@ mcp.registerTool("search_memory", {
 mcp.registerTool("list_memories", {
   description: "List recent memories from the shared repo memory store. Shows what the team of agents has learned about this repository.",
   inputSchema: {
-    category: z.enum(["decision", "learning", "architecture", "bug-fix", "convention"]).optional().describe("Filter by category"),
+    category: z.enum(["task", "issue", "architecture"]).optional().describe("Filter by category"),
     limit: z.number().optional().describe("Max results (default 20)"),
   },
 }, async ({ category, limit }) => {
@@ -1276,6 +1341,8 @@ async function registerWithBroker(): Promise<void> {
   const source = mySource;
   // Let the broker decide: claim a sleeping peer of the same kind, or create a new one.
   // Register with the owner (CLI session) PID so liveness checks target the long-lived process.
+  const terminalId = process.env.AGENT_PEERS_TERMINAL_ID || null;
+  const extHostId = process.env.AGENT_PEERS_EXT_HOST || null;
   const reg = await brokerFetch<RegisterResponse>("/register", {
     agentType: AGENT_TYPE,
     source,
@@ -1283,6 +1350,8 @@ async function registerWithBroker(): Promise<void> {
     cwd: myCwd,
     gitRoot: myGitRoot,
     tty: myTty,
+    terminalId,
+    extHostId,
     context,
   });
   myId = reg.id;
@@ -1379,6 +1448,7 @@ async function main() {
   let lastTaskIntentJson = ""; // Cache to avoid redundant taskIntent updates
   let lastMemoryExtractionTime = 0;
   let lastLatestCommit = "";
+  let lastExtractionExchangeLen = 0; // Track exchange growth for extraction gate
   const MEMORY_EXTRACTION_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
   const heartbeatTimer = setInterval(async () => {
     if (!myId) return;
@@ -1462,7 +1532,7 @@ async function main() {
         await brokerFetch("/update-context", { id: myId, context: contextUpdate });
       }
 
-      // Periodic memory extraction (every 5 minutes if significant work detected)
+      // Periodic memory extraction (every 5 minutes)
       const now = Date.now();
       if (myGitRoot && now - lastMemoryExtractionTime > MEMORY_EXTRACTION_INTERVAL_MS) {
         const latestCommit = gitCtx?.recentCommits?.[0] ?? "";
@@ -1471,12 +1541,16 @@ async function main() {
         const agentModifiedFiles = (gitCtx?.modifiedFiles ?? []).filter(
           f => !new Set(baselineModifiedFiles).has(f),
         );
-        if (newCommits || agentModifiedFiles.length >= 1) {
+        // Use full text for extraction (not the 200-char truncated context version)
+        const fullExchange = getRecentExchanges(EXTRACTION_MAX_CHARS);
+        const exchangeGrew = fullExchange.length > lastExtractionExchangeLen;
+        // Trigger on: new commits, file modifications, OR conversation growth
+        if (newCommits || agentModifiedFiles.length >= 1 || (exchangeGrew && fullExchange.length >= 50)) {
+          lastExtractionExchangeLen = fullExchange.length;
           lastMemoryExtractionTime = now;
-          // Run extraction asynchronously to not block heartbeat
+          // Run extraction — broker deduplicates via content hash
           try {
-            const exchange = getRecentExchanges();
-            const memories = extractMemoriesFromExchanges(exchange, gitCtx, cachedSessionTitle);
+            const memories = extractMemoriesFromExchanges(fullExchange, gitCtx, cachedSessionTitle);
             for (const mem of memories) {
               brokerFetch("/repo-memory/add", {
                 gitRoot: myGitRoot!, sourcePeerId: myId!,
@@ -1504,10 +1578,10 @@ async function main() {
     if (titleWatchTimer) clearTimeout(titleWatchTimer);
     gitWatcher?.close();
     clearInterval(parentWatchTimer);
-    // Extract memories from session before sleeping
+    // Extract memories from session before sleeping (use full text for pattern matching)
     if (myId && myGitRoot) {
       try {
-        const exchange = getRecentExchanges();
+        const exchange = getRecentExchanges(EXTRACTION_MAX_CHARS);
         const gitCtx = await gatherGitContext(myCwd);
         if (gitCtx) {
           gitCtx.baselineModifiedFiles = baselineModifiedFiles;

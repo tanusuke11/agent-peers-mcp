@@ -190,7 +190,7 @@ export class BrokerClient {
     }
   }
 
-  async registerPeer(agentType: string, pid: number, cwd: string, gitRoot: string | null, source: "terminal" | "extension" = "extension"): Promise<{ id: string }> {
+  async registerPeer(agentType: string, pid: number, cwd: string, gitRoot: string | null, source: "terminal" | "extension" = "extension", opts?: { extHostId?: string; terminalId?: string }): Promise<{ id: string }> {
     const now = new Date().toISOString();
     return await this.post<{ id: string }>("/register", {
       agentType,
@@ -199,6 +199,8 @@ export class BrokerClient {
       cwd,
       gitRoot,
       tty: null,
+      terminalId: opts?.terminalId ?? null,
+      extHostId: opts?.extHostId ?? null,
       context: { summary: "", activeFiles: [], git: null, updatedAt: now },
     });
   }

@@ -1,13 +1,13 @@
 /**
  * Peer List tree view provider
- * Shows all connected AI agent instances with their type, summary, and status.
+ * Shows all AI agent instances with their type, summary, and status.
  * Includes inline context: git state (with modified/staged file trees), active files, etc.
  */
 
 import * as path from "path";
 import * as vscode from "vscode";
 import type { BrokerClient } from "../broker-client";
-import type { Peer, RepoMemory } from "../../shared/types";
+import type { Peer } from "../../shared/types";
 
 export class PeerListProvider implements vscode.TreeDataProvider<PeerItem> {
   private _onDidChangeTreeData = new vscode.EventEmitter<PeerItem | undefined>();
@@ -52,10 +52,6 @@ export class PeerListProvider implements vscode.TreeDataProvider<PeerItem> {
           return item;
         });
       }
-      // Lazily load repo memories when the "Repo Memory" node is expanded
-      if (element.repoMemoryGitRoot) {
-        return this.loadRepoMemories(element.repoMemoryGitRoot);
-      }
       return element.children ?? [];
     }
 
@@ -82,125 +78,24 @@ export class PeerListProvider implements vscode.TreeDataProvider<PeerItem> {
     const items: PeerItem[] = [];
     for (const [groupKey, group] of sortedGroups) {
       const header = PeerItem.projectHeader(group.label, group.peers.length, groupKey);
-      const activeDescriptions = new Set(
-        group.peers
-          .filter((p) => !p.suspended)
-          .map((p) => formatPeerDescription(p))
-          .filter((description) => !!description),
-      );
       const peerItems = group.peers
         .map((p) => {
           const displayType = agentDisplayName(p.agentType);
           const tag = sourceTag(p.source);
-          const label = p.suspended
-            ? `${displayType} (${p.id})${tag}`
-            : `${agentEmoji(p.agentType)} ${displayType} (${animalEmoji(p.id)}${p.id})${tag}`;
-          return new PeerItem(label, p.id, "peer", p, undefined, undefined, descriptionForPeerRow(p, activeDescriptions));
+          const label = `${agentEmoji(p.agentType)} ${displayType} (${animalEmoji(p.id)}${p.id})${tag}`;
+          const description = formatPeerDescription(p) || undefined;
+          return new PeerItem(label, p.id, "peer", p, undefined, undefined, description);
         })
         .sort((a, b) => {
           const sourceRank = (p: Peer | undefined) => (p?.source === "extension" ? 0 : 1);
-          const suspendedRank = (p: Peer | undefined) => (p?.suspended ? 1 : 0);
-          const sourceDiff = sourceRank(a.peer) - sourceRank(b.peer);
-          if (sourceDiff !== 0) return sourceDiff;
-          return suspendedRank(a.peer) - suspendedRank(b.peer);
+          return sourceRank(a.peer) - sourceRank(b.peer);
         });
 
-      // Add "Repo Memory" node per project (lazily loaded on expand)
-      const gitRoot = group.peers.find(p => p.gitRoot)?.gitRoot;
-      if (gitRoot) {
-        const memoryItem = new PeerItem(
-          "Repo Memory", "", "detail", undefined,
-          "book", new vscode.ThemeColor("charts.purple"),
-        );
-        memoryItem.id = `project:${groupKey}:repo-memory`;
-        memoryItem.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
-        memoryItem.repoMemoryGitRoot = gitRoot;
-        memoryItem.contextValue = "repoMemoryHeader";
-        header.children = [...peerItems, memoryItem];
-      } else {
-        header.children = peerItems;
-      }
+      header.children = peerItems;
       items.push(header);
     }
 
     return items;
-  }
-
-  /** Lazily load repo memories for a given git root */
-  private async loadRepoMemories(gitRoot: string): Promise<PeerItem[]> {
-    try {
-      const memories = await this.client.listRepoMemories(gitRoot, undefined, 30);
-      if (memories.length === 0) {
-        return [leaf("No memories yet", undefined, "info", new vscode.ThemeColor("charts.foreground"))];
-      }
-
-      // Group by category
-      const byCategory = new Map<string, RepoMemory[]>();
-      for (const m of memories) {
-        const list = byCategory.get(m.category) ?? [];
-        list.push(m);
-        byCategory.set(m.category, list);
-      }
-
-      const CATEGORY_ICONS: Record<string, { icon: string; color: string }> = {
-        "decision": { icon: "law", color: "charts.red" },
-        "learning": { icon: "mortar-board", color: "charts.blue" },
-        "architecture": { icon: "symbol-structure", color: "charts.purple" },
-        "bug-fix": { icon: "bug", color: "charts.orange" },
-        "convention": { icon: "checklist", color: "charts.green" },
-      };
-
-      const items: PeerItem[] = [];
-      for (const [category, mems] of byCategory) {
-        const cfg = CATEGORY_ICONS[category] ?? { icon: "note", color: "charts.foreground" };
-        const catItem = new PeerItem(
-          `${category} (${mems.length})`, "", "detail", undefined,
-          cfg.icon, new vscode.ThemeColor(cfg.color),
-        );
-        catItem.id = `repo-memory:${gitRoot}:cat:${category}`;
-        catItem.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
-        catItem.children = mems.map(m => {
-          const item = leaf(
-            m.title,
-            m.sourcePeerId ?? undefined,
-            cfg.icon,
-            new vscode.ThemeColor(cfg.color),
-          );
-          item.id = `repo-memory:${gitRoot}:${m.id}`;
-          item.tooltip = new vscode.MarkdownString(
-            `**[${m.category}] ${m.title}**\n\n${m.content}\n\n` +
-            (m.files.length ? `Files: ${m.files.join(", ")}\n\n` : "") +
-            `By: ${m.sourcePeerId ?? "unknown"} · ${m.updatedAt}`,
-          );
-          item.command = {
-            command: "agentPeers.showRepoMemoryDetail",
-            title: "Show Repo Memory Detail",
-            arguments: [{
-              title: `Memory #${m.id}: ${m.title}`,
-              header: [
-                `# Repo Memory #${m.id}`,
-                "",
-                `- **Category:** ${m.category}`,
-                `- **By:** ${m.sourcePeerId ?? "unknown"}`,
-                `- **Created:** ${m.createdAt}`,
-                `- **Updated:** ${m.updatedAt}`,
-                m.files.length ? `- **Files:** ${m.files.join(", ")}` : "",
-                m.areas.length ? `- **Areas:** ${m.areas.join(", ")}` : "",
-                "",
-                "---",
-                "",
-              ].filter(Boolean).join("\n"),
-              text: m.content,
-            }],
-          };
-          return item;
-        });
-        items.push(catItem);
-      }
-      return items;
-    } catch {
-      return [leaf("Failed to load memories", undefined, "warning", new vscode.ThemeColor("charts.red"))];
-    }
   }
 }
 
@@ -304,47 +199,33 @@ function formatPeerDescription(peer: Peer): string {
   return parts.join(" · ");
 }
 
-function descriptionForPeerRow(peer: Peer, activeDescriptions: Set<string>): string | undefined {
-  const description = formatPeerDescription(peer);
-  if (!description) {
-    return peer.suspended ? "(sleep)" : undefined;
-  }
-  if (peer.suspended && activeDescriptions.has(description)) {
-    return "(sleep)";
-  }
-  return peer.suspended ? `(sleep) ${description}` : description;
-}
 
-
-const DIM_COLOR = new vscode.ThemeColor("disabledForeground");
 
 /** Build the nested context item tree for a peer (detail rows + git/file sub-trees). */
 function buildContextItems(peer: Peer): PeerItem[] {
-  const isSuspended = !!peer.suspended;
-  const dim = isSuspended ? DIM_COLOR : undefined;
   const items: PeerItem[] = [];
 
-  items.push(leaf("PID", String(peer.pid), "terminal", dim ?? new vscode.ThemeColor("charts.foreground")));
-  items.push(leaf("Dir", peer.cwd, "folder", dim ?? new vscode.ThemeColor("charts.blue")));
+  items.push(leaf("PID", String(peer.pid), "terminal", new vscode.ThemeColor("charts.foreground")));
+  items.push(leaf("Dir", peer.cwd, "folder", new vscode.ThemeColor("charts.blue")));
 
   if (peer.context.currentTask) {
-    items.push(leaf(peer.context.currentTask, undefined, "target", dim ?? new vscode.ThemeColor("charts.red")));
+    items.push(leaf(peer.context.currentTask, undefined, "target", new vscode.ThemeColor("charts.red")));
   }
 
   if (peer.context.git) {
     const git = peer.context.git;
-    const gitItem = leaf("Git", git.branch ?? "detached", "git-branch", dim ?? new vscode.ThemeColor("charts.purple"));
+    const gitItem = leaf("Git", git.branch ?? "detached", "git-branch", new vscode.ThemeColor("charts.purple"));
 
     const gitChildren: PeerItem[] = [];
     // Show only files changed by this agent (exclude pre-existing modifications)
     const baseline = new Set(git.baselineModifiedFiles ?? []);
     const agentModified = (git.modifiedFiles ?? []).filter((f) => !baseline.has(f));
     for (const f of agentModified) {
-      gitChildren.push(leaf(f, undefined, "diff-modified", dim ?? new vscode.ThemeColor("charts.yellow")));
+      gitChildren.push(leaf(f, undefined, "diff-modified", new vscode.ThemeColor("charts.yellow")));
     }
     if (git.stagedFiles?.length) {
       for (const f of git.stagedFiles) {
-        gitChildren.push(leaf(f, undefined, "diff-added", dim ?? new vscode.ThemeColor("charts.green")));
+        gitChildren.push(leaf(f, undefined, "diff-added", new vscode.ThemeColor("charts.green")));
       }
     }
 
@@ -354,18 +235,18 @@ function buildContextItems(peer: Peer): PeerItem[] {
     }
     items.push(gitItem);
   } else {
-    items.push(leaf("Git", "(not a repo)", "git-branch", dim ?? new vscode.ThemeColor("charts.foreground")));
+    items.push(leaf("Git", "(not a repo)", "git-branch", new vscode.ThemeColor("charts.foreground")));
   }
 
   if (peer.context.activeFiles?.length) {
-    const filesItem = leaf(`Active files (${peer.context.activeFiles.length})`, undefined, "folder-opened", dim ?? new vscode.ThemeColor("charts.orange"));
+    const filesItem = leaf(`Active files (${peer.context.activeFiles.length})`, undefined, "folder-opened", new vscode.ThemeColor("charts.orange"));
     filesItem.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
     filesItem.children = peer.context.activeFiles.map((f) =>
       leaf(
         `${f.relativePath || f.path}${f.isDirty ? " •" : ""}`,
         undefined,
         "file",
-        dim ?? new vscode.ThemeColor("charts.blue"),
+        new vscode.ThemeColor("charts.blue"),
       ),
     );
     items.push(filesItem);
@@ -381,7 +262,7 @@ function buildContextItems(peer: Peer): PeerItem[] {
       "detail",
       undefined,
       "mail",
-      dim ?? new vscode.ThemeColor("notificationsInfoIcon.foreground"),
+      new vscode.ThemeColor("notificationsInfoIcon.foreground"),
     );
     incomingItem.id = `peer:${peer.id}:incoming`;
     incomingItem.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
@@ -408,8 +289,6 @@ class PeerItem extends vscode.TreeItem {
   incomingForPeerId?: string;
   /** Message ID for individual message items — used by delete command */
   messageId?: number;
-  /** When set, getChildren will lazily fetch repo memories for this git root */
-  repoMemoryGitRoot?: string;
 
   static projectHeader(projectName: string, peerCount: number, projectKey: string): PeerItem {
     const item = new PeerItem(projectName, "", "header");
@@ -433,31 +312,23 @@ class PeerItem extends vscode.TreeItem {
     super(label, vscode.TreeItemCollapsibleState.None);
 
     if (itemType === "peer" && peer) {
-      const isSuspended = !!peer.suspended;
       this.id = `peer:${peer.id}`;
       this.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
 
-      // Build description from recent context (shared by both active & sleep peers)
       const summary = peer.context.summary ?? "";
       const task = peer.context.currentTask ?? "";
       const description = displayDescription;
 
-      if (isSuspended) {
-        if (description) this.description = description;
-        this.iconPath = new vscode.ThemeIcon("circle-outline", DIM_COLOR);
-        this.contextValue = "sleepPeer";
+      if (description) this.description = description;
+      this.contextValue = "peer";
+      const hasInformativeSummary = isInformativeSummary(summary, peer);
+      const hasConversationCue = !!preferredConversationCue(peer);
+      const recentlyActive = isRecentlyActive(peer, 2 * 60_000);
+      const isWorking = !!task || hasInformativeSummary || hasConversationCue || recentlyActive;
+      if (isWorking) {
+        this.iconPath = new vscode.ThemeIcon("sync~spin", agentColor(peer.agentType));
       } else {
-        if (description) this.description = description;
-        this.contextValue = "peer";
-        const hasInformativeSummary = isInformativeSummary(summary, peer);
-        const hasConversationCue = !!preferredConversationCue(peer);
-        const recentlyActive = isRecentlyActive(peer, 2 * 60_000);
-        const isWorking = !!task || hasInformativeSummary || hasConversationCue || recentlyActive;
-        if (isWorking) {
-          this.iconPath = new vscode.ThemeIcon("sync~spin", agentColor(peer.agentType));
-        } else {
-          this.iconPath = new vscode.ThemeIcon("circle-filled", agentColor(peer.agentType));
-        }
+        this.iconPath = new vscode.ThemeIcon("circle-filled", agentColor(peer.agentType));
       }
       this.tooltip = new vscode.MarkdownString(this.buildTooltip(peer));
       this.children = buildContextItems(peer);
@@ -478,7 +349,7 @@ class PeerItem extends vscode.TreeItem {
   private buildTooltip(p: Peer): string {
     const parts = [
       `**${p.agentType}** — \`${p.id}\``,
-      `- Status: ${p.suspended ? "Sleep" : "Active"}`,
+      `- Status: Active`,
       `- Source: ${p.source === "extension" ? "IDE extension" : "Terminal (MCP)"}`,
       `- CWD: \`${p.cwd}\``,
     ];

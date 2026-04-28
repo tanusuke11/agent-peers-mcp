@@ -11,14 +11,15 @@ import * as vscode from "vscode";
 import { BrokerClient } from "./broker-client";
 import { PeerListProvider } from "./views/peer-list";
 import { ControlProvider } from "./views/control";
-import { MessageDetailProvider } from "./views/message-detail";
-import { RepoMemoryDetailProvider } from "./views/repo-memory-detail";
+import { DetailPanelProvider } from "./views/detail-panel";
+import { MemoryProvider } from "./views/memory";
 import type { MarkdownViewItem } from "./views/webview-content";
 import { forceKillProcess, findNodeBinary } from "../shared/process";
 import type { Peer } from "../shared/types";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import { randomUUID } from "crypto";
 
 let brokerClient: BrokerClient;
 
@@ -40,145 +41,28 @@ const pendingDeliveries = new Map<string, PendingDelivery>();
 /** How long to wait for additional messages before flushing (ms). */
 const MESSAGE_BATCH_DELAY_MS = 600;
 
-// ─── Terminal lookup helpers ──────────────────────────────
+// ─── Terminal binding maps ────────────────────────────────
 
-/** Get the parent PID of a process. Linux reads /proc, others use ps/PowerShell. */
-function getParentPid(pid: number): number {
-  try {
-    if (process.platform === "linux") {
-      const status = fs.readFileSync(`/proc/${pid}/status`, "utf8");
-      const m = status.match(/PPid:\s*(\d+)/);
-      return m ? parseInt(m[1]!, 10) : 0;
-    }
-    const { execSync } = require("child_process") as typeof import("child_process");
-    if (process.platform === "darwin") {
-      return parseInt(execSync(`ps -o ppid= -p ${pid}`, { encoding: "utf8", timeout: 3000 }).trim(), 10) || 0;
-    }
-    if (process.platform === "win32") {
-      // Get-CimInstance works in both Windows PowerShell 5.1 and PowerShell Core 7+.
-      // Get-WmiObject is not available in PS7+.
-      const out = execSync(
-        `powershell -NoProfile -Command "(Get-CimInstance -ClassName Win32_Process -Filter 'ProcessId=${pid}').ParentProcessId"`,
-        { encoding: "utf8", timeout: 5000 },
-      ).trim();
-      return parseInt(out, 10) || 0;
-    }
-    return 0;
-  } catch { return 0; }
-}
+/** Unique ID for this extension host, generated once per activate(). */
+let extHostId = "";
 
-/** Collect all ancestor PIDs up to init (PID 1), max 15 levels. */
-function getAncestorPids(pid: number): Set<number> {
-  const ancestors = new Set<number>();
-  let current = pid;
-  for (let i = 0; i < 15 && current > 1; i++) {
-    const parent = getParentPid(current);
-    if (parent <= 1) break;
-    ancestors.add(parent);
-    current = parent;
-  }
-  return ancestors;
-}
-
-/**
- * Find the VSCode terminal whose shell process is an ancestor of the given PID.
- * Returns the terminal if found, null otherwise.
- */
-async function findTerminalForPid(pid: number): Promise<vscode.Terminal | null> {
-  const ancestors = getAncestorPids(pid);
-  for (const terminal of vscode.window.terminals) {
-    const shellPid = await terminal.processId;
-    if (shellPid && (shellPid === pid || ancestors.has(shellPid))) {
-      return terminal;
-    }
-  }
-  return null;
-}
+/** Maps terminalId (UUID injected via env) → vscode.Terminal instance. */
+const terminalsById = new Map<string, vscode.Terminal>();
+/** Reverse map: vscode.Terminal → terminalId. */
+const terminalIdsByTerminal = new WeakMap<vscode.Terminal, string>();
+/** Maps peerId → terminalId, populated on peer-joined for our terminals. */
+const peerTerminalIdById = new Map<string, string>();
 
 const terminalPeerTitles = new WeakMap<vscode.Terminal, string>();
-const peerTerminalAssignments = new Map<string, vscode.Terminal>();
-/** Tracks the owner PID that was active when a terminal was assigned to a peer.
- * Used to detect stale assignments when a peer is resumed by a new session (new PID). */
-const peerTerminalPids = new Map<string, number>();
-const pendingGridTerminals = new Map<string, vscode.Terminal[]>();
-
-function getTerminalKeyForAgent(agentType: Peer["agentType"]): string {
-  switch (agentType) {
-    case "claude-code":
-      return "claude";
-    case "codex":
-      return "codex";
-    default:
-      return "agent";
-  }
-}
-
-function getTerminalKeyForCommand(command: string | undefined): string | undefined {
-  const trimmed = command?.trim().toLowerCase();
-  if (!trimmed) return undefined;
-  if (trimmed === "claude") return "claude";
-  if (trimmed === "codex") return "codex";
-  return undefined;
-}
+/** Stores the original terminal name before peer renaming, so we can restore it on peer-left. */
+const terminalOriginalTitles = new WeakMap<vscode.Terminal, string>();
 
 function isKnownTerminal(terminal: vscode.Terminal): boolean {
   return vscode.window.terminals.includes(terminal);
 }
 
-function enqueuePendingGridTerminal(command: string | undefined, terminal: vscode.Terminal): void {
-  const key = getTerminalKeyForCommand(command);
-  if (!key) return;
-  const queue = pendingGridTerminals.get(key) ?? [];
-  queue.push(terminal);
-  pendingGridTerminals.set(key, queue);
-}
-
 function hasActiveTerminalTab(group: vscode.TabGroup): boolean {
   return group.activeTab?.input instanceof vscode.TabInputTerminal;
-}
-
-function claimPendingGridTerminal(peer: Peer): vscode.Terminal | null {
-  const key = getTerminalKeyForAgent(peer.agentType);
-  const queue = pendingGridTerminals.get(key);
-  if (!queue?.length) return null;
-
-  while (queue.length > 0) {
-    const terminal = queue.shift()!;
-    if (isKnownTerminal(terminal)) {
-      peerTerminalAssignments.set(peer.id, terminal);
-      peerTerminalPids.set(peer.id, peer.pid);
-      return terminal;
-    }
-  }
-
-  pendingGridTerminals.delete(key);
-  return null;
-}
-
-async function resolveTerminalForPeer(peer: Peer): Promise<vscode.Terminal | null> {
-  const assigned = peerTerminalAssignments.get(peer.id);
-  if (assigned && isKnownTerminal(assigned)) {
-    // If the peer was resumed with a new session (PID changed), the stored
-    // assignment points to the old terminal. Clear it and re-resolve by new PID.
-    const assignedPid = peerTerminalPids.get(peer.id);
-    if (assignedPid === undefined || assignedPid === peer.pid) {
-      return assigned;
-    }
-    peerTerminalAssignments.delete(peer.id);
-    peerTerminalPids.delete(peer.id);
-  } else if (assigned) {
-    peerTerminalAssignments.delete(peer.id);
-    peerTerminalPids.delete(peer.id);
-  }
-
-  const byPid = await findTerminalForPid(peer.pid);
-  if (byPid) {
-    peerTerminalAssignments.set(peer.id, byPid);
-    peerTerminalPids.set(peer.id, peer.pid);
-    return byPid;
-  }
-
-  return claimPendingGridTerminal(peer);
 }
 
 function getTerminalAgentLabel(agentType: Peer["agentType"]): string {
@@ -196,40 +80,60 @@ function getTerminalPeerTitle(peer: Pick<Peer, "agentType" | "id">): string {
   return `${getTerminalAgentLabel(peer.agentType)} • ${peer.id}`;
 }
 
-async function renameTerminalWithPeerTitle(terminal: vscode.Terminal, title: string): Promise<void> {
-  if (terminal.name === title || terminalPeerTitles.get(terminal) === title) return;
-
-  // renameWithArg only targets the *active* terminal instance. `show(true)` preserves
-  // focus, so the terminal never becomes active and the rename silently hits the
-  // wrong terminal (or no-ops). Pass `false` to actually focus it, then restore.
+async function focusTerminalAndRename(terminal: vscode.Terminal, name: string): Promise<void> {
   const previouslyActive = vscode.window.activeTerminal;
+
   terminal.show(false);
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  await vscode.commands.executeCommand("workbench.action.terminal.renameWithArg", { name: title });
-  terminalPeerTitles.set(terminal, title);
+  await vscode.commands.executeCommand("workbench.action.terminal.focus");
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  await vscode.commands.executeCommand("workbench.action.terminal.renameWithArg", { name });
+
   if (previouslyActive && previouslyActive !== terminal) {
     previouslyActive.show(false);
   }
 }
 
-function schedulePeerTerminalRename(peer: Peer, retries = 10): void {
-  if (peer.source !== "terminal") return;
+async function renameTerminalWithPeerTitle(terminal: vscode.Terminal, title: string): Promise<void> {
+  if (terminal.name === title || terminalPeerTitles.get(terminal) === title) return;
 
-  void (async () => {
-    const terminal = await resolveTerminalForPeer(peer);
-    if (terminal) {
-      await renameTerminalWithPeerTitle(terminal, getTerminalPeerTitle(peer));
-      return;
-    }
-    if (retries > 0) {
-      setTimeout(() => schedulePeerTerminalRename(peer, retries - 1), 500);
-    }
-  })();
+  // Save original title before first peer rename so we can restore on peer-left
+  if (!terminalOriginalTitles.has(terminal)) {
+    terminalOriginalTitles.set(terminal, terminal.name);
+  }
+
+  await focusTerminalAndRename(terminal, title);
+  terminalPeerTitles.set(terminal, title);
 }
 
-async function syncPeerTerminalTitles(peers: Peer[]): Promise<void> {
-  for (const peer of peers) {
-    schedulePeerTerminalRename(peer);
+/** Reset a terminal's title back to its original name (before peer renaming). */
+async function resetTerminalTitle(terminal: vscode.Terminal): Promise<void> {
+  const original = terminalOriginalTitles.get(terminal);
+  // Fall back to a generic "Terminal" name if we never captured the original
+  const resetName = original || "Terminal";
+  await focusTerminalAndRename(terminal, resetName);
+  terminalOriginalTitles.delete(terminal);
+}
+
+/** Bind a newly-joined peer to its terminal tab (rename). Only acts on our own terminals. */
+async function bindPeerToTerminal(peer: Peer): Promise<void> {
+  if (peer.source !== "terminal") return;
+  if (peer.extHostId !== extHostId) return;
+  if (!peer.terminalId) return;
+  const terminal = terminalsById.get(peer.terminalId);
+  if (!terminal || !isKnownTerminal(terminal)) return;
+  peerTerminalIdById.set(peer.id, peer.terminalId);
+  await renameTerminalWithPeerTitle(terminal, getTerminalPeerTitle(peer));
+}
+
+/** Unbind a peer from its terminal tab (reset title). Only acts on our own terminals. */
+async function unbindPeerFromTerminal(peer: Pick<Peer, "terminalId" | "extHostId">): Promise<void> {
+  if (peer.extHostId !== extHostId) return;
+  if (!peer.terminalId) return;
+  const terminal = terminalsById.get(peer.terminalId);
+  if (terminal && isKnownTerminal(terminal)) {
+    terminalPeerTitles.delete(terminal);
+    await resetTerminalTitle(terminal);
   }
 }
 
@@ -308,7 +212,6 @@ async function openTerminalGrid(command: string | undefined): Promise<void> {
 
   const { cols, rows } = picked;
   const total = cols * rows;
-  const prefix = command ?? "Terminal";
 
   // Build the editor grid layout using vscode.setEditorLayout
   // orientation: 0 = left-right (horizontal), 1 = top-bottom (vertical)
@@ -360,13 +263,17 @@ async function openTerminalGrid(command: string | undefined): Promise<void> {
     }
 
     const viewColumn = group.viewColumn;
-    const terminalIndex = Number(viewColumn);
 
+    const terminalId = randomUUID();
     const terminal = vscode.window.createTerminal({
-      name: `${prefix} ${terminalIndex}`,
       location: { viewColumn } as vscode.TerminalEditorLocationOptions,
+      env: {
+        AGENT_PEERS_TERMINAL_ID: terminalId,
+        AGENT_PEERS_EXT_HOST: extHostId,
+      },
     });
-    enqueuePendingGridTerminal(command, terminal);
+    terminalsById.set(terminalId, terminal);
+    terminalIdsByTerminal.set(terminal, terminalId);
     terminal.show(false);
 
     // Give VS Code a moment to actually open the terminal editor in the group
@@ -448,36 +355,50 @@ export function activate(extensionContext: vscode.ExtensionContext) {
   const brokerPort = config.get<number>("brokerPort", 7899);
   const wsPort = brokerPort + 1; // Convention: WS port = HTTP port + 1
 
+  // Generate a unique ID for this extension host (one per activate)
+  extHostId = randomUUID();
+
   // Initialize broker client
   brokerClient = new BrokerClient(brokerPort, wsPort);
 
   // Initialize tree data providers
   const controlProvider = new ControlProvider(brokerClient);
   const peerListProvider = new PeerListProvider(brokerClient);
-  const messageDetailProvider = new MessageDetailProvider();
-  const repoMemoryDetailProvider = new RepoMemoryDetailProvider();
+  const memoryProvider = new MemoryProvider(brokerClient);
+  const detailPanelProvider = new DetailPanelProvider();
   // Register tree views
   const peerListView = vscode.window.createTreeView("agentPeers.peerList", {
     treeDataProvider: peerListProvider,
   });
   extensionContext.subscriptions.push(
     vscode.window.registerTreeDataProvider("agentPeers.control", controlProvider),
-    vscode.window.registerWebviewViewProvider(MessageDetailProvider.viewId, messageDetailProvider),
-    vscode.window.registerWebviewViewProvider(RepoMemoryDetailProvider.viewId, repoMemoryDetailProvider),
+    vscode.window.registerTreeDataProvider("agentPeers.memory", memoryProvider),
+    vscode.window.registerWebviewViewProvider(DetailPanelProvider.viewId, detailPanelProvider),
     peerListView,
   );
 
   // Listen to real-time events
   brokerClient.on("peer-joined", (data) => {
+    const peer = data as Peer;
     peerListProvider.refresh();
-    schedulePeerTerminalRename(data as Peer);
+    memoryProvider.refresh();
+    void bindPeerToTerminal(peer);
   });
-  brokerClient.on("peer-left", () => { peerListProvider.refresh(); });
+  brokerClient.on("peer-left", (data) => {
+    const { id } = data as { id: string };
+    const terminalId = peerTerminalIdById.get(id);
+    if (terminalId) {
+      void unbindPeerFromTerminal({ terminalId, extHostId });
+      peerTerminalIdById.delete(id);
+    }
+    peerListProvider.refresh();
+    memoryProvider.refresh();
+  });
   brokerClient.on("context-updated", () => {
     peerListProvider.refresh();
   });
   brokerClient.on("memory-added", () => {
-    peerListProvider.refresh();
+    memoryProvider.refresh();
   });
   /**
    * Deliver a prompt string to a terminal, accounting for agent-type differences.
@@ -490,12 +411,16 @@ export function activate(extensionContext: vscode.ExtensionContext) {
    * For claude-code peers we disable the automatic newline and explicitly
    * send `\r` to trigger submission. Other agent types use the default behaviour.
    */
-  function deliverToTerminal(terminal: vscode.Terminal, text: string, agentType: string) {
+  async function deliverToTerminal(terminal: vscode.Terminal, text: string, agentType: string) {
     if (agentType === "claude-code") {
       // Raw-mode TUI: send ESC first to exit any modal state (e.g. "accept edits on"),
-      // then send text without trailing LF, then CR to submit.
+      // then send text without trailing LF.
       terminal.sendText("\x1b", false);
       terminal.sendText(text, false);
+      // Delay before CR so that bracketed-paste mode finishes processing the
+      // multi-line text. Without this, the CR lands inside the paste bracket
+      // and the terminal shows "[Pasted text]" without submitting.
+      await new Promise(r => setTimeout(r, 80));
       terminal.sendText("\r", false);
     } else {
       terminal.sendText(text);
@@ -525,7 +450,7 @@ export function activate(extensionContext: vscode.ExtensionContext) {
           "---",
           "",
         ].join("\n");
-        await messageDetailProvider.show({
+        await detailPanelProvider.showMessage({
           title: `${typeLabel}: ${fromId}`,
           header,
           text: combined,
@@ -556,6 +481,9 @@ export function activate(extensionContext: vscode.ExtensionContext) {
 
     const autoDeliver = vscode.workspace.getConfiguration("agentPeers").get<boolean>("autoDeliveryMessage", true);
 
+    // Resolve terminal for the target peer via terminalId map
+    const resolvedTerminal = peer?.terminalId ? terminalsById.get(peer.terminalId) ?? null : null;
+
     if (!autoDeliver) {
       const typeLabel = pending.type === "task-handoff" ? "Task handoff" : pending.type === "context-request" ? "Context request" : "Message";
       const preview = combined.length > 200 ? combined.slice(0, 200) + "…" : combined;
@@ -566,26 +494,20 @@ export function activate(extensionContext: vscode.ExtensionContext) {
         "Dismiss",
       );
       if (choice === "Deliver to Terminal") {
-        if (peer) {
-          const terminal = await resolveTerminalForPeer(peer);
-          if (terminal) {
-            deliverToTerminal(terminal, prompt, peer.agentType);
-            terminal.show(true);
-          }
+        if (peer && resolvedTerminal) {
+          deliverToTerminal(resolvedTerminal, prompt, peer.agentType);
+          resolvedTerminal.show(true);
         }
       }
       peerListProvider.refresh();
       return;
     }
 
-    if (peer) {
-      const terminal = await resolveTerminalForPeer(peer);
-      if (terminal) {
-        deliverToTerminal(terminal, prompt, peer.agentType);
-        terminal.show(true);
-        peerListProvider.refresh();
-        return;
-      }
+    if (peer && resolvedTerminal) {
+      deliverToTerminal(resolvedTerminal, prompt, peer.agentType);
+      resolvedTerminal.show(true);
+      peerListProvider.refresh();
+      return;
     }
 
     // Fallback: notification with actions
@@ -630,20 +552,15 @@ export function activate(extensionContext: vscode.ExtensionContext) {
 
   // Register commands
   extensionContext.subscriptions.push(
-    vscode.window.onDidCloseTerminal((terminal) => {
-      for (const [peerId, assigned] of peerTerminalAssignments.entries()) {
-        if (assigned === terminal) {
-          peerTerminalAssignments.delete(peerId);
-          peerTerminalPids.delete(peerId);
-        }
-      }
-      for (const [key, queue] of pendingGridTerminals.entries()) {
-        const remaining = queue.filter((item) => item !== terminal);
-        if (remaining.length > 0) {
-          pendingGridTerminals.set(key, remaining);
-        } else {
-          pendingGridTerminals.delete(key);
-        }
+    vscode.window.onDidCloseTerminal(async (terminal) => {
+      const tid = terminalIdsByTerminal.get(terminal);
+      if (!tid) return;
+      terminalsById.delete(tid);
+      // Find the peer that owned this terminal and ask broker to delete it.
+      const peers = await brokerClient.listPeers("machine");
+      const owned = peers.find(p => p.terminalId === tid && p.extHostId === extHostId);
+      if (owned) {
+        await brokerClient.deletePeer(owned.id);
       }
     }),
     vscode.commands.registerCommand("agentPeers.sendMessage", async () => {
@@ -653,13 +570,7 @@ export function activate(extensionContext: vscode.ExtensionContext) {
         return;
       }
 
-      const activePeers = peers.filter((p) => !p.suspended);
-      if (activePeers.length === 0) {
-        vscode.window.showInformationMessage("No active peers found — all peers are currently sleeping.");
-        return;
-      }
-
-      const items = activePeers.map((p) => {
+      const items = peers.map((p) => {
         const sourceLabel = p.source === "extension" ? "[ext]" : "[term]";
         return {
           label: `${p.agentType} — ${p.id} ${sourceLabel}`,
@@ -781,12 +692,15 @@ export function activate(extensionContext: vscode.ExtensionContext) {
       if (confirm !== "Delete") return;
       try {
         // Close and clean up the terminal associated with this peer, if any.
-        const assignedTerminal = peerTerminalAssignments.get(peerId);
-        if (assignedTerminal && isKnownTerminal(assignedTerminal)) {
-          assignedTerminal.dispose();
+        const tid = peerTerminalIdById.get(peerId);
+        if (tid) {
+          const assignedTerminal = terminalsById.get(tid);
+          if (assignedTerminal && isKnownTerminal(assignedTerminal)) {
+            assignedTerminal.dispose();
+          }
+          terminalsById.delete(tid);
+          peerTerminalIdById.delete(peerId);
         }
-        peerTerminalAssignments.delete(peerId);
-        peerTerminalPids.delete(peerId);
 
         await brokerClient.deletePeer(peerId);
         peerListProvider.refresh();
@@ -802,13 +716,8 @@ export function activate(extensionContext: vscode.ExtensionContext) {
         return;
       }
 
-      try {
-        await brokerClient.resumePeer(peerId);
-        vscode.window.showInformationMessage(`Peer "${peerId}" resumed. Context sharing is active again.`);
-        peerListProvider.refresh();
-      } catch (e) {
-        vscode.window.showErrorMessage(`Failed to resume peer: ${e}`);
-      }
+      // Resume functionality has been removed; command kept for compatibility.
+      vscode.window.showInformationMessage("Resume is no longer available.");
     }),
 
     vscode.commands.registerCommand("agentPeers.addMcpServer", async () => {
@@ -987,7 +896,7 @@ AGENT_PEERS_AGENT_TYPE = "codex"
         "---",
         "",
       ].filter(Boolean).join("\n");
-      await messageDetailProvider.show({
+      await detailPanelProvider.showMessage({
         title: item.title ?? "Message Detail",
         header,
         text: item.text,
@@ -996,7 +905,7 @@ AGENT_PEERS_AGENT_TYPE = "codex"
 
     vscode.commands.registerCommand("agentPeers.showRepoMemoryDetail", async (item?: MarkdownViewItem) => {
       if (!item?.text) return;
-      await repoMemoryDetailProvider.show(item);
+      await detailPanelProvider.showRepoMemory(item);
     }),
 
     vscode.commands.registerCommand("agentPeers.deleteMessage", async (item?: { messageId?: number; peerId?: string }) => {
@@ -1056,7 +965,11 @@ AGENT_PEERS_AGENT_TYPE = "codex"
   // React to WebSocket connection state changes
   brokerClient.on("broker-connected", () => {
     setBrokerConnected(true);
-    void brokerClient.listPeers("machine").then(syncPeerTerminalTitles);
+    // Register the extension itself as a peer (source="extension", no terminalId)
+    const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+    void brokerClient.getGitRoot().then((gitRoot) => {
+      void brokerClient.registerPeer("claude-code", process.pid, cwd, gitRoot, "extension", { extHostId });
+    });
   });
   brokerClient.on("broker-disconnected", () => {
     setBrokerConnected(false);

@@ -37,13 +37,12 @@
           "name": "Peers"
         },
         {
-          "id": "agentPeers.messageDetail",
-          "name": "Message Detail",
-          "type": "webview"
+          "id": "agentPeers.memory",
+          "name": "Memory"
         },
         {
-          "id": "agentPeers.repoMemoryDetail",
-          "name": "Repo Memory Detail",
+          "id": "agentPeers.detailPanel",
+          "name": "Detail",
           "type": "webview"
         }
       ]
@@ -89,18 +88,6 @@
         "command": "agentPeers.showDashboard",
         "title": "Show Dashboard",
         "icon": "$(dashboard)",
-        "category": "Agent Peers"
-      },
-      {
-        "command": "agentPeers.disconnectPeer",
-        "title": "Suspend Peer",
-        "icon": "$(debug-disconnect)",
-        "category": "Agent Peers"
-      },
-      {
-        "command": "agentPeers.connectPeer",
-        "title": "Resume Peer",
-        "icon": "$(plug)",
         "category": "Agent Peers"
       },
       {
@@ -180,7 +167,7 @@
       "view/item/context": [
         {
           "command": "agentPeers.deletePeer",
-          "when": "view == agentPeers.peerList && viewItem =~ /^(peer|sleepPeer)$/",
+          "when": "view == agentPeers.peerList && viewItem == peer",
           "group": "inline"
         },
         {

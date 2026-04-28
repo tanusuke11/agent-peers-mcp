@@ -103,7 +103,7 @@ export function extractMemoriesFromExchanges(
         if (sentence) {
           const files = extractFilePaths(block.text);
           memories.push({
-            category: "decision",
+            category: "architecture",
             title: truncate(sentence, 100),
             content: truncate(block.text, 500),
             files,
@@ -126,7 +126,7 @@ export function extractMemoriesFromExchanges(
     const fixSentence = extractSentence(assistant.text, BUGFIX_PATTERNS[0]!);
     const files = extractFilePaths(assistant.text);
     memories.push({
-      category: "bug-fix",
+      category: "issue",
       title: truncate(fixSentence ?? "Bug fix", 100),
       content: truncate(assistant.text, 500),
       files,
@@ -165,7 +165,7 @@ export function extractMemoriesFromExchanges(
         : `Modified ${agentFiles.length} file(s)`;
       const fileList = agentFiles.slice(0, 10).join(", ");
       memories.push({
-        category: "learning",
+        category: "task",
         title,
         content: truncate(`Files changed: ${fileList}. ${sessionTitle ?? ""}`, 500),
         files: agentFiles,

@@ -61,7 +61,6 @@ import {
   BROKER_DB_PATH,
   STALE_PEER_CLEANUP_MS,
   PEER_TIMEOUT_MS,
-  SLEEPING_PEER_MAX_AGE_MS,
 } from "../shared/constants.ts";
 import { terminateProcess } from "../shared/process.ts";
 
@@ -118,6 +117,17 @@ try {
   db.exec("ALTER TABLE peers ADD COLUMN source TEXT NOT NULL DEFAULT 'terminal'");
 } catch { /* column already exists */ }
 
+// Migration: add terminal_id and ext_host_id columns
+try {
+  db.exec("ALTER TABLE peers ADD COLUMN terminal_id TEXT");
+} catch { /* column already exists */ }
+try {
+  db.exec("ALTER TABLE peers ADD COLUMN ext_host_id TEXT");
+} catch { /* column already exists */ }
+
+// Wipe all stale sleeping peers — sleep state is abolished
+db.exec("DELETE FROM peers WHERE sleep = 1");
+
 // Legacy compatibility migration: keep the old read column if it exists in user databases
 try {
   db.exec("ALTER TABLE messages ADD COLUMN read INTEGER NOT NULL DEFAULT 0");
@@ -155,7 +165,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS repo_memories (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     git_root TEXT NOT NULL,
-    category TEXT NOT NULL DEFAULT 'learning',
+    category TEXT NOT NULL DEFAULT 'architecture',
     title TEXT NOT NULL,
     content TEXT NOT NULL,
     files_json TEXT DEFAULT '[]',
@@ -170,6 +180,14 @@ db.exec(`
 
 db.exec("CREATE INDEX IF NOT EXISTS idx_repo_memories_git_root ON repo_memories(git_root)");
 db.exec("CREATE INDEX IF NOT EXISTS idx_repo_memories_hash ON repo_memories(content_hash)");
+
+// One-shot migration: collapse old 5 categories → 3 (task, issue, architecture)
+try {
+  db.exec(`
+    UPDATE repo_memories SET category = 'issue' WHERE category = 'bug-fix';
+    UPDATE repo_memories SET category = 'architecture' WHERE category IN ('decision','convention','learning');
+  `);
+} catch { /* safe to re-run */ }
 
 // FTS5 full-text search (may not be available in all SQLite builds)
 let hasFts5 = false;
@@ -230,40 +248,16 @@ function sendToPeer(peerId: string, event: WsEvent): boolean {
 // ─── Stale peer cleanup ────────────────────────────────────────
 
 function cleanStalePeers() {
-  const peers = db.prepare("SELECT id, pid, last_seen, sleep FROM peers").all() as unknown as { id: string; pid: number; last_seen: string; sleep: number }[];
+  const peers = db.prepare("SELECT id, pid, last_seen FROM peers").all() as { id: string; pid: number; last_seen: string }[];
   const now = Date.now();
   for (const peer of peers) {
-    if (peer.sleep) {
-      // Hard-delete sleeping peers that have been dormant longer than the max age.
-      // Without this, sleeping peers accumulate indefinitely across session restarts.
-      const dormantMs = now - new Date(peer.last_seen).getTime();
-      if (dormantMs > SLEEPING_PEER_MAX_AGE_MS) {
-        removePeer(peer.id);
-        log(`Sleeping peer ${peer.id} deleted (dormant ${Math.round(dormantMs / 60000)} min)`);
-      }
-      continue;
-    }
-
     const staleByTime = now - new Date(peer.last_seen).getTime() > PEER_TIMEOUT_MS;
     let deadByPid = false;
-    // Only use PID check when the stored PID is not the broker's own PID
-    // (MCP peers are registered with process.pid which is always alive)
     if (peer.pid !== process.pid && peer.pid !== 0) {
-      try {
-        process.kill(peer.pid, 0);
-      } catch {
-        deadByPid = true;
-      }
+      try { process.kill(peer.pid, 0); } catch { deadByPid = true; }
     }
-    if (staleByTime || deadByPid) {
-      detachPeer(peer.id);
-    }
+    if (staleByTime || deadByPid) removePeer(peer.id);
   }
-
-  // Also collapse redundant sleeping peers on every cleanup cycle,
-  // not just at startup and registration time.
-  const allPeers = selectAllPeers.all() as unknown as RawPeerRow[];
-  collapseRedundantSleepingPeers(allPeers);
 }
 
 // NOTE: cleanStalePeers() is called after prepared statements are defined (see below)
@@ -271,8 +265,9 @@ function cleanStalePeers() {
 // ─── Prepared statements ───────────────────────────────────────
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, agent_type, source, pid, cwd, git_root, tty, context_json, registered_at, last_seen)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, agent_type, source, pid, cwd, git_root, tty,
+                     terminal_id, ext_host_id, context_json, registered_at, last_seen)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const updateLastSeen = db.prepare(`UPDATE peers SET last_seen = ? WHERE id = ?`);
@@ -282,17 +277,6 @@ const deleteMessagesForPeer = db.prepare(`DELETE FROM messages WHERE from_id = ?
 const selectAllPeers = db.prepare(`SELECT * FROM peers`);
 const selectPeersByDirectory = db.prepare(`SELECT * FROM peers WHERE cwd = ?`);
 const selectPeerById = db.prepare(`SELECT * FROM peers WHERE id = ?`);
-const selectActiveByPid = db.prepare(`SELECT * FROM peers WHERE pid = ? AND sleep = 0 LIMIT 1`);
-const selectSuspendedByRepo = db.prepare(`
-  SELECT * FROM peers
-  WHERE agent_type = ? AND source = ? AND git_root = ? AND sleep = 1
-  ORDER BY registered_at ASC, last_seen DESC
-`);
-const selectSuspendedByCwd = db.prepare(`
-  SELECT * FROM peers
-  WHERE agent_type = ? AND source = ? AND cwd = ? AND sleep = 1
-  ORDER BY registered_at ASC, last_seen DESC
-`);
 const selectMessageById = db.prepare(`SELECT * FROM messages WHERE id = ?`);
 
 const insertMessage = db.prepare(`
@@ -318,11 +302,6 @@ const countMemoriesByRepo = db.prepare(`SELECT COUNT(*) as cnt FROM repo_memorie
 const deleteMemoryById = db.prepare(`DELETE FROM repo_memories WHERE id = ?`);
 const updateMemoryTimestamp = db.prepare(`UPDATE repo_memories SET updated_at = ? WHERE id = ?`);
 const selectRecentMemoriesByRepo = db.prepare(`SELECT * FROM repo_memories WHERE git_root = ? ORDER BY updated_at DESC LIMIT ?`);
-
-// ─── Stale peer cleanup (deferred until prepared statements are ready) ──
-cleanStalePeers();
-collapseRedundantSleepingPeers(selectAllPeers.all() as unknown as RawPeerRow[]);
-setInterval(cleanStalePeers, STALE_PEER_CLEANUP_MS);
 
 // ─── Helpers ───────────────────────────────────────────────────
 
@@ -362,6 +341,8 @@ interface RawPeerRow {
   cwd: string;
   git_root: string | null;
   tty: string | null;
+  terminal_id: string | null;
+  ext_host_id: string | null;
   context_json: string;
   registered_at: string;
   last_seen: string;
@@ -372,14 +353,10 @@ const countAllMessages = db.prepare(`SELECT COUNT(*) as cnt FROM messages WHERE 
 const selectAllMessagesForPeer = db.prepare(`SELECT * FROM messages WHERE to_id = ? ORDER BY sent_at ASC`);
 const deleteMessageById = db.prepare(`DELETE FROM messages WHERE id = ?`);
 const clearMessagesForPeer = db.prepare(`DELETE FROM messages WHERE to_id = ?`);
-const reassignMessagesFromPeer = db.prepare(`UPDATE messages SET from_id = ? WHERE from_id = ?`);
-const reassignMessagesToPeer = db.prepare(`UPDATE messages SET to_id = ? WHERE to_id = ?`);
-const reassignMemorySourcePeer = db.prepare(`UPDATE repo_memories SET source_peer_id = ? WHERE source_peer_id = ?`);
-const updatePeerAfterSleepMerge = db.prepare(`
-  UPDATE peers
-  SET cwd = ?, git_root = ?, tty = ?, context_json = ?, last_seen = ?, pid = 0, sleep = 1
-  WHERE id = ?
-`);
+
+// ─── Stale peer cleanup (deferred until prepared statements are ready) ──
+cleanStalePeers();
+setInterval(cleanStalePeers, STALE_PEER_CLEANUP_MS);
 
 function rowToPeer(row: RawPeerRow): Peer {
   return {
@@ -389,12 +366,12 @@ function rowToPeer(row: RawPeerRow): Peer {
     cwd: row.cwd,
     gitRoot: row.git_root,
     tty: row.tty,
+    terminalId: row.terminal_id,
+    extHostId: row.ext_host_id,
     source: (row.source ?? "terminal") as Peer["source"],
     context: JSON.parse(row.context_json) as AgentContext,
     registeredAt: row.registered_at,
     lastSeen: row.last_seen,
-    connected: !row.sleep,
-    suspended: !!row.sleep,
     totalMessages: (() => {
       const cnt = (countAllMessages.get(row.id) as unknown as { cnt: number })?.cnt ?? 0;
       return cnt > 0 ? cnt : undefined;
@@ -427,15 +404,6 @@ function rowToMessage(row: RawMessageRow): Message {
     sentAt: row.sent_at,
     delivered: !!row.delivered,
   };
-}
-
-function isAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 
@@ -479,279 +447,30 @@ function clearSessionContext(peer: Peer): void {
   peer.context.conversationDigest = undefined;
 }
 
-function countMessagesForPeer(peerId: string): number {
-  return (countAllMessages.get(peerId) as unknown as { cnt: number } | undefined)?.cnt ?? 0;
-}
-
-function parseTimestamp(value: string | undefined): number {
-  if (!value) return 0;
-  const parsed = Date.parse(value);
-  return Number.isNaN(parsed) ? 0 : parsed;
-}
-
-function hasMeaningfulSummary(summary: string | undefined): boolean {
-  return !!summary && summary !== "Untitled";
-}
-
-function getPeerProjectKey(row: Pick<RawPeerRow, "git_root" | "cwd">): string {
-  return row.git_root ? `repo:${row.git_root}` : `cwd:${row.cwd}`;
-}
-
-function getSleepFingerprint(row: Pick<RawPeerRow, "agent_type" | "source" | "git_root" | "cwd" | "tty">): string {
-  const anchor = row.tty ? `tty:${row.tty}` : `cwd:${row.cwd}`;
-  return [row.agent_type, row.source ?? "terminal", getPeerProjectKey(row), anchor].join("|");
-}
-
-function mergeStoredContexts(primary: AgentContext, secondary: AgentContext, now: string): AgentContext {
-  const primaryNewer = parseTimestamp(primary.updatedAt) >= parseTimestamp(secondary.updatedAt);
-  const preferred = primaryNewer ? primary : secondary;
-  const fallback = primaryNewer ? secondary : primary;
-
-  return {
-    ...fallback,
-    ...preferred,
-    summary: hasMeaningfulSummary(preferred.summary)
-      ? preferred.summary
-      : hasMeaningfulSummary(fallback.summary)
-        ? fallback.summary
-        : preferred.summary || fallback.summary || "",
-    activeFiles: preferred.activeFiles?.length ? preferred.activeFiles : fallback.activeFiles,
-    git: preferred.git ?? fallback.git,
-    currentTask: preferred.currentTask || fallback.currentTask,
-    taskIntent: preferred.taskIntent ?? fallback.taskIntent,
-    recentExchange: preferred.recentExchange || fallback.recentExchange,
-    conversationDigest: preferred.conversationDigest || fallback.conversationDigest,
-    metadata: preferred.metadata ?? fallback.metadata,
-    updatedAt: preferred.updatedAt || fallback.updatedAt || now,
-  };
-}
-
-function chooseCanonicalSleepingPeer(rows: RawPeerRow[]): RawPeerRow {
-  return [...rows].sort((a, b) => {
-    const registeredDelta = parseTimestamp(a.registered_at) - parseTimestamp(b.registered_at);
-    if (registeredDelta !== 0) return registeredDelta;
-
-    const messageDelta = countMessagesForPeer(b.id) - countMessagesForPeer(a.id);
-    if (messageDelta !== 0) return messageDelta;
-
-    const seenDelta = parseTimestamp(b.last_seen) - parseTimestamp(a.last_seen);
-    if (seenDelta !== 0) return seenDelta;
-
-    return a.id.localeCompare(b.id);
-  })[0];
-}
-
-function chooseRegisterReuseCandidate(rows: RawPeerRow[], body: RegisterRequest): RawPeerRow {
-  return [...rows].sort((a, b) => {
-    const aTty = body.tty && a.tty === body.tty ? 1 : 0;
-    const bTty = body.tty && b.tty === body.tty ? 1 : 0;
-    if (aTty !== bTty) return bTty - aTty;
-
-    const aCwd = a.cwd === body.cwd ? 1 : 0;
-    const bCwd = b.cwd === body.cwd ? 1 : 0;
-    if (aCwd !== bCwd) return bCwd - aCwd;
-
-    const messageDelta = countMessagesForPeer(b.id) - countMessagesForPeer(a.id);
-    if (messageDelta !== 0) return messageDelta;
-
-    const registeredDelta = parseTimestamp(a.registered_at) - parseTimestamp(b.registered_at);
-    if (registeredDelta !== 0) return registeredDelta;
-
-    const seenDelta = parseTimestamp(b.last_seen) - parseTimestamp(a.last_seen);
-    if (seenDelta !== 0) return seenDelta;
-
-    return a.id.localeCompare(b.id);
-  })[0];
-}
-
-function mergeSleepingPeerIntoCanonical(canonical: RawPeerRow, duplicate: RawPeerRow): RawPeerRow {
-  const now = new Date().toISOString();
-  const canonicalContext = JSON.parse(canonical.context_json) as AgentContext;
-  const duplicateContext = JSON.parse(duplicate.context_json) as AgentContext;
-  const mergedContext = mergeStoredContexts(canonicalContext, duplicateContext, now);
-  const mergedTty = canonical.tty ?? duplicate.tty;
-  const mergedGitRoot = canonical.git_root ?? duplicate.git_root;
-  const mergedLastSeen = parseTimestamp(canonical.last_seen) >= parseTimestamp(duplicate.last_seen)
-    ? canonical.last_seen
-    : duplicate.last_seen;
-
-  updatePeerAfterSleepMerge.run(
-    canonical.cwd,
-    mergedGitRoot,
-    mergedTty,
-    JSON.stringify(mergedContext),
-    mergedLastSeen,
-    canonical.id,
-  );
-  reassignMessagesFromPeer.run(canonical.id, duplicate.id);
-  reassignMessagesToPeer.run(canonical.id, duplicate.id);
-  reassignMemorySourcePeer.run(canonical.id, duplicate.id);
-  deletePeer.run(duplicate.id);
-
-  broadcast({
-    type: "peer-left",
-    data: { id: duplicate.id },
-    timestamp: now,
-  } satisfies WsPeerLeftEvent);
-  broadcast({
-    type: "context-updated",
-    data: { id: canonical.id, context: mergedContext },
-    timestamp: now,
-  } satisfies WsContextUpdatedEvent);
-  log(`Collapsed sleeping peer ${duplicate.id} into ${canonical.id}`);
-
-  return selectPeerById.get(canonical.id) as unknown as RawPeerRow;
-}
-
-function collapseRedundantSleepingPeers(rows: RawPeerRow[]): number {
-  const sleeping = rows.filter((row) => row.sleep);
-  if (sleeping.length < 2) return 0;
-
-  // First pass: collapse peers with identical fingerprint (same TTY anchor)
-  const groups = new Map<string, RawPeerRow[]>();
-  for (const row of sleeping) {
-    const fingerprint = getSleepFingerprint(row);
-    const group = groups.get(fingerprint);
-    if (group) {
-      group.push(row);
-    } else {
-      groups.set(fingerprint, [row]);
-    }
-  }
-
-  let collapsed = 0;
-  for (const group of groups.values()) {
-    if (group.length < 2) continue;
-
-    let canonical = chooseCanonicalSleepingPeer(group);
-    for (const row of group) {
-      if (row.id === canonical.id) continue;
-      canonical = mergeSleepingPeerIntoCanonical(canonical, row);
-      collapsed++;
-    }
-  }
-
-  // Second pass: collapse by project key only (ignoring TTY anchor).
-  // This handles the common case where session restarts in a different terminal/shell,
-  // producing a different TTY anchor that prevents first-pass deduplication.
-  // Re-query to get fresh state after first pass.
-  const remainingSleeping = (selectAllPeers.all() as unknown as RawPeerRow[]).filter(r => r.sleep);
-  if (remainingSleeping.length >= 2) {
-    const projectGroups = new Map<string, RawPeerRow[]>();
-    for (const row of remainingSleeping) {
-      const key = [row.agent_type, row.source ?? "terminal", getPeerProjectKey(row)].join("|");
-      const group = projectGroups.get(key);
-      if (group) group.push(row);
-      else projectGroups.set(key, [row]);
-    }
-    for (const group of projectGroups.values()) {
-      if (group.length < 2) continue;
-      let canonical = chooseCanonicalSleepingPeer(group);
-      for (const row of group) {
-        if (row.id === canonical.id) continue;
-        // Verify still exists (may have been removed in first pass)
-        if (!selectPeerById.get(row.id)) continue;
-        canonical = mergeSleepingPeerIntoCanonical(canonical, row);
-        collapsed++;
-      }
-    }
-  }
-
-  return collapsed;
-}
 
 // ─── Request handlers ──────────────────────────────────────────
 
 function handleRegister(body: RegisterRequest): RegisterResponse {
   const now = new Date().toISOString();
-  const contextJson = JSON.stringify(body.context);
   const source = body.source ?? "terminal";
 
-  // Wrap in a transaction so register/resume is atomic.
   db.exec("BEGIN");
   let id: string;
   try {
-    // 1. If preferredId is given (e.g. extension peers), use that stable identity.
-    // 2. Else, if the same owner PID is already active, keep that identity (prevents ID churn).
-    // 3. Else, prefer a sleeping peer with an exact tty anchor in the same project.
-    // 4. Else, claim the best sleeping peer of the same kind in the same project.
-    let existingRow: RawPeerRow | undefined;
-    let suspendedRows: RawPeerRow[] = [];
-    if (body.preferredId) {
-      existingRow = selectPeerById.get(body.preferredId) as unknown as RawPeerRow | undefined;
+    const existingIds = new Set((selectAllPeers.all() as unknown as RawPeerRow[]).map(r => r.id));
+    if (body.preferredId && !existingIds.has(body.preferredId)) {
+      id = body.preferredId;
     } else {
-      existingRow = selectActiveByPid.get(body.pid) as unknown as RawPeerRow | undefined;
+      id = generateId(existingIds);
     }
-
-    if (!existingRow && body.gitRoot) {
-      suspendedRows = selectSuspendedByRepo.all(body.agentType, source, body.gitRoot) as unknown as RawPeerRow[];
-    } else if (!existingRow) {
-      suspendedRows = selectSuspendedByCwd.all(body.agentType, source, body.cwd) as unknown as RawPeerRow[];
-    }
-
-    if (!existingRow && suspendedRows.length > 0) {
-      const ttyMatches = body.tty
-        ? suspendedRows.filter((row) => row.tty === body.tty)
-        : [];
-      existingRow = chooseRegisterReuseCandidate(ttyMatches.length > 0 ? ttyMatches : suspendedRows, body);
-      collapseRedundantSleepingPeers(
-        suspendedRows.filter((row) => getSleepFingerprint(row) === getSleepFingerprint(existingRow!)),
-      );
-      existingRow = selectPeerById.get(existingRow.id) as unknown as RawPeerRow | undefined;
-    }
-
-    if (existingRow) {
-      // Resume existing peer: reassign session, unsuspend, update connection info
-      id = existingRow.id;
-      // Merge context: preserve existing data, only overlay non-empty new fields
-      const existingContext = JSON.parse(existingRow.context_json) as AgentContext;
-      const incoming = body.context;
-      const mergedContext: AgentContext = {
-        ...existingContext,
-        // Only overwrite with incoming values when they carry real data
-        summary: hasMeaningfulSummary(incoming.summary)
-          ? incoming.summary
-          : existingContext.summary ?? "",
-        activeFiles: incoming.activeFiles?.length ? incoming.activeFiles : existingContext.activeFiles,
-        git: incoming.git ?? existingContext.git,
-        currentTask: incoming.currentTask || existingContext.currentTask,
-        taskIntent: incoming.taskIntent ?? existingContext.taskIntent,
-        recentExchange: incoming.recentExchange || existingContext.recentExchange,
-        conversationDigest: incoming.conversationDigest || existingContext.conversationDigest,
-        metadata: incoming.metadata ?? existingContext.metadata,
-        updatedAt: now,
-      };
-      db.prepare(`
-        UPDATE peers
-        SET pid = ?, cwd = ?, git_root = ?, tty = ?, source = ?,
-            agent_type = ?, context_json = ?, last_seen = ?, sleep = 0
-        WHERE id = ?
-      `).run(body.pid, body.cwd, body.gitRoot, body.tty, source,
-             body.agentType, JSON.stringify(mergedContext), now, id);
-      log(`Peer ${id} resumed (was sleep=${!!existingRow.sleep})`);
-    } else {
-      // No sleeping peer of this kind — create new one
-      const existingIds = new Set((selectAllPeers.all() as unknown as RawPeerRow[]).map((r) => r.id));
-      if (body.preferredId && !existingIds.has(body.preferredId)) {
-        id = body.preferredId;
-      } else {
-        id = generateId(existingIds);
-      }
-      insertPeer.run(id, body.agentType, source, body.pid, body.cwd, body.gitRoot, body.tty, contextJson, now, now);
-    }
+    insertPeer.run(id, body.agentType, source, body.pid, body.cwd, body.gitRoot,
+                   body.tty, body.terminalId ?? null, body.extHostId ?? null,
+                   JSON.stringify(body.context), now, now);
     db.exec("COMMIT");
-  } catch (e) {
-    db.exec("ROLLBACK");
-    throw e;
-  }
+  } catch (e) { db.exec("ROLLBACK"); throw e; }
 
   const peer = rowToPeer(selectPeerById.get(id) as unknown as RawPeerRow);
-  broadcast({
-    type: "peer-joined",
-    data: peer,
-    timestamp: now,
-  } satisfies WsPeerJoinedEvent);
-
+  broadcast({ type: "peer-joined", data: peer, timestamp: now } satisfies WsPeerJoinedEvent);
   return { id };
 }
 
@@ -761,21 +480,11 @@ function handleHeartbeat(body: HeartbeatRequest): { ok: boolean } {
   const now = new Date().toISOString();
   const pid = body.pid ?? row.pid;
   const source = body.source ?? row.source;
-  if (row.sleep) {
-    // Peer is alive (sending heartbeats) — resume it
-    db.prepare("UPDATE peers SET sleep = 0, pid = ?, source = ?, last_seen = ? WHERE id = ?")
+  if ((body.pid && body.pid !== row.pid) || (body.source && body.source !== row.source)) {
+    db.prepare("UPDATE peers SET pid=?, source=?, last_seen=? WHERE id=?")
       .run(pid, source, now, body.id);
-    const peer = rowToPeer(selectPeerById.get(body.id) as unknown as RawPeerRow);
-    broadcast({ type: "peer-joined", data: peer, timestamp: now } satisfies WsPeerJoinedEvent);
-    log(`Peer ${body.id} resumed via heartbeat (pid=${pid}, source=${source})`);
   } else {
-    // Update PID/source if changed
-    if ((body.pid && body.pid !== row.pid) || (body.source && body.source !== row.source)) {
-      db.prepare("UPDATE peers SET pid = ?, source = ?, last_seen = ? WHERE id = ?")
-        .run(pid, source, now, body.id);
-    } else {
-      updateLastSeen.run(now, body.id);
-    }
+    updateLastSeen.run(now, body.id);
   }
   return { ok: true };
 }
@@ -922,14 +631,6 @@ function handleSendMessage(body: SendMessageRequest): SendMessageResponse {
     return { ok: false, error: `Peer ${body.toId} not found` };
   }
 
-  // Reject messages to sleeping peers — they have no active session to receive them
-  if (target.sleep) {
-    return {
-      ok: false,
-      error: `Cannot send message to peer ${body.toId}: peer is currently sleeping. Wait for it to resume or choose a different peer.`,
-    };
-  }
-
   // Reject task-handoff to extension peers — they cannot autonomously execute tasks
   const targetSource = target.source ?? "terminal";
   if (targetSource !== "terminal" && body.type === "task-handoff") {
@@ -1056,21 +757,6 @@ function handlePeekMessages(body: PollMessagesRequest): PollMessagesResponse {
   return { found: true, messages: rows.map(rowToMessage) };
 }
 
-/** Detach a session from a peer: put to sleep, clear PID, but keep data & messages. */
-function detachPeer(id: string): void {
-  const row = selectPeerById.get(id) as unknown as RawPeerRow | undefined;
-  if (!row) return;
-  if (row.sleep) return; // already detached
-  db.prepare("UPDATE peers SET sleep = 1, pid = 0 WHERE id = ?").run(id);
-  const now = new Date().toISOString();
-  broadcast({
-    type: "context-updated",
-    data: { id, context: { ...JSON.parse(row.context_json), updatedAt: now } },
-    timestamp: now,
-  } satisfies WsContextUpdatedEvent);
-  log(`Peer ${id} detached (sleep)`);
-}
-
 /** Hard-remove a peer and all its messages. */
 function removePeer(id: string): void {
   const row = selectPeerById.get(id) as unknown as RawPeerRow | undefined;
@@ -1093,28 +779,14 @@ function handleDeletePeer(body: { id: string }): { ok: boolean } {
 }
 
 function handleUnregister(body: { id: string }): void {
-  detachPeer(body.id);
+  removePeer(body.id);
 }
 
-function handleSuspendPeer(body: { id: string }): { ok: boolean } {
-  const row = selectPeerById.get(body.id) as unknown as RawPeerRow | undefined;
-  if (!row) return { ok: false };
-  detachPeer(body.id);
+function handleSuspendPeer(_body: { id: string }): { ok: boolean } {
   return { ok: true };
 }
 
-function handleResumePeer(body: { id: string }): { ok: boolean } {
-  const row = selectPeerById.get(body.id) as unknown as RawPeerRow | undefined;
-  if (!row) return { ok: false };
-  if (!row.sleep) return { ok: true }; // already active
-  db.prepare("UPDATE peers SET sleep = 0, last_seen = ? WHERE id = ?").run(new Date().toISOString(), body.id);
-  const peer = rowToPeer(selectPeerById.get(body.id) as unknown as RawPeerRow);
-  broadcast({
-    type: "peer-joined",
-    data: peer,
-    timestamp: new Date().toISOString(),
-  } satisfies WsPeerJoinedEvent);
-  log(`Peer ${body.id} resumed`);
+function handleResumePeer(_body: { id: string }): { ok: boolean } {
   return { ok: true };
 }
 
@@ -1133,19 +805,15 @@ function handlePurge(): { purged: number } {
 
 function handleCleanup(): { suspended: number; remaining: number } {
   const peers = selectAllPeers.all() as unknown as RawPeerRow[];
-  let slept = 0;
+  let removed = 0;
   for (const peer of peers) {
-    if (peer.sleep) continue; // already sleeping
-    let dead = false;
-    if (peer.pid !== process.pid && peer.pid !== 0) {
-      try { process.kill(peer.pid, 0); } catch { dead = true; }
-    }
-    if (dead) {
-      detachPeer(peer.id);
-      slept++;
+    if (peer.pid === process.pid || peer.pid === 0) continue;
+    try { process.kill(peer.pid, 0); } catch {
+      removePeer(peer.id);
+      removed++;
     }
   }
-  return { suspended: slept, remaining: (selectAllPeers.all() as unknown as RawPeerRow[]).length };
+  return { suspended: removed, remaining: (selectAllPeers.all() as unknown as RawPeerRow[]).length };
 }
 
 // ─── Conflict detection ──────────────────────────────────────
@@ -1257,15 +925,22 @@ function handleCheckConflicts(body: CheckConflictsRequest): CheckConflictsRespon
 
       const memScore = fileOverlap * 3 + areaOverlap * 2 + Math.min(tokenOverlap, 3);
       if (memScore >= 3) {
-        if (row.category === "bug-fix" || row.category === "learning") {
-          // Boost existing conflict scores for peers working on same area
+        if (row.category === "issue") {
+          // Issue entries overlapping current task files → blocking-style warning
           for (const c of conflicts) {
             c.relatedMemories = c.relatedMemories ?? [];
             c.relatedMemories.push({ id: row.id, category: row.category, title: row.title, createdAt: row.created_at });
           }
         }
-        // Check 6: Advisory surfacing — decisions/conventions/architecture as non-blocking info
-        if (row.category === "decision" || row.category === "convention" || row.category === "architecture") {
+        if (row.category === "task") {
+          // Recent task entries from other peers → "currently in progress" notice
+          for (const c of conflicts) {
+            c.relatedMemories = c.relatedMemories ?? [];
+            c.relatedMemories.push({ id: row.id, category: row.category, title: row.title, createdAt: row.created_at });
+          }
+        }
+        // Advisory surfacing — architecture entries as non-blocking background knowledge
+        if (row.category === "architecture") {
           advisories.push({
             memoryId: row.id,
             category: row.category,
@@ -1687,18 +1362,9 @@ wss.on("connection", (ws) => {
         wsClients.delete(ws);
         identifiedPeerId = msg.id;
         wsPeerClients.set(msg.id, ws);
-        // Resume sleeping peer on WS re-identify (e.g. after reconnect)
+        // Update PID/source if changed on WS re-identify
         const row = selectPeerById.get(msg.id) as unknown as RawPeerRow | undefined;
-        if (row?.sleep) {
-          const pid = typeof msg.pid === "number" ? msg.pid : row.pid;
-          const source = (msg.source === "extension" || msg.source === "terminal") ? msg.source : row.source;
-          db.prepare("UPDATE peers SET sleep = 0, pid = ?, source = ?, last_seen = ? WHERE id = ?")
-            .run(pid, source, new Date().toISOString(), msg.id);
-          const peer = rowToPeer(selectPeerById.get(msg.id) as unknown as RawPeerRow);
-          broadcast({ type: "peer-joined", data: peer, timestamp: new Date().toISOString() } satisfies WsPeerJoinedEvent);
-          log(`Peer ${msg.id} resumed via WS identify (pid=${pid}, source=${source})`);
-        } else if (row) {
-          // Not sleeping but source/pid may need updating
+        if (row) {
           const pid = typeof msg.pid === "number" ? msg.pid : row.pid;
           const source = (msg.source === "extension" || msg.source === "terminal") ? msg.source : row.source;
           if (pid !== row.pid || source !== row.source) {
@@ -1716,16 +1382,16 @@ wss.on("connection", (ws) => {
     wsClients.delete(ws);
     if (identifiedPeerId) {
       wsPeerClients.delete(identifiedPeerId);
-      // Only suspend if the owner process is dead; skip if still alive
+      // Remove peer if the owner process is dead
       const row = selectPeerById.get(identifiedPeerId) as unknown as RawPeerRow | undefined;
       let ownerAlive = false;
       if (row && row.pid > 0) {
         try { process.kill(row.pid, 0); ownerAlive = true; } catch { /* dead */ }
       }
       if (!ownerAlive) {
-        detachPeer(identifiedPeerId);
+        removePeer(identifiedPeerId);
       } else {
-        log(`WebSocket disconnected for ${identifiedPeerId} but owner pid ${row!.pid} alive — not suspending`);
+        log(`WebSocket disconnected for ${identifiedPeerId} but owner pid ${row!.pid} alive — keeping peer`);
       }
     }
     log(`WebSocket client disconnected (anonymous: ${wsClients.size}, peers: ${wsPeerClients.size})`);
@@ -1741,7 +1407,7 @@ wss.on("connection", (ws) => {
         try { process.kill(row.pid, 0); ownerAlive = true; } catch { /* dead */ }
       }
       if (!ownerAlive) {
-        detachPeer(identifiedPeerId);
+        removePeer(identifiedPeerId);
       }
     }
   });

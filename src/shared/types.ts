@@ -89,16 +89,20 @@ export interface Peer {
   tty: string | null;
   /** How the peer connects: "terminal" (MCP server) or "extension" (VSCode extension) */
   source: PeerSource;
+  /** Opaque terminal identifier injected via AGENT_PEERS_TERMINAL_ID env when the
+   *  extension created the terminal. Used by the extension to bind a peer to its
+   *  vscode.Terminal instance without process-tree introspection. */
+  terminalId?: string | null;
+  /** Identifier of the VSCode extension host that created this peer's terminal
+   *  (or that registered itself as the extension peer). Lets each extension host
+   *  ignore peers that belong to other windows. */
+  extHostId?: string | null;
   /** Structured context shared by this peer */
   context: AgentContext;
   /** When the peer first registered */
   registeredAt: string;
   /** When the peer last sent a heartbeat */
   lastSeen: string;
-  /** Whether the peer is connected via MCP (true) or discovered via process scan (false) */
-  connected?: boolean;
-  /** Whether the peer is sleeping (session ended, data retained) */
-  suspended?: boolean;
   /** Total number of messages stored for this peer in the sidebar */
   totalMessages?: number;
 }
@@ -124,7 +128,7 @@ export interface Message {
 // ─── Broker API Request/Response ───────────────────────────────
 
 export interface RegisterRequest {
-  /** Request a specific ID (persisted from a previous session) */
+  /** Request a specific ID (extension peers may pass a stable extHostId-derived id). */
   preferredId?: string;
   agentType: AgentType;
   /** How the peer connects: "terminal" (MCP server) or "extension" (VSCode extension). Defaults to "terminal". */
@@ -133,6 +137,11 @@ export interface RegisterRequest {
   cwd: string;
   gitRoot: string | null;
   tty: string | null;
+  /** Opaque terminal identifier from AGENT_PEERS_TERMINAL_ID env (terminal peers
+   *  spawned by the extension) — lets the extension bind the peer to a vscode.Terminal. */
+  terminalId?: string | null;
+  /** Extension host that owns this peer's terminal (or this extension peer itself). */
+  extHostId?: string | null;
   context: AgentContext;
 }
 
@@ -142,7 +151,7 @@ export interface RegisterResponse {
 
 export interface HeartbeatRequest {
   id: PeerId;
-  /** Owner (CLI session) PID — used to resume sleeping peers and update liveness */
+  /** Owner (CLI session) PID — updates liveness and may correct a stored PID. */
   pid?: number;
   /** How the peer connects: "terminal" or "extension" */
   source?: PeerSource;
@@ -256,7 +265,7 @@ export interface WsMemoryAddedEvent extends WsEvent {
 
 // ─── Repo Memory ─────────────────────────────────────────────
 
-export type MemoryCategory = "decision" | "learning" | "architecture" | "bug-fix" | "convention";
+export type MemoryCategory = "task" | "issue" | "architecture";
 
 export interface RepoMemory {
   id: number;
