@@ -8,4 +8,5 @@ vsix: build
     code --install-extension agent-peers-mcp-0.1.0.vsix --force
 
 update-claude:
+    npm install -g @anthropic-ai/sdk
     npm update @anthropic-ai/sdk
