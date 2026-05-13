@@ -18,7 +18,6 @@
 import { DatabaseSync } from "node:sqlite";
 import http from "http";
 import { WebSocketServer, WebSocket } from "ws";
-import crypto from "crypto";
 import type {
   RegisterRequest,
   RegisterResponse,
@@ -55,8 +54,6 @@ import type {
   WsPeerUpdatedEvent,
   WsContextUpdatedEvent,
   WsMemoryAddedEvent,
-  ReservePeerRequest,
-  ReservePeerResponse,
   PeerStatus,
 } from "../shared/types.ts";
 import {
@@ -72,7 +69,18 @@ const PORT = parseInt(process.env.AGENT_PEERS_PORT ?? String(DEFAULT_BROKER_PORT
 const WS_PORT = parseInt(process.env.AGENT_PEERS_WS_PORT ?? String(DEFAULT_WS_PORT), 10);
 const DB_PATH = process.env.AGENT_PEERS_DB ?? BROKER_DB_PATH;
 let AUTO_CONFLICT_CHECK = process.env.AGENT_PEERS_AUTO_CONFLICT_CHECK !== "false";
-let MAX_CONTEXT_LENGTH = parseInt(process.env.AGENT_PEERS_MAX_CONTEXT_LENGTH ?? "30", 10) || 30;
+const DEFAULT_MAX_RECENT_CONTEXT_CHARS = 6000;
+
+function resolveMaxRecentContextCharsFromEnv(): number {
+  const configured = parseInt(process.env.AGENT_PEERS_MAX_CONTEXT_CHARS ?? "", 10);
+  if (Number.isFinite(configured) && configured > 0) {
+    return configured;
+  }
+
+  return DEFAULT_MAX_RECENT_CONTEXT_CHARS;
+}
+
+let MAX_RECENT_CONTEXT_CHARS = resolveMaxRecentContextCharsFromEnv();
 const startTime = Date.now();
 
 // ─── Database setup ────────────────────────────────────────────
@@ -174,50 +182,139 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS repo_memories (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     git_root TEXT NOT NULL,
-    category TEXT NOT NULL DEFAULT 'architecture',
-    title TEXT NOT NULL,
-    content TEXT NOT NULL,
+    type TEXT NOT NULL DEFAULT 'long',
+    summary TEXT NOT NULL,
     files_json TEXT DEFAULT '[]',
     areas_json TEXT DEFAULT '[]',
-    source_peer_id TEXT,
-    source_exchange TEXT,
-    content_hash TEXT NOT NULL,
+    expires_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   )
 `);
 
-db.exec("CREATE INDEX IF NOT EXISTS idx_repo_memories_git_root ON repo_memories(git_root)");
-db.exec("CREATE INDEX IF NOT EXISTS idx_repo_memories_hash ON repo_memories(content_hash)");
+function hasColumn(table: string, column: string): boolean {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  return rows.some(row => row.name === column);
+}
 
-// One-shot migration: collapse old 5 categories → 3 (task, issue, architecture)
-try {
+function normalizeLegacyMemorySummary(category: string, title: string, content: string): string {
+  const normalizedTitle = title.trim();
+  const normalizedContent = content.replace(/\s+/g, " ").trim();
+  const genericTitles = new Set([
+    "Modified 2 file(s)",
+    "Modified 3 file(s)",
+    "Modified 4 file(s)",
+    "Modified 5 file(s)",
+    "Summary of fix:",
+    "対処:",
+    "エラーの原因を調査します。",
+  ]);
+
+  if (category === "task") {
+    return normalizedTitle;
+  }
+  if (!normalizedTitle) return normalizedContent.slice(0, 160);
+  if (!normalizedContent) return normalizedTitle.slice(0, 160);
+  if (genericTitles.has(normalizedTitle)) return normalizedContent.slice(0, 160);
+  return `${normalizedTitle}: ${normalizedContent}`.slice(0, 160);
+}
+
+function migrateRepoMemoriesSchema() {
+  if (!hasColumn("repo_memories", "category")) return;
+
+  db.exec("DROP TRIGGER IF EXISTS repo_memories_ai");
+  db.exec("DROP TRIGGER IF EXISTS repo_memories_ad");
+  db.exec("DROP TRIGGER IF EXISTS repo_memories_au");
+  db.exec("DROP TABLE IF EXISTS repo_memories_fts");
+
   db.exec(`
-    UPDATE repo_memories SET category = 'issue' WHERE category = 'bug-fix';
-    UPDATE repo_memories SET category = 'architecture' WHERE category IN ('decision','convention','learning');
+    CREATE TABLE repo_memories_new (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      git_root TEXT NOT NULL,
+      type TEXT NOT NULL DEFAULT 'long',
+      summary TEXT NOT NULL,
+      files_json TEXT DEFAULT '[]',
+      areas_json TEXT DEFAULT '[]',
+      expires_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
   `);
-} catch { /* safe to re-run */ }
+
+  const legacyRows = db.prepare(`
+    SELECT id, git_root, category, title, content, files_json, areas_json, created_at, updated_at
+    FROM repo_memories
+    ORDER BY id
+  `).all() as Array<{
+    git_root: string;
+    category: string;
+    title: string;
+    content: string;
+    files_json: string;
+    areas_json: string;
+    created_at: string;
+    updated_at: string;
+  }>;
+
+  const insert = db.prepare(`
+    INSERT INTO repo_memories_new (git_root, type, summary, files_json, areas_json, expires_at, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  for (const row of legacyRows) {
+    const type = row.category === "task" ? "short" : "long";
+    const summary = normalizeLegacyMemorySummary(row.category, row.title ?? "", row.content ?? "");
+    if (!summary) continue;
+    const expiresAt = type === "short"
+      ? new Date(new Date(row.updated_at).getTime() + 24 * 60 * 60 * 1000).toISOString()
+      : null;
+    insert.run(
+      row.git_root,
+      type,
+      summary,
+      row.files_json || "[]",
+      row.areas_json || "[]",
+      expiresAt,
+      row.created_at,
+      row.updated_at,
+    );
+  }
+
+  db.exec("DROP TABLE repo_memories");
+  db.exec("ALTER TABLE repo_memories_new RENAME TO repo_memories");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_repo_memories_git_root ON repo_memories(git_root)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_repo_memories_type ON repo_memories(type)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_repo_memories_expires_at ON repo_memories(expires_at)");
+}
+
+migrateRepoMemoriesSchema();
+
+db.exec("CREATE INDEX IF NOT EXISTS idx_repo_memories_git_root ON repo_memories(git_root)");
+db.exec("CREATE INDEX IF NOT EXISTS idx_repo_memories_type ON repo_memories(type)");
+db.exec("CREATE INDEX IF NOT EXISTS idx_repo_memories_expires_at ON repo_memories(expires_at)");
+
+db.prepare("DELETE FROM repo_memories WHERE expires_at IS NOT NULL AND expires_at <= ?").run(new Date().toISOString());
 
 // FTS5 full-text search (may not be available in all SQLite builds)
 let hasFts5 = false;
 try {
   db.exec(`
     CREATE VIRTUAL TABLE IF NOT EXISTS repo_memories_fts USING fts5(
-      title, content,
+      summary,
       content=repo_memories, content_rowid=id,
       tokenize='porter unicode61'
     )
   `);
   // Sync triggers
   db.exec(`CREATE TRIGGER IF NOT EXISTS repo_memories_ai AFTER INSERT ON repo_memories BEGIN
-    INSERT INTO repo_memories_fts(rowid, title, content) VALUES (new.id, new.title, new.content);
+    INSERT INTO repo_memories_fts(rowid, summary) VALUES (new.id, new.summary);
   END`);
   db.exec(`CREATE TRIGGER IF NOT EXISTS repo_memories_ad AFTER DELETE ON repo_memories BEGIN
-    INSERT INTO repo_memories_fts(repo_memories_fts, rowid, title, content) VALUES('delete', old.id, old.title, old.content);
+    INSERT INTO repo_memories_fts(repo_memories_fts, rowid, summary) VALUES('delete', old.id, old.summary);
   END`);
   db.exec(`CREATE TRIGGER IF NOT EXISTS repo_memories_au AFTER UPDATE ON repo_memories BEGIN
-    INSERT INTO repo_memories_fts(repo_memories_fts, rowid, title, content) VALUES('delete', old.id, old.title, old.content);
-    INSERT INTO repo_memories_fts(rowid, title, content) VALUES (new.id, new.title, new.content);
+    INSERT INTO repo_memories_fts(repo_memories_fts, rowid, summary) VALUES('delete', old.id, old.summary);
+    INSERT INTO repo_memories_fts(rowid, summary) VALUES (new.id, new.summary);
   END`);
   hasFts5 = true;
 } catch {
@@ -316,17 +413,24 @@ const markDelivered = db.prepare(`UPDATE messages SET delivered = 1 WHERE id = ?
 // ─── Repo Memory prepared statements ────────────────────────
 
 const insertMemory = db.prepare(`
-  INSERT INTO repo_memories (git_root, category, title, content, files_json, areas_json, source_peer_id, source_exchange, content_hash, created_at, updated_at)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO repo_memories (git_root, type, summary, files_json, areas_json, expires_at, created_at, updated_at)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 `);
-const selectMemoryByHash = db.prepare(`SELECT id FROM repo_memories WHERE content_hash = ? AND git_root = ?`);
+const selectMemoryByIdentity = db.prepare(`SELECT id FROM repo_memories WHERE git_root = ? AND type = ? AND summary = ?`);
+const selectMemoryByScope = db.prepare(`SELECT id FROM repo_memories WHERE git_root = ? AND type = ? AND files_json = ? AND areas_json = ?`);
 const selectMemoryById = db.prepare(`SELECT * FROM repo_memories WHERE id = ?`);
-const selectMemoriesByRepo = db.prepare(`SELECT * FROM repo_memories WHERE git_root = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?`);
-const selectMemoriesByRepoAndCategory = db.prepare(`SELECT * FROM repo_memories WHERE git_root = ? AND category = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?`);
-const countMemoriesByRepo = db.prepare(`SELECT COUNT(*) as cnt FROM repo_memories WHERE git_root = ?`);
+const selectMemoriesByRepo = db.prepare(`SELECT * FROM repo_memories WHERE git_root = ? AND (expires_at IS NULL OR expires_at > ?) ORDER BY updated_at DESC LIMIT ? OFFSET ?`);
+const selectMemoriesByRepoAndType = db.prepare(`SELECT * FROM repo_memories WHERE git_root = ? AND type = ? AND (expires_at IS NULL OR expires_at > ?) ORDER BY updated_at DESC LIMIT ? OFFSET ?`);
+const countMemoriesByRepo = db.prepare(`SELECT COUNT(*) as cnt FROM repo_memories WHERE git_root = ? AND (expires_at IS NULL OR expires_at > ?)`);
+const countMemoriesByRepoAndType = db.prepare(`SELECT COUNT(*) as cnt FROM repo_memories WHERE git_root = ? AND type = ? AND (expires_at IS NULL OR expires_at > ?)`);
 const deleteMemoryById = db.prepare(`DELETE FROM repo_memories WHERE id = ?`);
 const updateMemoryTimestamp = db.prepare(`UPDATE repo_memories SET updated_at = ? WHERE id = ?`);
-const selectRecentMemoriesByRepo = db.prepare(`SELECT * FROM repo_memories WHERE git_root = ? ORDER BY updated_at DESC LIMIT ?`);
+const updateMemoryById = db.prepare(`
+  UPDATE repo_memories
+  SET summary = ?, files_json = ?, areas_json = ?, expires_at = ?, updated_at = ?
+  WHERE id = ?
+`);
+const selectRecentMemoriesByRepo = db.prepare(`SELECT * FROM repo_memories WHERE git_root = ? AND (expires_at IS NULL OR expires_at > ?) ORDER BY updated_at DESC LIMIT ?`);
 
 // ─── Helpers ───────────────────────────────────────────────────
 
@@ -484,45 +588,31 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
 
   let id: string;
 
-  // If terminalId matches a pending reservation → activate it
-  const pending = terminalId
-    ? db.prepare("SELECT * FROM peers WHERE terminal_id = ? AND status = 'pending' LIMIT 1")
-        .get(terminalId) as RawPeerRow | undefined
-    : undefined;
+  // Create/update peers only when an actual agent session registers.
+  db.exec("BEGIN");
+  try {
+    const allRows = selectAllPeers.all() as unknown as RawPeerRow[];
+    const existingIds = new Set(allRows.map(r => r.id));
 
-  if (pending) {
-    db.prepare(`UPDATE peers SET pid=?, cwd=?, git_root=?, tty=?, source=?,
-                agent_type=?, context_json=?, last_seen=?, status='active' WHERE id=?`)
-      .run(body.pid, body.cwd, body.gitRoot, body.tty, source,
-           body.agentType, JSON.stringify(body.context), now, pending.id);
-    id = pending.id;
-  } else {
-    // Manual launch (no terminalId) or extension peer — create or update peer
-    db.exec("BEGIN");
-    try {
-      const allRows = selectAllPeers.all() as unknown as RawPeerRow[];
-      const existingIds = new Set(allRows.map(r => r.id));
-
-      if (body.preferredId && existingIds.has(body.preferredId)) {
-        // preferredId already exists → UPDATE in place (e.g. ext peer re-registering)
-        db.prepare(`UPDATE peers SET pid=?, cwd=?, git_root=?, tty=?, source=?, terminal_id=?,
-                    agent_type=?, ext_host_id=?, context_json=?, last_seen=?, status='active'
-                    WHERE id=?`)
-          .run(body.pid, body.cwd, body.gitRoot, body.tty, source,
-               terminalId, body.agentType, body.extHostId ?? null,
-               JSON.stringify(body.context), now, body.preferredId);
-        id = body.preferredId;
-      } else {
-        id = body.preferredId && !existingIds.has(body.preferredId)
-          ? body.preferredId
-          : generateId(existingIds);
-        insertPeer.run(id, body.agentType, source, body.pid, body.cwd, body.gitRoot,
-                       body.tty, terminalId, body.extHostId ?? null,
-                       JSON.stringify(body.context), now, now, "active");
-      }
-      db.exec("COMMIT");
-    } catch (e) { db.exec("ROLLBACK"); throw e; }
-  }
+    if (body.preferredId && existingIds.has(body.preferredId)) {
+      // preferredId already exists → UPDATE in place (e.g. ext peer re-registering)
+      db.prepare(`UPDATE peers SET pid=?, cwd=?, git_root=?, tty=?, source=?, terminal_id=?,
+                  agent_type=?, ext_host_id=?, context_json=?, last_seen=?, status='active'
+                  WHERE id=?`)
+        .run(body.pid, body.cwd, body.gitRoot, body.tty, source,
+             terminalId, body.agentType, body.extHostId ?? null,
+             JSON.stringify(body.context), now, body.preferredId);
+      id = body.preferredId;
+    } else {
+      id = body.preferredId && !existingIds.has(body.preferredId)
+        ? body.preferredId
+        : generateId(existingIds);
+      insertPeer.run(id, body.agentType, source, body.pid, body.cwd, body.gitRoot,
+                     body.tty, terminalId, body.extHostId ?? null,
+                     JSON.stringify(body.context), now, now, "active");
+    }
+    db.exec("COMMIT");
+  } catch (e) { db.exec("ROLLBACK"); throw e; }
 
   const peer = rowToPeer(selectPeerById.get(id) as unknown as RawPeerRow);
   // Re-registration of an existing preferredId → peer-updated (not peer-joined) to avoid sidebar duplication
@@ -532,18 +622,6 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     broadcast({ type: "peer-joined", data: peer, timestamp: now } satisfies WsPeerJoinedEvent);
   }
   return { id };
-}
-
-function handleReservePeer(body: ReservePeerRequest): ReservePeerResponse {
-  const now = new Date().toISOString();
-  const existingIds = new Set((selectAllPeers.all() as unknown as RawPeerRow[]).map(r => r.id));
-  const id = generateId(existingIds);
-  insertPeer.run(id, body.agentType, "terminal", 0, "", null,
-                 null, body.terminalId, body.extHostId,
-                 JSON.stringify({ summary: "", activeFiles: [], git: null, updatedAt: now }),
-                 now, now, "pending");
-  // Do NOT broadcast peer-joined yet — CLI hasn't started
-  return { id, name: id };
 }
 
 function handleHeartbeat(body: HeartbeatRequest): { ok: boolean } {
@@ -707,14 +785,7 @@ function handleSendMessage(body: SendMessageRequest): SendMessageResponse {
     return { ok: false, error: `Peer ${body.toId} is pending (CLI not running).` };
   }
 
-  // Reject task-handoff to extension peers — they cannot autonomously execute tasks
   const targetSource = target.source ?? "terminal";
-  if (targetSource !== "terminal" && body.type === "task-handoff") {
-    return {
-      ok: false,
-      error: `Cannot send task-handoff to extension peer ${body.toId}: extension peers cannot execute tasks autonomously. Choose a terminal peer instead.`,
-    };
-  }
 
   // For report messages to extension peers, validate the replyTo chain
   if (targetSource !== "terminal" && body.type === "report") {
@@ -960,7 +1031,7 @@ function handleCheckConflicts(body: CheckConflictsRequest): CheckConflictsRespon
     // Check 4: Recent context overlap — digest or assistant turns vs prompt
     const ctx = peer.context;
     const contextText = ctx.conversationDigest
-      ?? ctx.recentExchange?.filter(e => e.role === "assistant").map(e => e.text).join(" ")
+      ?? ctx.recentExchange
       ?? "";
     if (contextText) {
       const contextTokens = extractTokens(contextText);
@@ -987,11 +1058,11 @@ function handleCheckConflicts(body: CheckConflictsRequest): CheckConflictsRespon
   // Check 5: Historical memory overlap — past memories about the same files/areas
   const advisories: ConflictAdvisory[] = [];
   if (body.gitRoot) {
-    const repoMemories = (selectRecentMemoriesByRepo.all(body.gitRoot, 100) as unknown as RawMemoryRow[]);
+    const repoMemories = (selectRecentMemoriesByRepo.all(body.gitRoot, new Date().toISOString(), 100) as unknown as RawMemoryRow[]);
     for (const row of repoMemories) {
       const memFiles = JSON.parse(row.files_json || "[]") as string[];
       const memAreas = JSON.parse(row.areas_json || "[]") as string[];
-      const memTokens = extractTokens(`${row.title} ${row.content}`);
+      const memTokens = extractTokens(row.summary);
       const tokenOverlap = memTokens.filter(t => promptTokens.includes(t)).length;
       const fileOverlap = memFiles.filter(f => {
         const basename = f.split("/").pop()!.toLowerCase();
@@ -1001,27 +1072,18 @@ function handleCheckConflicts(body: CheckConflictsRequest): CheckConflictsRespon
 
       const memScore = fileOverlap * 3 + areaOverlap * 2 + Math.min(tokenOverlap, 3);
       if (memScore >= 3) {
-        if (row.category === "issue") {
-          // Issue entries overlapping current task files → blocking-style warning
-          for (const c of conflicts) {
-            c.relatedMemories = c.relatedMemories ?? [];
-            c.relatedMemories.push({ id: row.id, category: row.category, title: row.title, createdAt: row.created_at });
-          }
-        }
-        if (row.category === "task") {
+        if (row.type === "short") {
           // Recent task entries from other peers → "currently in progress" notice
           for (const c of conflicts) {
             c.relatedMemories = c.relatedMemories ?? [];
-            c.relatedMemories.push({ id: row.id, category: row.category, title: row.title, createdAt: row.created_at });
+            c.relatedMemories.push({ id: row.id, type: row.type as "short", summary: row.summary, createdAt: row.created_at });
           }
         }
-        // Advisory surfacing — architecture entries as non-blocking background knowledge
-        if (row.category === "architecture") {
+        if (row.type === "long") {
           advisories.push({
             memoryId: row.id,
-            category: row.category,
-            title: row.title,
-            content: row.content.length > 200 ? row.content.slice(0, 200) + "\u2026" : row.content,
+            type: "long",
+            summary: row.summary,
           });
         }
       }
@@ -1036,14 +1098,11 @@ function handleCheckConflicts(body: CheckConflictsRequest): CheckConflictsRespon
 interface RawMemoryRow {
   id: number;
   git_root: string;
-  category: string;
-  title: string;
-  content: string;
+  type: string;
+  summary: string;
   files_json: string;
   areas_json: string;
-  source_peer_id: string | null;
-  source_exchange: string | null;
-  content_hash: string;
+  expires_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -1052,21 +1111,14 @@ function rowToMemory(row: RawMemoryRow): RepoMemory {
   return {
     id: row.id,
     gitRoot: row.git_root,
-    category: row.category as RepoMemory["category"],
-    title: row.title,
-    content: row.content,
+    type: row.type as RepoMemory["type"],
+    summary: row.summary,
     files: JSON.parse(row.files_json || "[]") as string[],
     areas: JSON.parse(row.areas_json || "[]") as string[],
-    sourcePeerId: row.source_peer_id,
-    contentHash: row.content_hash,
+    expiresAt: row.expires_at ?? undefined,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
-}
-
-function computeContentHash(category: string, title: string, content: string): string {
-  const normalized = `${category}|${title.toLowerCase().trim()}|${content.toLowerCase().trim().slice(0, 500)}`;
-  return crypto.createHash("sha256").update(normalized).digest("hex");
 }
 
 /** Sanitize user query for FTS5 MATCH syntax */
@@ -1079,18 +1131,19 @@ function sanitizeFtsQuery(query: string): string {
 }
 
 function handleAddMemory(body: AddMemoryRequest): AddMemoryResponse {
-  const hash = computeContentHash(body.category, body.title, body.content);
-  const existing = selectMemoryByHash.get(hash, body.gitRoot) as unknown as { id: number } | undefined;
+  const existing = selectMemoryByIdentity.get(body.gitRoot, body.type, body.summary) as unknown as { id: number } | undefined;
   if (existing) {
     updateMemoryTimestamp.run(new Date().toISOString(), existing.id);
     return { ok: true, id: existing.id, duplicate: true };
   }
   const now = new Date().toISOString();
+  const expiresAt = body.type === "short"
+    ? body.expiresAt ?? new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
+    : null;
   insertMemory.run(
-    body.gitRoot, body.category, body.title, body.content,
+    body.gitRoot, body.type, body.summary,
     JSON.stringify(body.files ?? []), JSON.stringify(body.areas ?? []),
-    body.sourcePeerId ?? null, body.sourceExchange ?? null,
-    hash, now, now,
+    expiresAt, now, now,
   );
   const lastId = (db.prepare("SELECT last_insert_rowid() as id").get() as unknown as { id: number }).id;
   broadcast({
@@ -1101,7 +1154,38 @@ function handleAddMemory(body: AddMemoryRequest): AddMemoryResponse {
   return { ok: true, id: lastId };
 }
 
+function handleUpsertMemory(body: AddMemoryRequest): AddMemoryResponse {
+  const filesJson = JSON.stringify(body.files ?? []);
+  const areasJson = JSON.stringify(body.areas ?? []);
+  const existing = (body.type === "long"
+    ? selectMemoryByScope.get(body.gitRoot, body.type, filesJson, areasJson)
+    : selectMemoryByIdentity.get(body.gitRoot, body.type, body.summary)) as unknown as { id: number } | undefined;
+  if (!existing) {
+    return handleAddMemory(body);
+  }
+
+  const now = new Date().toISOString();
+  const expiresAt = body.type === "short"
+    ? body.expiresAt ?? new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
+    : null;
+  updateMemoryById.run(
+    body.summary,
+    filesJson,
+    areasJson,
+    expiresAt,
+    now,
+    existing.id,
+  );
+  broadcast({
+    type: "memory-added",
+    data: { gitRoot: body.gitRoot, memoryId: existing.id },
+    timestamp: now,
+  } satisfies WsMemoryAddedEvent);
+  return { ok: true, id: existing.id, duplicate: true };
+}
+
 function handleSearchMemory(body: SearchMemoryRequest): SearchMemoryResponse {
+  const now = new Date().toISOString();
   const limit = Math.min(body.limit ?? 20, 100);
   const queryTokens = extractTokens(body.query);
   if (queryTokens.length === 0) return { memories: [] };
@@ -1112,12 +1196,12 @@ function handleSearchMemory(body: SearchMemoryRequest): SearchMemoryResponse {
   if (hasFts5) {
     try {
       const ftsQuery = sanitizeFtsQuery(body.query);
-      const stmt = body.category
-        ? db.prepare(`SELECT m.*, fts.rank FROM repo_memories_fts fts JOIN repo_memories m ON m.id = fts.rowid WHERE repo_memories_fts MATCH ? AND m.git_root = ? AND m.category = ? ORDER BY fts.rank LIMIT ?`)
-        : db.prepare(`SELECT m.*, fts.rank FROM repo_memories_fts fts JOIN repo_memories m ON m.id = fts.rowid WHERE repo_memories_fts MATCH ? AND m.git_root = ? ORDER BY fts.rank LIMIT ?`);
-      candidates = (body.category
-        ? stmt.all(ftsQuery, body.gitRoot, body.category, limit * 2)
-        : stmt.all(ftsQuery, body.gitRoot, limit * 2)
+      const stmt = body.type
+        ? db.prepare(`SELECT m.*, fts.rank FROM repo_memories_fts fts JOIN repo_memories m ON m.id = fts.rowid WHERE repo_memories_fts MATCH ? AND m.git_root = ? AND m.type = ? AND (m.expires_at IS NULL OR m.expires_at > ?) ORDER BY fts.rank LIMIT ?`)
+        : db.prepare(`SELECT m.*, fts.rank FROM repo_memories_fts fts JOIN repo_memories m ON m.id = fts.rowid WHERE repo_memories_fts MATCH ? AND m.git_root = ? AND (m.expires_at IS NULL OR m.expires_at > ?) ORDER BY fts.rank LIMIT ?`);
+      candidates = (body.type
+        ? stmt.all(ftsQuery, body.gitRoot, body.type, now, limit * 2)
+        : stmt.all(ftsQuery, body.gitRoot, now, limit * 2)
       ) as unknown as RawMemoryRow[];
     } catch {
       // FTS5 query error — fall back to token-based
@@ -1130,7 +1214,7 @@ function handleSearchMemory(body: SearchMemoryRequest): SearchMemoryResponse {
   // Post-score with file/area overlap
   const scored = candidates.map(row => {
     let score = (row as unknown as { rank?: number }).rank ? Math.abs((row as unknown as { rank: number }).rank) : 0;
-    const memTokens = extractTokens(`${row.title} ${row.content}`);
+    const memTokens = extractTokens(row.summary);
     score += memTokens.filter(t => queryTokens.includes(t)).length;
 
     if (body.files?.length) {
@@ -1155,18 +1239,22 @@ function handleSearchMemory(body: SearchMemoryRequest): SearchMemoryResponse {
 }
 
 function getFallbackCandidates(body: SearchMemoryRequest): RawMemoryRow[] {
-  return body.category
-    ? selectMemoriesByRepoAndCategory.all(body.gitRoot, body.category, 200, 0) as unknown as RawMemoryRow[]
-    : selectMemoriesByRepo.all(body.gitRoot, 200, 0) as unknown as RawMemoryRow[];
+  const now = new Date().toISOString();
+  return body.type
+    ? selectMemoriesByRepoAndType.all(body.gitRoot, body.type, now, 200, 0) as unknown as RawMemoryRow[]
+    : selectMemoriesByRepo.all(body.gitRoot, now, 200, 0) as unknown as RawMemoryRow[];
 }
 
 function handleListMemories(body: ListMemoriesRequest): ListMemoriesResponse {
+  const now = new Date().toISOString();
   const limit = Math.min(body.limit ?? 20, 100);
   const offset = body.offset ?? 0;
-  const rows = body.category
-    ? selectMemoriesByRepoAndCategory.all(body.gitRoot, body.category, limit, offset) as unknown as RawMemoryRow[]
-    : selectMemoriesByRepo.all(body.gitRoot, limit, offset) as unknown as RawMemoryRow[];
-  const total = (countMemoriesByRepo.get(body.gitRoot) as unknown as { cnt: number }).cnt;
+  const rows = body.type
+    ? selectMemoriesByRepoAndType.all(body.gitRoot, body.type, now, limit, offset) as unknown as RawMemoryRow[]
+    : selectMemoriesByRepo.all(body.gitRoot, now, limit, offset) as unknown as RawMemoryRow[];
+  const total = body.type
+    ? (countMemoriesByRepoAndType.get(body.gitRoot, body.type, now) as unknown as { cnt: number }).cnt
+    : (countMemoriesByRepo.get(body.gitRoot, now) as unknown as { cnt: number }).cnt;
   return { memories: rows.map(rowToMemory), total };
 }
 
@@ -1231,14 +1319,18 @@ function handleWakePeer(body: { id: string }): { ok: boolean; delivered: number 
   return { ok: sent, delivered };
 }
 
-function handleUpdateConfig(body: { autoConflictCheck?: boolean; maxContextLength?: number }): { ok: boolean; autoConflictCheck: boolean; maxContextLength: number } {
+function handleUpdateConfig(body: { autoConflictCheck?: boolean; maxRecentContextChars?: number }): { ok: boolean; autoConflictCheck: boolean; maxRecentContextChars: number } {
   if (body.autoConflictCheck !== undefined) {
     AUTO_CONFLICT_CHECK = body.autoConflictCheck;
   }
-  if (body.maxContextLength !== undefined && body.maxContextLength > 0) {
-    MAX_CONTEXT_LENGTH = body.maxContextLength;
+  if (body.maxRecentContextChars !== undefined && body.maxRecentContextChars > 0) {
+    MAX_RECENT_CONTEXT_CHARS = body.maxRecentContextChars;
   }
-  return { ok: true, autoConflictCheck: AUTO_CONFLICT_CHECK, maxContextLength: MAX_CONTEXT_LENGTH };
+  return {
+    ok: true,
+    autoConflictCheck: AUTO_CONFLICT_CHECK,
+    maxRecentContextChars: MAX_RECENT_CONTEXT_CHARS,
+  };
 }
 
 function handleHealth(): BrokerHealthResponse {
@@ -1248,7 +1340,7 @@ function handleHealth(): BrokerHealthResponse {
     peerCount: (selectAllPeers.all() as unknown as RawPeerRow[]).length,
     uptime: Math.floor((Date.now() - startTime) / 1000),
     autoConflictCheck: AUTO_CONFLICT_CHECK,
-    maxContextLength: MAX_CONTEXT_LENGTH,
+    maxRecentContextChars: MAX_RECENT_CONTEXT_CHARS,
   };
 }
 
@@ -1281,9 +1373,6 @@ async function handleRequest(req: Request): Promise<Response> {
 
     let result: unknown;
     switch (path) {
-      case "/reserve-peer":
-        result = handleReservePeer(body as ReservePeerRequest);
-        break;
       case "/register":
         result = handleRegister(body as RegisterRequest);
         break;
@@ -1324,6 +1413,9 @@ async function handleRequest(req: Request): Promise<Response> {
         break;
       case "/repo-memory/add":
         result = handleAddMemory(body as AddMemoryRequest);
+        break;
+      case "/repo-memory/upsert":
+        result = handleUpsertMemory(body as AddMemoryRequest);
         break;
       case "/repo-memory/search":
         result = handleSearchMemory(body as SearchMemoryRequest);
@@ -1472,26 +1564,7 @@ wss.on("connection", (ws) => {
           // All WS connections for this peer are gone — decide what to do
           const row = selectPeerById.get(identifiedPeerId) as unknown as RawPeerRow | undefined;
           if (row) {
-            let ownerAlive = false;
-            if (row.pid > 0) {
-              try { process.kill(row.pid, 0); ownerAlive = true; } catch { /* dead */ }
-            }
-            if (row.terminal_id && !ownerAlive) {
-              // CLI exited but terminal still exists → go pending
-              const now = new Date().toISOString();
-              db.prepare("UPDATE peers SET status='pending', pid=0, last_seen=? WHERE id=?")
-                .run(now, identifiedPeerId);
-              const updatedRow = selectPeerById.get(identifiedPeerId) as unknown as RawPeerRow;
-              broadcast({
-                type: "peer-updated",
-                data: rowToPeer(updatedRow),
-                timestamp: now,
-              } satisfies WsPeerUpdatedEvent);
-              log(`Peer ${identifiedPeerId} went pending (CLI exited, terminal alive)`);
-            } else {
-              // No terminal_id (manual launch or extension) → hard remove
-              removePeer(identifiedPeerId);
-            }
+            removePeer(identifiedPeerId);
           }
         }
       }
@@ -1509,23 +1582,7 @@ wss.on("connection", (ws) => {
           wsPeerClients.delete(identifiedPeerId);
           const row = selectPeerById.get(identifiedPeerId) as unknown as RawPeerRow | undefined;
           if (row) {
-            let ownerAlive = false;
-            if (row.pid > 0) {
-              try { process.kill(row.pid, 0); ownerAlive = true; } catch { /* dead */ }
-            }
-            if (row.terminal_id && !ownerAlive) {
-              const now = new Date().toISOString();
-              db.prepare("UPDATE peers SET status='pending', pid=0, last_seen=? WHERE id=?")
-                .run(now, identifiedPeerId);
-              const updatedRow = selectPeerById.get(identifiedPeerId) as unknown as RawPeerRow;
-              broadcast({
-                type: "peer-updated",
-                data: rowToPeer(updatedRow),
-                timestamp: now,
-              } satisfies WsPeerUpdatedEvent);
-            } else {
-              removePeer(identifiedPeerId);
-            }
+            removePeer(identifiedPeerId);
           }
         }
       }

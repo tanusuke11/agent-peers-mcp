@@ -73,6 +73,12 @@
         "category": "Agent Peers"
       },
       {
+        "command": "agentPeers.rescueHandoff",
+        "title": "Rescue Task Handoff (Rate-Limited Peer)",
+        "icon": "$(life-preserver)",
+        "category": "Agent Peers"
+      },
+      {
         "command": "agentPeers.startBroker",
         "title": "Start Broker Daemon",
         "icon": "$(play)",
@@ -130,6 +136,12 @@
         "command": "agentPeers.toggleAutoConflictCheck",
         "title": "Toggle Auto Conflict Check",
         "icon": "$(shield)",
+        "category": "Agent Peers"
+      },
+      {
+        "command": "agentPeers.updateLongMemory",
+        "title": "Update Long Memory",
+        "icon": "$(database)",
         "category": "Agent Peers"
       },
       {
@@ -212,10 +224,10 @@
           "default": true,
           "description": "When ON, automatically checks for conflicts with other peers before every prompt (via hook) and when sharing context. When OFF, conflicts are only checked when explicitly using the check_conflicts tool."
         },
-        "agentPeers.maxContextLength": {
+        "agentPeers.maxRecentContextChars": {
           "type": "number",
-          "default": 30,
-          "description": "Number of recent conversation exchanges to include in the shared context (recentExchange markdown document)."
+          "default": 6000,
+          "description": "Maximum total characters to include in shared recent conversation context. The newest exchanges are kept until this budget is filled."
         }
       }
     }

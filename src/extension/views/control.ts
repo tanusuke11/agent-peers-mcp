@@ -6,6 +6,18 @@
 import * as vscode from "vscode";
 import type { BrokerClient } from "../broker-client";
 
+const DEFAULT_MAX_RECENT_CONTEXT_CHARS = 6000;
+
+function getConfiguredMaxRecentContextChars(): number {
+  const cfg = vscode.workspace.getConfiguration("agentPeers");
+  const configured = cfg.get<number>("maxRecentContextChars");
+  if (configured && configured > 0) {
+    return configured;
+  }
+
+  return DEFAULT_MAX_RECENT_CONTEXT_CHARS;
+}
+
 export class ControlProvider implements vscode.TreeDataProvider<ControlItem> {
   private _onDidChangeTreeData = new vscode.EventEmitter<ControlItem | undefined>();
   readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
@@ -51,12 +63,18 @@ export class ControlProvider implements vscode.TreeDataProvider<ControlItem> {
       autoConflict ? "ON — checks peers before work" : "OFF — manual only",
     ));
 
-    // Max context length (number of recent exchanges in shared context)
-    const maxContextLength = vscode.workspace.getConfiguration("agentPeers").get<number>("maxContextLength", 30);
+    // Shared context budget (total chars across recent exchanges)
+    const maxRecentContextChars = getConfiguredMaxRecentContextChars();
     items.push(ControlItem.action(
-      "Max Context Length", "agentPeers.setMaxContextLength",
+      "Context Budget", "agentPeers.setContextBudget",
       "list-ordered", "charts.foreground",
-      `${maxContextLength} exchanges`,
+      `${maxRecentContextChars.toLocaleString()} chars`,
+    ));
+
+    items.push(ControlItem.action(
+      "Update Long Memory", "agentPeers.updateLongMemory",
+      "database", "charts.purple",
+      "Refresh stable repo facts",
     ));
 
     // Broker actions — disable the irrelevant one based on state
@@ -86,6 +104,12 @@ export class ControlProvider implements vscode.TreeDataProvider<ControlItem> {
     ));
 
     // Terminal grid launchers
+    items.push(ControlItem.action(
+      "Rescue Task Handoff", this.brokerConnected ? "agentPeers.rescueHandoff" : undefined,
+      "life-preserver", this.brokerConnected ? "charts.yellow" : "disabledForeground",
+      "Hand off work from rate-limited peer",
+    ));
+
     items.push(ControlItem.action(
       "Align Terminal Grid", "agentPeers.openTerminalGrid",
       "terminal", "charts.foreground",

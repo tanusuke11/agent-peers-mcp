@@ -1,17 +1,16 @@
 /**
  * Memory tree view provider
- * Shows repo-level shared memory entries grouped by project (git root) and category.
+ * Shows repo-level shared memory entries grouped by project (git root) and type.
  */
 
 import * as path from "path";
 import * as vscode from "vscode";
 import type { BrokerClient } from "../broker-client";
-import type { Peer, RepoMemory } from "../../shared/types";
+import type { RepoMemory } from "../../shared/types";
 
-const CATEGORY_ICONS: Record<string, { icon: string; color: string }> = {
-  "task": { icon: "tasklist", color: "charts.blue" },
-  "issue": { icon: "bug", color: "charts.orange" },
-  "architecture": { icon: "symbol-structure", color: "charts.purple" },
+const TYPE_ICONS: Record<string, { icon: string; color: string }> = {
+  "short": { icon: "history", color: "charts.blue" },
+  "long": { icon: "database", color: "charts.purple" },
 };
 
 export class MemoryProvider implements vscode.TreeDataProvider<MemoryItem> {
@@ -69,51 +68,52 @@ export class MemoryProvider implements vscode.TreeDataProvider<MemoryItem> {
         return [MemoryItem.info("No memories yet")];
       }
 
-      const byCategory = new Map<string, RepoMemory[]>();
+      const byType = new Map<string, RepoMemory[]>();
       for (const m of memories) {
-        const list = byCategory.get(m.category) ?? [];
+        const list = byType.get(m.type) ?? [];
         list.push(m);
-        byCategory.set(m.category, list);
+        byType.set(m.type, list);
       }
 
       const items: MemoryItem[] = [];
-      for (const [category, mems] of byCategory) {
-        const cfg = CATEGORY_ICONS[category] ?? { icon: "note", color: "charts.foreground" };
+      for (const [type, mems] of byType) {
+        const cfg = TYPE_ICONS[type] ?? { icon: "note", color: "charts.foreground" };
         const catItem = new MemoryItem(
-          `${category} (${mems.length})`,
+          `${type} (${mems.length})`,
           cfg.icon,
           new vscode.ThemeColor(cfg.color),
         );
-        catItem.id = `memory:${gitRoot}:cat:${category}`;
+        catItem.id = `memory:${gitRoot}:type:${type}`;
         catItem.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
         catItem.children = mems.map((m) => {
-          const item = new MemoryItem(m.title, cfg.icon, new vscode.ThemeColor(cfg.color));
+          const item = new MemoryItem(m.summary, cfg.icon, new vscode.ThemeColor(cfg.color));
           item.id = `memory:${gitRoot}:${m.id}`;
-          item.description = m.sourcePeerId ?? undefined;
+          item.description = m.expiresAt ? `expires ${m.expiresAt.slice(0, 10)}` : undefined;
           item.tooltip = new vscode.MarkdownString(
-            `**[${m.category}] ${m.title}**\n\n${m.content}\n\n` +
+            `**[${m.type}]** ${m.summary}\n\n` +
               (m.files.length ? `Files: ${m.files.join(", ")}\n\n` : "") +
-              `By: ${m.sourcePeerId ?? "unknown"} · ${m.updatedAt}`,
+              (m.expiresAt ? `Expires: ${m.expiresAt}\n\n` : "") +
+              `Updated: ${m.updatedAt}`,
           );
           item.command = {
             command: "agentPeers.showRepoMemoryDetail",
             title: "Show Repo Memory Detail",
             arguments: [{
-              title: `Memory #${m.id}: ${m.title}`,
+              title: `Memory #${m.id}`,
               header: [
                 `# Repo Memory #${m.id}`,
                 "",
-                `- **Category:** ${m.category}`,
-                `- **By:** ${m.sourcePeerId ?? "unknown"}`,
+                `- **Type:** ${m.type}`,
                 `- **Created:** ${m.createdAt}`,
                 `- **Updated:** ${m.updatedAt}`,
+                m.expiresAt ? `- **Expires:** ${m.expiresAt}` : "",
                 m.files.length ? `- **Files:** ${m.files.join(", ")}` : "",
                 m.areas.length ? `- **Areas:** ${m.areas.join(", ")}` : "",
                 "",
                 "---",
                 "",
               ].filter(Boolean).join("\n"),
-              text: m.content,
+              text: m.summary,
             }],
           };
           return item;

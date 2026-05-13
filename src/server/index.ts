@@ -59,6 +59,7 @@ import {
   HEARTBEAT_INTERVAL_MS,
 } from "../shared/constants.ts";
 import { onProcessTermination, findNodeBinary } from "../shared/process.ts";
+import { buildCanonicalArchitectureMemories } from "../shared/canonical-architecture.ts";
 import { extractMemoriesFromExchanges } from "../shared/memory-compression.ts";
 import {
   gatherGitContext,
@@ -76,6 +77,8 @@ const AGENT_TYPE = (process.env.AGENT_PEERS_AGENT_TYPE ?? "claude-code") as Agen
 const TRUST_BROKER_ID_ONLY = process.env.AGENT_PEERS_TRUST_BROKER_ID_ONLY !== "false"; // default: true
 const BROKER_SCRIPT = path.join(__dirname, "..", "broker", "index.js");
 const CODEX_SESSIONS_DIR = path.join(os.homedir(), ".codex", "sessions");
+
+type RecentExchange = { role: "human" | "assistant"; text: string; timestamp: string };
 
 // ─── Broker communication ──────────────────────────────────────
 
@@ -238,6 +241,7 @@ function looksLikeExtensionOwner(cmdLine: string, owner: number): boolean {
   return (
     lower.includes("anthropic.claude-code")
     || (lower.includes("resources/native-binary/claude") && lower.includes("--input-format stream-json"))
+    || (lower.includes("openai.chatgpt") && lower.includes("codex") && lower.includes("app-server"))
   );
 }
 
@@ -469,9 +473,12 @@ function parsePsElapsedSeconds(value: string): number | null {
   let minutes = 0;
   let seconds = 0;
   if (timeParts.length === 3) {
-    [hours, minutes, seconds] = timeParts;
+    hours = timeParts[0]!;
+    minutes = timeParts[1]!;
+    seconds = timeParts[2]!;
   } else if (timeParts.length === 2) {
-    [minutes, seconds] = timeParts;
+    minutes = timeParts[0]!;
+    seconds = timeParts[1]!;
   } else {
     return null;
   }
@@ -565,6 +572,46 @@ function extractCodexMessageText(content: unknown, role: "user" | "assistant"): 
     .trim();
 }
 
+function extractCodexPayloadMessage(payload: unknown): RecentExchange | null {
+  if (!payload || typeof payload !== "object") return null;
+  const data = payload as Record<string, unknown>;
+
+  if (data.type === "message") {
+    const role = data.role as "user" | "assistant" | undefined;
+    if (role !== "user" && role !== "assistant") return null;
+    const text = extractCodexMessageText(data.content, role);
+    if (!text || text.includes("<environment_context>")) return null;
+    return {
+      role: role === "user" ? "human" : "assistant",
+      text,
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  if (data.type === "user_message" || data.type === "agent_message") {
+    const text = typeof data.message === "string" ? data.message.trim() : "";
+    if (!text || text.includes("<environment_context>")) return null;
+    return {
+      role: data.type === "user_message" ? "human" : "assistant",
+      text,
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  return null;
+}
+
+function pushCodexExchange(exchanges: RecentExchange[], exchange: RecentExchange, maxCharsPerExchange: number, timestamp?: unknown): void {
+  const truncated: RecentExchange = {
+    ...exchange,
+    text: truncateExchangeText(exchange.text, maxCharsPerExchange),
+    timestamp: typeof timestamp === "string" ? timestamp : exchange.timestamp,
+  };
+  const previous = exchanges[exchanges.length - 1];
+  if (previous && previous.role === truncated.role && previous.text === truncated.text) return;
+  exchanges.push(truncated);
+}
+
 type CodexSessionMeta = {
   cwd: string | null;
   startedAtMs: number | null;
@@ -591,6 +638,11 @@ function readCodexSessionMeta(file: string): CodexSessionMeta {
         }
 
         if (!cwd && obj.type === "session_meta" && obj.payload && typeof obj.payload === "object") {
+          const payload = obj.payload as Record<string, unknown>;
+          if (typeof payload.cwd === "string") cwd = payload.cwd;
+        }
+
+        if (!cwd && obj.type === "turn_context" && obj.payload && typeof obj.payload === "object") {
           const payload = obj.payload as Record<string, unknown>;
           if (typeof payload.cwd === "string") cwd = payload.cwd;
         }
@@ -646,61 +698,98 @@ function findCodexSessionFileUncached(): string | null {
 const EXCHANGE_MAX_CHARS = 200;
 /** Larger limit for memory extraction — patterns like "decided to" often appear deeper in responses */
 const EXTRACTION_MAX_CHARS = 1500;
-let cachedMaxContextLength = 30; // updated from broker health on each heartbeat
+const DEFAULT_MAX_RECENT_CONTEXT_CHARS = 6000;
+const MEMORY_EXTRACTION_MAX_TOTAL_CHARS = 12000;
+let cachedMaxRecentContextChars = DEFAULT_MAX_RECENT_CONTEXT_CHARS; // updated from broker health on each heartbeat
+
+function formatRecentExchange(exchange: RecentExchange): string {
+  return `## ${exchange.role === "human" ? "Human" : "Assistant"} · ${exchange.timestamp}\n\n${exchange.text}`;
+}
+
+function truncateExchangeText(text: string, maxCharsPerExchange: number): string {
+  return text.length > maxCharsPerExchange ? text.slice(0, maxCharsPerExchange) + "…" : text;
+}
+
+function selectRecentExchangesWithinBudget(exchanges: RecentExchange[], maxTotalChars: number): RecentExchange[] {
+  if (exchanges.length === 0) return [];
+
+  const selected: RecentExchange[] = [];
+  let totalChars = 0;
+
+  for (let i = exchanges.length - 1; i >= 0; i--) {
+    const exchange = exchanges[i]!;
+    const blockLength = formatRecentExchange(exchange).length + (selected.length > 0 ? 2 : 0);
+
+    if (selected.length > 0 && totalChars + blockLength > maxTotalChars) {
+      break;
+    }
+
+    selected.unshift(exchange);
+    totalChars += blockLength;
+
+    if (totalChars >= maxTotalChars) {
+      break;
+    }
+  }
+
+  return selected;
+}
 
 /** Format a list of raw exchanges into a single markdown document. */
 function buildRecentContextMarkdown(
-  exchanges: Array<{ role: "human" | "assistant"; text: string; timestamp: string }>,
+  exchanges: RecentExchange[],
 ): string {
   return exchanges
-    .map((ex) => `## ${ex.role === "human" ? "Human" : "Assistant"} · ${ex.timestamp}\n\n${ex.text}`)
+    .map(formatRecentExchange)
     .join("\n\n");
 }
 
-/** Read recent human/assistant exchanges from the session JSONL and return as a single markdown document. */
-function getRecentExchanges(maxCharsPerExchange = EXCHANGE_MAX_CHARS): string {
-  if (AGENT_TYPE === "codex") {
-    try {
-      const file = findCodexSessionFile();
-      if (!file) return "";
-
-      const lines = fs.readFileSync(file, "utf8").split("\n").filter(Boolean);
-      const exchanges: Array<{ role: "human" | "assistant"; text: string; timestamp: string }> = [];
-
-      for (const line of lines) {
-        try {
-          const obj = JSON.parse(line) as Record<string, unknown>;
-          if (obj.type !== "message") continue;
-
-          const role = obj.role as "user" | "assistant" | undefined;
-          if (role !== "user" && role !== "assistant") continue;
-
-          const text = extractCodexMessageText(obj.content, role);
-          if (!text || text.includes("<environment_context>")) continue;
-
-          exchanges.push({
-            role: role === "user" ? "human" : "assistant",
-            text: text.length > maxCharsPerExchange ? text.slice(0, maxCharsPerExchange) + "…" : text,
-            timestamp: typeof obj.timestamp === "string" ? obj.timestamp : new Date().toISOString(),
-          });
-        } catch { /* skip */ }
-      }
-
-      return buildRecentContextMarkdown(exchanges.slice(-cachedMaxContextLength));
-    } catch { return ""; }
-  }
-
-  // Only Claude Code writes the ~/.claude session JSONL files we inspect below.
-  // Other agent types should explicitly add their own reader rather than falling
-  // back to another tool's session logs.
-  if (AGENT_TYPE !== "claude-code") return "";
-
+function loadCodexRecentExchanges(maxCharsPerExchange: number): RecentExchange[] {
   try {
-    const file = findSessionFile();
-    if (!file) return "";
+    const file = findCodexSessionFile();
+    if (!file) return [];
 
     const lines = fs.readFileSync(file, "utf8").split("\n").filter(Boolean);
-    const exchanges: Array<{ role: "human" | "assistant"; text: string; timestamp: string }> = [];
+    const exchanges: RecentExchange[] = [];
+
+    for (const line of lines) {
+      try {
+        const obj = JSON.parse(line) as Record<string, unknown>;
+
+        if (obj.type === "response_item" || obj.type === "event_msg") {
+          const exchange = extractCodexPayloadMessage(obj.payload);
+          if (exchange) pushCodexExchange(exchanges, exchange, maxCharsPerExchange, obj.timestamp);
+          continue;
+        }
+
+        if (obj.type !== "message") continue;
+
+        const role = obj.role as "user" | "assistant" | undefined;
+        if (role !== "user" && role !== "assistant") continue;
+
+        const text = extractCodexMessageText(obj.content, role);
+        if (!text || text.includes("<environment_context>")) continue;
+        pushCodexExchange(exchanges, {
+          role: role === "user" ? "human" : "assistant",
+          text,
+          timestamp: typeof obj.timestamp === "string" ? obj.timestamp : new Date().toISOString(),
+        }, maxCharsPerExchange, obj.timestamp);
+      } catch { /* skip */ }
+    }
+
+    return exchanges;
+  } catch {
+    return [];
+  }
+}
+
+function loadClaudeRecentExchanges(maxCharsPerExchange: number): RecentExchange[] {
+  try {
+    const file = findSessionFile();
+    if (!file) return [];
+
+    const lines = fs.readFileSync(file, "utf8").split("\n").filter(Boolean);
+    const exchanges: RecentExchange[] = [];
 
     for (const line of lines) {
       try {
@@ -723,15 +812,31 @@ function getRecentExchanges(maxCharsPerExchange = EXCHANGE_MAX_CHARS): string {
 
           exchanges.push({
             role,
-            text: text.length > maxCharsPerExchange ? text.slice(0, maxCharsPerExchange) + "…" : text,
+            text: truncateExchangeText(text, maxCharsPerExchange),
             timestamp: obj.timestamp ?? new Date().toISOString(),
           });
         }
       } catch { /* skip */ }
     }
 
-    return buildRecentContextMarkdown(exchanges.slice(-cachedMaxContextLength));
-  } catch { return ""; }
+    return exchanges;
+  } catch {
+    return [];
+  }
+}
+
+/** Read recent human/assistant exchanges from the session JSONL and return them as a bounded markdown document. */
+function getRecentExchanges(options?: { maxCharsPerExchange?: number; maxTotalChars?: number }): string {
+  const maxCharsPerExchange = options?.maxCharsPerExchange ?? EXCHANGE_MAX_CHARS;
+  const maxTotalChars = options?.maxTotalChars ?? cachedMaxRecentContextChars;
+
+  const exchanges = AGENT_TYPE === "codex"
+    ? loadCodexRecentExchanges(maxCharsPerExchange)
+    : AGENT_TYPE === "claude-code"
+      ? loadClaudeRecentExchanges(maxCharsPerExchange)
+      : [];
+
+  return buildRecentContextMarkdown(selectRecentExchangesWithinBudget(exchanges, maxTotalChars));
 }
 
 // ─── Conversation Digest (AI-generated summary) ─────────────
@@ -889,10 +994,33 @@ function log(msg: string) {
 let myId: PeerId | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
+let lastCanonicalArchitectureFingerprint = "";
 /** Files already modified at registration time — used to compute agent-only changes */
 let baselineModifiedFiles: string[] = [];
 /** Cached session title for taskIntent computation */
 let cachedSessionTitle: string | null = null;
+
+async function syncCanonicalArchitectureMemories(): Promise<void> {
+  if (!myId || !myGitRoot) return;
+
+  const memories = buildCanonicalArchitectureMemories(myGitRoot);
+  if (memories.length === 0) return;
+
+  const fingerprint = JSON.stringify(memories.map(memory => [memory.type, memory.summary]));
+  if (fingerprint === lastCanonicalArchitectureFingerprint) return;
+  lastCanonicalArchitectureFingerprint = fingerprint;
+
+  for (const memory of memories) {
+    await brokerFetch<AddMemoryResponse>("/repo-memory/add", {
+      gitRoot: myGitRoot,
+      type: memory.type,
+      summary: memory.summary,
+      files: memory.files,
+      areas: memory.areas,
+      expiresAt: memory.expiresAt,
+    }).catch(() => {});
+  }
+}
 
 // ─── MCP Server ────────────────────────────────────────────────
 
@@ -916,11 +1044,11 @@ Available tools:
 - set_summary: Set a brief summary of what you're working on
 - check_messages: Manually check for new messages
 - check_conflicts: Check if planned work conflicts with other agents before starting
-- save_memory: Save a task record, issue, or architecture note to the shared repo memory
-- search_memory: Search repo memory for past architecture decisions, known issues, and task records
+- save_memory: Save a long-lived repo fact or a short-lived task memory
+- search_memory: Search repo memory for long-lived repo facts and short-lived task records
 - list_memories: List recent entries from the shared repo memory
 
-When you start, proactively call share_context to publish your current state. This helps other agents understand what you're working on. Before starting a new task, use check_conflicts to verify no other agents are working on the same files. When you make important architectural decisions, discover open issues, or finish significant tasks, save them with save_memory so future agents benefit.`,
+When you start, proactively call share_context to publish your current state. This helps other agents understand what you're working on. Before starting a new task, use check_conflicts to verify no other agents are working on the same files. Save long memories for stable repo facts and short memories for active work that should expire.`,
   }
 );
 
@@ -1144,6 +1272,9 @@ mcp.registerTool("check_conflicts", {
       return { content: [{ type: "text" as const, text: "No conflicts detected. Safe to proceed." }] };
     }
     const lines: string[] = [];
+    if (!hasConflicts && hasAdvisories) {
+      lines.push("No active peer conflicts detected.");
+    }
     if (hasConflicts) {
       lines.push("⚠ Potential conflict(s) detected:\n");
       for (const c of result.conflicts) {
@@ -1153,7 +1284,7 @@ mcp.registerTool("check_conflicts", {
         lines.push(`  Files: ${files.join(", ")}${c.taskIntent.targetFiles.length > 5 ? " ..." : ""}`);
         lines.push(`  Conflict: ${c.reason} (confidence: ${c.confidence})`);
         if (c.relatedMemories?.length) {
-          lines.push(`  Related memories: ${c.relatedMemories.map(m => `#${m.id} [${m.category}] ${m.title}`).join("; ")}`);
+          lines.push(`  Related memories: ${c.relatedMemories.map(m => `#${m.id} [${m.type}] ${m.summary}`).join("; ")}`);
         }
       }
       lines.push("");
@@ -1164,9 +1295,9 @@ mcp.registerTool("check_conflicts", {
     }
     if (hasAdvisories) {
       lines.push("");
-      lines.push("Relevant repo memory (architecture/issues):");
+      lines.push("Relevant long memory:");
       for (const a of result.advisories!) {
-        lines.push(`- [${a.category}] ${a.title}: ${a.content}`);
+        lines.push(`- [${a.type}] ${a.summary}`);
       }
     }
     return { content: [{ type: "text" as const, text: lines.join("\n") }] };
@@ -1178,23 +1309,23 @@ mcp.registerTool("check_conflicts", {
 // ─── Repo Memory MCP Tools ──────────────────────────────────
 
 mcp.registerTool("save_memory", {
-  description: "Save a memory to the shared repo memory. All peers in the same repo can search and retrieve these memories. Use 'task' to record what a peer did or is doing, 'issue' to log open problems or bugs, 'architecture' to record how the project is built (modules, conventions, decisions, file layout).",
+  description: "Save a memory to the shared repo memory. Use 'long' for stable repo facts or warnings worth keeping. Use 'short' for active or recent task context that should expire.",
   inputSchema: {
-    category: z.enum(["task", "issue", "architecture"]).describe("Category. Use 'task' to record what a peer did or is doing. Use 'issue' to log open problems or bugs. Use 'architecture' to record how the project is built (modules, conventions, decisions, file layout)."),
-    title: z.string().describe("Short title summarizing the memory (under 100 chars)"),
-    content: z.string().describe("Detailed content: WHAT was done, WHY, and the OUTCOME (under 500 chars)"),
+    type: z.enum(["long", "short"]).describe("Memory type. Use 'long' for stable repo facts. Use 'short' for active or recent task context."),
+    summary: z.string().describe("Short memory summary (160 chars max)"),
     files: z.array(z.string()).optional().describe("Related file paths"),
     areas: z.array(z.string()).optional().describe("Related directory/module areas (e.g. 'src/broker')"),
+    expires_at: z.string().optional().describe("Optional ISO timestamp when a short memory should expire"),
   },
-}, async ({ category, title, content, files, areas }) => {
+}, async ({ type, summary, files, areas, expires_at }) => {
   if (!myId || !myGitRoot) {
     return { content: [{ type: "text" as const, text: "Not registered or not in a git repo." }], isError: true };
   }
   try {
     const result = await brokerFetch<AddMemoryResponse>("/repo-memory/add", {
       gitRoot: myGitRoot,
-      sourcePeerId: myId,
-      category, title, content, files, areas,
+      type, summary, files, areas,
+      expiresAt: expires_at,
     });
     if (result.duplicate) {
       return { content: [{ type: "text" as const, text: `Memory already exists (id: ${result.id}). Updated timestamp.` }] };
@@ -1206,27 +1337,27 @@ mcp.registerTool("save_memory", {
 });
 
 mcp.registerTool("search_memory", {
-  description: "Search the shared repo memory for relevant context. Returns memories saved by any peer in the same repo that match the query keywords. Use before starting work to check for relevant historical context, past decisions, or known issues.",
+  description: "Search the shared repo memory for relevant context. Returns long or short memories whose summary matches the query.",
   inputSchema: {
     query: z.string().describe("Search query (keywords describing what you're looking for)"),
-    category: z.enum(["task", "issue", "architecture"]).optional().describe("Filter by category"),
+    type: z.enum(["long", "short"]).optional().describe("Filter by memory type"),
     files: z.array(z.string()).optional().describe("Filter by related file paths"),
     areas: z.array(z.string()).optional().describe("Filter by related directory/module areas"),
     limit: z.number().optional().describe("Max results (default 10)"),
   },
-}, async ({ query, category, files, areas, limit }) => {
+}, async ({ query, type, files, areas, limit }) => {
   if (!myGitRoot) {
     return { content: [{ type: "text" as const, text: "Not in a git repo." }], isError: true };
   }
   try {
     const result = await brokerFetch<SearchMemoryResponse>("/repo-memory/search", {
-      gitRoot: myGitRoot, query, category, files, areas, limit: limit ?? 10,
+      gitRoot: myGitRoot, query, type, files, areas, limit: limit ?? 10,
     });
     if (result.memories.length === 0) {
       return { content: [{ type: "text" as const, text: "No matching memories found." }] };
     }
     const lines = result.memories.map(m =>
-      `#${m.id} [${m.category}] ${m.title} (score: ${m.score.toFixed(1)}, by: ${m.sourcePeerId ?? "unknown"}, ${m.createdAt})\n  ${m.content}`
+      `#${m.id} [${m.type}] ${m.summary} (score: ${m.score.toFixed(1)}, ${m.createdAt})`
     );
     return { content: [{ type: "text" as const, text: `Found ${result.memories.length} memory(ies):\n\n${lines.join("\n\n")}` }] };
   } catch (e) {
@@ -1237,22 +1368,22 @@ mcp.registerTool("search_memory", {
 mcp.registerTool("list_memories", {
   description: "List recent memories from the shared repo memory store. Shows what the team of agents has learned about this repository.",
   inputSchema: {
-    category: z.enum(["task", "issue", "architecture"]).optional().describe("Filter by category"),
+    type: z.enum(["long", "short"]).optional().describe("Filter by memory type"),
     limit: z.number().optional().describe("Max results (default 20)"),
   },
-}, async ({ category, limit }) => {
+}, async ({ type, limit }) => {
   if (!myGitRoot) {
     return { content: [{ type: "text" as const, text: "Not in a git repo." }], isError: true };
   }
   try {
     const result = await brokerFetch<ListMemoriesResponse>("/repo-memory/list", {
-      gitRoot: myGitRoot, category, limit: limit ?? 20,
+      gitRoot: myGitRoot, type, limit: limit ?? 20,
     });
     if (result.memories.length === 0) {
       return { content: [{ type: "text" as const, text: "No memories yet for this repo." }] };
     }
     const lines = result.memories.map(m =>
-      `#${m.id} [${m.category}] ${m.title} (by: ${m.sourcePeerId ?? "unknown"}, ${m.updatedAt})\n  ${m.content}`
+      `#${m.id} [${m.type}] ${m.summary} (${m.updatedAt}${m.expiresAt ? `, expires ${m.expiresAt}` : ""})`
     );
     return { content: [{ type: "text" as const, text: `${result.total} total memories. Showing ${result.memories.length}:\n\n${lines.join("\n\n")}` }] };
   } catch (e) {
@@ -1395,6 +1526,8 @@ async function registerWithBroker(): Promise<void> {
     await cleanupMisclassifiedExtensionPeers(preferredId);
   }
 
+  await syncCanonicalArchitectureMemories();
+
   // Try to restore session title immediately after (re-)registration
   if (AGENT_TYPE === "claude-code") {
     try {
@@ -1491,10 +1624,15 @@ async function main() {
   const heartbeatTimer = setInterval(async () => {
     if (!myId) return;
     try {
-      // Refresh config from broker (picks up maxContextLength changes in real-time)
+      // Refresh config from broker (picks up context budget changes in real-time)
       fetch(`${BROKER_URL}/health`, { signal: AbortSignal.timeout(1000) })
-        .then(r => r.ok ? r.json() as Promise<{ maxContextLength?: number }> : null)
-        .then(h => { if (h?.maxContextLength) cachedMaxContextLength = h.maxContextLength; })
+        .then(r => r.ok ? r.json() as Promise<{ maxRecentContextChars?: number }> : null)
+        .then((h) => {
+          const nextBudget = h?.maxRecentContextChars;
+          if (nextBudget && nextBudget > 0) {
+            cachedMaxRecentContextChars = nextBudget;
+          }
+        })
         .catch(() => { /* non-critical */ });
 
       const result = await brokerFetch<{ ok: boolean }>("/heartbeat", { id: myId, pid: ownerPid, source: mySource });
@@ -1570,6 +1708,8 @@ async function main() {
         await brokerFetch("/update-context", { id: myId, context: contextUpdate });
       }
 
+      await syncCanonicalArchitectureMemories();
+
       // Periodic memory extraction (every 5 minutes)
       const now = Date.now();
       if (myGitRoot && now - lastMemoryExtractionTime > MEMORY_EXTRACTION_INTERVAL_MS) {
@@ -1580,7 +1720,10 @@ async function main() {
           f => !new Set(baselineModifiedFiles).has(f),
         );
         // Use full text for extraction (not the 200-char truncated context version)
-        const fullExchange = getRecentExchanges(EXTRACTION_MAX_CHARS);
+        const fullExchange = getRecentExchanges({
+          maxCharsPerExchange: EXTRACTION_MAX_CHARS,
+          maxTotalChars: MEMORY_EXTRACTION_MAX_TOTAL_CHARS,
+        });
         const exchangeGrew = fullExchange.length > lastExtractionExchangeLen;
         // Trigger on: new commits, file modifications, OR conversation growth
         if (newCommits || agentModifiedFiles.length >= 1 || (exchangeGrew && fullExchange.length >= 50)) {
@@ -1591,9 +1734,12 @@ async function main() {
             const memories = extractMemoriesFromExchanges(fullExchange, gitCtx, cachedSessionTitle);
             for (const mem of memories) {
               brokerFetch("/repo-memory/add", {
-                gitRoot: myGitRoot!, sourcePeerId: myId!,
-                category: mem.category, title: mem.title, content: mem.content,
-                files: mem.files, areas: mem.areas, sourceExchange: mem.sourceExchange,
+                gitRoot: myGitRoot!,
+                type: mem.type,
+                summary: mem.summary,
+                files: mem.files,
+                areas: mem.areas,
+                expiresAt: mem.expiresAt,
               }).catch(() => {}); // Non-critical
             }
           } catch { /* non-critical */ }
@@ -1619,7 +1765,10 @@ async function main() {
     // Extract memories from session before sleeping (use full text for pattern matching)
     if (myId && myGitRoot) {
       try {
-        const exchange = getRecentExchanges(EXTRACTION_MAX_CHARS);
+        const exchange = getRecentExchanges({
+          maxCharsPerExchange: EXTRACTION_MAX_CHARS,
+          maxTotalChars: MEMORY_EXTRACTION_MAX_TOTAL_CHARS,
+        });
         const gitCtx = await gatherGitContext(myCwd);
         if (gitCtx) {
           gitCtx.baselineModifiedFiles = baselineModifiedFiles;
@@ -1627,9 +1776,12 @@ async function main() {
         const memories = extractMemoriesFromExchanges(exchange, gitCtx, cachedSessionTitle);
         for (const mem of memories) {
           await brokerFetch("/repo-memory/add", {
-            gitRoot: myGitRoot, sourcePeerId: myId,
-            category: mem.category, title: mem.title, content: mem.content,
-            files: mem.files, areas: mem.areas, sourceExchange: mem.sourceExchange,
+            gitRoot: myGitRoot,
+            type: mem.type,
+            summary: mem.summary,
+            files: mem.files,
+            areas: mem.areas,
+            expiresAt: mem.expiresAt,
           }).catch(() => {}); // Non-critical
         }
         if (memories.length > 0) log(`Extracted ${memories.length} memory(ies) to repo memory`);

@@ -55,13 +55,14 @@ export class PeerListProvider implements vscode.TreeDataProvider<PeerItem> {
       return element.children ?? [];
     }
 
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
     const workspaceGitRoot = await this.client.getGitRoot();
     const peers = await this.client.listPeers("machine");
 
     // Group peers by git root (or cwd if no git root)
     const groups = new Map<string, { label: string; isLocal: boolean; peers: Peer[] }>();
     for (const p of peers) {
-      const key = p.gitRoot ?? p.cwd;
+      const key = (p.gitRoot ?? p.cwd) || (workspaceGitRoot ?? workspaceFolder);
       if (!groups.has(key)) {
         const dirName = path.basename(key) || key;
         groups.set(key, { label: dirName, isLocal: key === workspaceGitRoot, peers: [] });
@@ -82,9 +83,12 @@ export class PeerListProvider implements vscode.TreeDataProvider<PeerItem> {
         .map((p) => {
           const isExtPeer = p.source === "extension";
           const displayType = agentDisplayName(p.agentType);
-          const label = isExtPeer
-            ? `${agentEmoji(p.agentType)} ${displayType} [ext]`
-            : `${agentEmoji(p.agentType)} ${displayType} (${animalEmoji(p.id)}${p.id})${sourceTag(p.source)}`;
+          const isUnassignedTerminal = p.source === "terminal" && p.status === "pending";
+          const label = isUnassignedTerminal
+            ? `⚪ (${animalEmoji(p.id)}${p.id})${sourceTag(p.source)}`
+            : isExtPeer
+              ? `${agentEmoji(p.agentType)} ${displayType} [ext]`
+              : `${agentEmoji(p.agentType)} ${displayType} (${animalEmoji(p.id)}${p.id})${sourceTag(p.source)}`;
           const description = formatPeerDescription(p) || undefined;
           return new PeerItem(label, p.id, "peer", p, undefined, undefined, description);
         })

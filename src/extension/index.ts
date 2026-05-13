@@ -16,6 +16,7 @@ import { MemoryProvider } from "./views/memory";
 import type { MarkdownViewItem } from "./views/webview-content";
 import { forceKillProcess, findNodeBinary } from "../shared/process";
 import type { Peer, AgentType } from "../shared/types";
+import { buildCanonicalArchitectureMemories } from "../shared/canonical-architecture";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
@@ -40,6 +41,120 @@ const pendingDeliveries = new Map<string, PendingDelivery>();
 
 /** How long to wait for additional messages before flushing (ms). */
 const MESSAGE_BATCH_DELAY_MS = 600;
+const RESCUE_EXCHANGE_MAX_CHARS = 1500;
+const RESCUE_MAX_RECENT_CONTEXT_CHARS = 8000;
+
+type RescueExchange = { role: "human" | "assistant"; text: string; timestamp: string };
+
+function truncateRescueText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, maxChars)}\n...[truncated]`;
+}
+
+function extractCodexContentText(content: unknown, role: "user" | "assistant"): string {
+  if (!Array.isArray(content)) return "";
+  const allowedTypes = role === "user" ? new Set(["input_text", "text"]) : new Set(["output_text", "text"]);
+  return content
+    .filter((block): block is { type?: string; text?: string } => !!block && typeof block === "object")
+    .filter((block) => typeof block.type === "string" && allowedTypes.has(block.type))
+    .map((block) => typeof block.text === "string" ? block.text : "")
+    .join(" ")
+    .trim();
+}
+
+function extractCodexExchange(obj: Record<string, unknown>): RescueExchange | null {
+  const timestamp = typeof obj.timestamp === "string" ? obj.timestamp : new Date().toISOString();
+
+  if (obj.type === "message") {
+    const role = obj.role as "user" | "assistant" | undefined;
+    if (role !== "user" && role !== "assistant") return null;
+    const text = extractCodexContentText(obj.content, role);
+    if (!text || text.includes("<environment_context>")) return null;
+    return { role: role === "user" ? "human" : "assistant", text, timestamp };
+  }
+
+  if ((obj.type === "response_item" || obj.type === "event_msg") && obj.payload && typeof obj.payload === "object") {
+    const payload = obj.payload as Record<string, unknown>;
+    if (payload.type === "message") {
+      const role = payload.role as "user" | "assistant" | undefined;
+      if (role !== "user" && role !== "assistant") return null;
+      const text = extractCodexContentText(payload.content, role);
+      if (!text || text.includes("<environment_context>")) return null;
+      return { role: role === "user" ? "human" : "assistant", text, timestamp };
+    }
+    if (payload.type === "user_message" || payload.type === "agent_message") {
+      const text = typeof payload.message === "string" ? payload.message.trim() : "";
+      if (!text || text.includes("<environment_context>")) return null;
+      return { role: payload.type === "user_message" ? "human" : "assistant", text, timestamp };
+    }
+  }
+
+  return null;
+}
+
+function codexSessionCwd(file: string): string | null {
+  try {
+    for (const line of fs.readFileSync(file, "utf8").split("\n").filter(Boolean)) {
+      try {
+        const obj = JSON.parse(line) as Record<string, unknown>;
+        if ((obj.type === "session_meta" || obj.type === "turn_context") && obj.payload && typeof obj.payload === "object") {
+          const cwd = (obj.payload as Record<string, unknown>).cwd;
+          if (typeof cwd === "string") return cwd;
+        }
+      } catch { /* skip */ }
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
+function findCodexSessionFiles(dir: string): string[] {
+  const files: string[] = [];
+  try {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) files.push(...findCodexSessionFiles(fullPath));
+      else if (entry.isFile() && entry.name.startsWith("rollout-") && entry.name.endsWith(".jsonl")) files.push(fullPath);
+    }
+  } catch { /* ignore */ }
+  return files;
+}
+
+function buildCodexRecentExchangeFallback(peer: Peer): string {
+  if (peer.agentType !== "codex") return "";
+  const sessionsDir = path.join(os.homedir(), ".codex", "sessions");
+  const file = findCodexSessionFiles(sessionsDir)
+    .map((sessionFile) => ({ sessionFile, mtime: fs.statSync(sessionFile).mtimeMs }))
+    .sort((a, b) => b.mtime - a.mtime)
+    .find(({ sessionFile }) => codexSessionCwd(sessionFile) === peer.cwd)?.sessionFile;
+  if (!file) return "";
+
+  const exchanges: RescueExchange[] = [];
+  try {
+    for (const line of fs.readFileSync(file, "utf8").split("\n").filter(Boolean)) {
+      try {
+        const exchange = extractCodexExchange(JSON.parse(line) as Record<string, unknown>);
+        if (!exchange) continue;
+        exchange.text = truncateRescueText(exchange.text, RESCUE_EXCHANGE_MAX_CHARS);
+        const previous = exchanges[exchanges.length - 1];
+        if (previous && previous.role === exchange.role && previous.text === exchange.text) continue;
+        exchanges.push(exchange);
+      } catch { /* skip */ }
+    }
+  } catch { return ""; }
+
+  const selected: RescueExchange[] = [];
+  let totalChars = 0;
+  for (let i = exchanges.length - 1; i >= 0; i--) {
+    const formatted = `## ${exchanges[i].role === "human" ? "Human" : "Assistant"} (${exchanges[i].timestamp})\n\n${exchanges[i].text}`;
+    if (selected.length > 0 && totalChars + formatted.length > RESCUE_MAX_RECENT_CONTEXT_CHARS) break;
+    selected.unshift(exchanges[i]);
+    totalChars += formatted.length;
+  }
+
+  return selected
+    .map((exchange) => `## ${exchange.role === "human" ? "Human" : "Assistant"} (${exchange.timestamp})\n\n${exchange.text}`)
+    .join("\n\n");
+}
 
 // ─── Terminal binding maps ────────────────────────────────
 
@@ -52,6 +167,8 @@ const terminalsById = new Map<string, vscode.Terminal>();
 const terminalIdsByTerminal = new WeakMap<vscode.Terminal, string>();
 /** Maps peerId → terminalId, populated on peer-joined for our terminals. */
 const peerTerminalIdById = new Map<string, string>();
+/** Serializes terminal renames because VS Code's rename command targets the active terminal. */
+let terminalRenameQueue: Promise<void> = Promise.resolve();
 
 function isKnownTerminal(terminal: vscode.Terminal): boolean {
   return vscode.window.terminals.includes(terminal);
@@ -157,6 +274,17 @@ async function cleanupStalePeers(): Promise<void> {
   } catch { /* broker may not be ready yet */ }
 }
 
+async function cleanupPendingReservations(): Promise<void> {
+  try {
+    const peers = await brokerClient.listPeers("machine");
+    for (const peer of peers) {
+      if (peer.source === "terminal" && peer.status === "pending" && peer.extHostId === extHostId) {
+        await brokerClient.deletePeer(peer.id).catch(() => {});
+      }
+    }
+  } catch { /* broker may not be ready yet */ }
+}
+
 /**
  * Reconcile terminal tab names with their peer IDs.
  * After (re)connecting to the broker, some terminals may show just "claude"
@@ -196,12 +324,22 @@ function detectAgentFromCommand(cmd: string): AgentType | null {
   return null;
 }
 
+async function renameTerminalForPeer(terminal: vscode.Terminal, agentType: AgentType, peerName: string): Promise<void> {
+  const rename = terminalRenameQueue.then(
+    () => doRenameTerminalForPeer(terminal, agentType, peerName),
+    () => doRenameTerminalForPeer(terminal, agentType, peerName),
+  );
+  terminalRenameQueue = rename.catch(() => {});
+  await rename;
+}
+
 /** Rename a terminal tab to include the peer's animal name.
  *  Uses VSCode's internal rename command (requires briefly focusing the terminal).
  *  Retries once if the rename didn't take effect. */
-async function renameTerminalForPeer(terminal: vscode.Terminal, agentType: AgentType, peerName: string): Promise<void> {
+async function doRenameTerminalForPeer(terminal: vscode.Terminal, agentType: AgentType, peerName: string): Promise<void> {
   if (!isKnownTerminal(terminal)) return;
   const newName = `${getTerminalAgentLabel(agentType)} • ${peerName}`;
+  if (terminal.name === newName) return;
   const previouslyActive = vscode.window.activeTerminal;
 
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -216,7 +354,7 @@ async function renameTerminalForPeer(terminal: vscode.Terminal, agentType: Agent
     await vscode.commands.executeCommand("workbench.action.terminal.renameWithArg", { name: newName });
     await new Promise(r => setTimeout(r, 100));
     // Check if rename succeeded
-    if (terminal.name.includes(peerName)) break;
+    if (terminal.name === newName) break;
   }
 
   // Restore previously active terminal
@@ -288,9 +426,23 @@ const GRID_SIZES = [
   { label: "1×2", description: "2 stacked", cols: 1, rows: 2 },
   { label: "2×2", description: "4 terminals", cols: 2, rows: 2 },
   { label: "3×1", description: "3 side by side", cols: 3, rows: 1 },
-  { label: "3×2", description: "6 terminals", cols: 3, rows: 2 },
-  { label: "2×3", description: "6 terminals", cols: 2, rows: 3 },
 ];
+
+const FOCUS_GROUP_COMMANDS = [
+  "workbench.action.focusFirstEditorGroup",
+  "workbench.action.focusSecondEditorGroup",
+  "workbench.action.focusThirdEditorGroup",
+  "workbench.action.focusFourthEditorGroup",
+  "workbench.action.focusFifthEditorGroup",
+  "workbench.action.focusSixthEditorGroup",
+  "workbench.action.focusSeventhEditorGroup",
+  "workbench.action.focusEighthEditorGroup",
+];
+
+function focusGroupCommand(oneBasedIndex: number): string {
+  const idx = Math.min(Math.max(oneBasedIndex, 1), FOCUS_GROUP_COMMANDS.length);
+  return FOCUS_GROUP_COMMANDS[idx - 1];
+}
 
 async function openTerminalGrid(command: string | undefined): Promise<void> {
   const picked = await vscode.window.showQuickPick(GRID_SIZES, {
@@ -305,70 +457,59 @@ async function openTerminalGrid(command: string | undefined): Promise<void> {
   // orientation: 0 = left-right (horizontal), 1 = top-bottom (vertical)
   const buildLayout = (): Record<string, unknown> => {
     if (total === 1) {
-      return { orientation: 0, groups: [{ size: 1 }] };
+      return { orientation: 0, groups: [{}] };
     }
     if (rows === 1) {
       return {
         orientation: 0,
-        groups: Array.from({ length: cols }, () => ({ size: 1 })),
+        groups: Array.from({ length: cols }, () => ({})),
       };
     }
     if (cols === 1) {
       return {
         orientation: 1,
-        groups: Array.from({ length: rows }, () => ({ size: 1 })),
+        groups: Array.from({ length: rows }, () => ({})),
       };
     }
     return {
       orientation: 1,
       groups: Array.from({ length: rows }, () => ({
         orientation: 0,
-        groups: Array.from({ length: cols }, () => ({ size: 1 })),
-        size: 1,
+        groups: Array.from({ length: cols }, () => ({})),
       })),
     };
   };
 
+  // First, collapse to a single group so we start from a clean slate.
+  // Otherwise leftover groups from a previous layout can interfere with
+  // the new grid (e.g. the new layout being merged with stale columns).
+  await vscode.commands.executeCommand("vscode.setEditorLayout", { orientation: 0, groups: [{}] });
+  await new Promise(resolve => setTimeout(resolve, 150));
+
   await vscode.commands.executeCommand("vscode.setEditorLayout", buildLayout());
   await new Promise(resolve => setTimeout(resolve, 300));
 
-  const groups = [...vscode.window.tabGroups.all]
-    .sort((a, b) => Number(a.viewColumn) - Number(b.viewColumn))
-    .slice(0, total);
+  // Snapshot which groups already have terminals before we start creating new ones.
+  const preExistingTerminalGroups = new Set(
+    vscode.window.tabGroups.all
+      .filter(g => hasActiveTerminalTab(g))
+      .map(g => Number(g.viewColumn))
+  );
 
-  // Create a terminal editor tab only in groups that do not already have an
-  // active terminal session. Existing terminal editors are preserved in place
-  // and only participate in the arranged layout.
-  //
-  // We create new terminals with an explicit `location: { viewColumn }` so each
-  // one lands in the intended group regardless of which group is currently
-  // focused. `createTerminalEditor` (the command) targets the active group
-  // only, which is unreliable when some groups are still empty — new empty
-  // groups can get merged/collapsed before the command runs.
-  for (const group of groups) {
-    if (hasActiveTerminalTab(group)) {
+  // Create terminals by focusing each group in order and using ViewColumn.Active.
+  // This is more reliable than `location: { viewColumn }` for multi-row layouts,
+  // where VS Code may not correctly place terminals into the right grid cell.
+  for (let i = 1; i <= total; i++) {
+    if (preExistingTerminalGroups.has(i)) {
       continue;
     }
 
-    const viewColumn = group.viewColumn;
+    await vscode.commands.executeCommand(focusGroupCommand(i));
+    await new Promise(resolve => setTimeout(resolve, 100));
 
     const terminalId = randomUUID();
-    // Reserve a peer slot first so the tab title is set at creation time.
-    // We don't yet know whether the user will run claude/codex/something else,
-    // so the initial title is just the animal name (e.g. "swan"). Once the CLI
-    // registers, bindPeerToTerminal will rename it to "claude • swan" or
-    // "codex • swan" based on the actual agent type.
-    let terminalName: string | undefined;
-    let reservedPeerId: string | null = null;
-    try {
-      const reservation = await brokerClient.reservePeer(terminalId, extHostId, "claude-code");
-      reservedPeerId = reservation.id;
-      terminalName = reservation.name;
-    } catch { /* broker not running — create unnamed terminal, CLI will register normally */ }
-
     const terminal = vscode.window.createTerminal({
-      name: terminalName,
-      location: { viewColumn } as vscode.TerminalEditorLocationOptions,
+      location: { viewColumn: vscode.ViewColumn.Active } as vscode.TerminalEditorLocationOptions,
       env: {
         AGENT_PEERS_TERMINAL_ID: terminalId,
         AGENT_PEERS_EXT_HOST: extHostId,
@@ -376,14 +517,9 @@ async function openTerminalGrid(command: string | undefined): Promise<void> {
     });
     terminalsById.set(terminalId, terminal);
     terminalIdsByTerminal.set(terminal, terminalId);
-    if (reservedPeerId) {
-      peerTerminalIdById.set(reservedPeerId, terminalId);
-    }
     terminal.show(false);
 
-    // Give VS Code a moment to actually open the terminal editor in the group
-    // before we move on — otherwise the next iteration's focus/creation can
-    // race with it and cause groups to collapse.
+    // Wait for the terminal editor to open in the group before moving on.
     await new Promise(resolve => setTimeout(resolve, 150));
 
     if (command) {
@@ -495,8 +631,10 @@ export function activate(extensionContext: vscode.ExtensionContext) {
     peerListProvider.refresh();
     memoryProvider.refresh();
   });
-  brokerClient.on("peer-updated", () => {
+  brokerClient.on("peer-updated", (data) => {
+    const peer = data as Peer | undefined;
     peerListProvider.refresh();
+    if (peer) void bindPeerToTerminal(peer);
   });
   brokerClient.on("context-updated", () => {
     peerListProvider.refresh();
@@ -707,7 +845,15 @@ export function activate(extensionContext: vscode.ExtensionContext) {
         return;
       }
 
-      const items = peers.map((p) => {
+      const selfPeer = peers.find((p) => p.source === "extension" && p.extHostId === extHostId);
+      if (!selfPeer) {
+        vscode.window.showWarningMessage("This extension peer is not registered yet.");
+        return;
+      }
+
+      const items = peers
+        .filter((p) => p.id !== selfPeer.id)
+        .map((p) => {
         const sourceLabel = p.source === "extension" ? "[ext]" : "[term]";
         return {
           label: `${p.agentType} — ${p.id} ${sourceLabel}`,
@@ -717,6 +863,11 @@ export function activate(extensionContext: vscode.ExtensionContext) {
           source: p.source,
         };
       });
+
+      if (items.length === 0) {
+        vscode.window.showInformationMessage("No other peers available to message.");
+        return;
+      }
 
       const selected = await vscode.window.showQuickPick(items, {
         placeHolder: "Select a peer to message",
@@ -730,7 +881,7 @@ export function activate(extensionContext: vscode.ExtensionContext) {
       if (!message) return;
 
       try {
-        await brokerClient.sendMessage("vscode-extension", selected.peerId, "text", message);
+        await brokerClient.sendMessage(selfPeer.id, selected.peerId, "text", message);
         vscode.window.showInformationMessage(`Message sent to ${selected.peerId}`);
       } catch (e) {
         vscode.window.showErrorMessage(`Failed to send message: ${e}`);
@@ -739,6 +890,140 @@ export function activate(extensionContext: vscode.ExtensionContext) {
 
     vscode.commands.registerCommand("agentPeers.shareContext", async () => {
       vscode.window.showInformationMessage("Context sharing is handled automatically by the MCP server.");
+    }),
+
+    vscode.commands.registerCommand("agentPeers.rescueHandoff", async () => {
+      const peers = await brokerClient.listPeers("machine");
+      const selfPeer = peers.find((p) => p.source === "extension" && p.extHostId === extHostId);
+      const candidatePeers = peers.filter((p) => p.id !== selfPeer?.id);
+      if (candidatePeers.length < 2) {
+        vscode.window.showInformationMessage("Need at least 2 peers for a rescue handoff.");
+        return;
+      }
+
+      // Step 1: Pick the stuck (rate-limited) peer
+      const stuckItems = candidatePeers.map((p) => {
+        const sourceLabel = p.source === "extension" ? "[ext]" : "[term]";
+        return {
+          label: `$(error) ${p.agentType} — ${p.id} ${sourceLabel}`,
+          description: p.context.currentTask || p.context.summary || "",
+          detail: `CWD: ${p.cwd}${p.context.git?.branch ? ` | Branch: ${p.context.git.branch}` : ""}`,
+          peer: p,
+        };
+      });
+      const stuckPick = await vscode.window.showQuickPick(stuckItems, {
+        title: "$(warning) Step 1/2 — FROM: Rate-limited peer",
+        placeHolder: "Who is stuck? Select the peer that hit the rate limit",
+      });
+      if (!stuckPick) return;
+
+      // Step 2: Pick the target peer
+      const targetItems = candidatePeers
+        .filter((p) => p.id !== stuckPick.peer.id)
+        .map((p) => {
+          const sourceLabel = p.source === "extension" ? "[ext]" : "[term]";
+          return {
+            label: `$(play) ${p.agentType} — ${p.id} ${sourceLabel}`,
+            description: p.context.currentTask || p.context.summary || "",
+            detail: `CWD: ${p.cwd}${p.context.git?.branch ? ` | Branch: ${p.context.git.branch}` : ""}`,
+            peer: p,
+          };
+        });
+      const targetPick = await vscode.window.showQuickPick(targetItems, {
+        title: `$(arrow-right) Step 2/2 — TO: Take over from ${stuckPick.peer.id}`,
+        placeHolder: "Who should continue the work?",
+      });
+      if (!targetPick) return;
+
+      // Step 3: Compose the handoff message from the stuck peer's context
+      const refreshedPeers = await brokerClient.listPeers("machine");
+      const stuck = refreshedPeers.find((p) => p.id === stuckPick.peer.id) ?? stuckPick.peer;
+      const storedMessages = await brokerClient.listMessages(stuck.id);
+      const localRecentExchange = stuck.context.recentExchange ? "" : buildCodexRecentExchangeFallback(stuck);
+      const hasCapturedContext = !!(
+        stuck.context.currentTask ||
+        stuck.context.summary ||
+        stuck.context.conversationDigest ||
+        stuck.context.recentExchange ||
+        localRecentExchange ||
+        stuck.context.taskIntent?.description ||
+        stuck.context.git?.modifiedFiles?.length ||
+        stuck.context.activeFiles?.length
+      );
+      const parts: string[] = [];
+      parts.push("## Rescue Task Handoff");
+      parts.push(`The peer **${stuck.id}** (${stuck.agentType}) hit a rate limit and cannot continue.`);
+      parts.push("Please take over the following work:\n");
+
+      if (!hasCapturedContext) {
+        parts.push("### Context Capture Warning");
+        parts.push("No live conversation context was captured for the source peer yet. If this looks empty, wait for the source peer heartbeat or restart its MCP/extension after updating Agent Peers, then run Rescue Task Handoff again.\n");
+      }
+
+      if (stuck.context.currentTask) {
+        parts.push(`### Current Task\n${stuck.context.currentTask}\n`);
+      }
+      if (stuck.context.summary) {
+        parts.push(`### Context Summary\n${stuck.context.summary}\n`);
+      }
+      if (stuck.context.conversationDigest) {
+        parts.push(`### Conversation Digest\n${stuck.context.conversationDigest}\n`);
+      }
+      if (stuck.context.taskIntent) {
+        const ti = stuck.context.taskIntent;
+        parts.push(`### Task Intent`);
+        parts.push(`- Action: ${ti.action}`);
+        parts.push(`- Description: ${ti.description}`);
+        if (ti.targetFiles.length > 0) parts.push(`- Target Files: ${ti.targetFiles.join(", ")}`);
+        if (ti.targetAreas.length > 0) parts.push(`- Target Areas: ${ti.targetAreas.join(", ")}`);
+        parts.push("");
+      }
+      if (stuck.context.git) {
+        const g = stuck.context.git;
+        if (g.branch) parts.push(`### Git\n- Branch: ${g.branch}`);
+        if (g.modifiedFiles && g.modifiedFiles.length > 0) {
+          parts.push(`- Modified files: ${g.modifiedFiles.join(", ")}`);
+        }
+        parts.push("");
+      }
+      if (stuck.context.recentExchange) {
+        parts.push(`### Recent Conversation\n${stuck.context.recentExchange}\n`);
+      }
+      if (localRecentExchange) {
+        parts.push(`### Recent Conversation (local Codex session fallback)\n${localRecentExchange}\n`);
+      }
+      if (storedMessages.length > 0) {
+        const recentMessages = storedMessages.slice(-5);
+        parts.push("### Stored Agent Peers Messages");
+        for (const msg of recentMessages) {
+          const direction = msg.fromId === stuck.id ? "sent" : "received";
+          parts.push(`#### ${direction}: ${msg.type} #${msg.id}`);
+          parts.push(msg.text);
+          parts.push("");
+        }
+      }
+
+      const handoffText = parts.join("\n");
+
+      // Step 4: Let the user review/edit before sending
+      const doc = await vscode.workspace.openTextDocument({ content: handoffText, language: "markdown" });
+      const editor = await vscode.window.showTextDocument(doc);
+
+      const confirmed = await vscode.window.showInformationMessage(
+        `Send rescue handoff from ${stuck.id} → ${targetPick.peer.id}? Edit the document first if needed, then confirm.`,
+        { modal: true },
+        "Send Handoff",
+      );
+      if (confirmed !== "Send Handoff") return;
+
+      const finalText = editor.document.getText();
+
+      try {
+        await brokerClient.sendMessage(stuck.id, targetPick.peer.id, "task-handoff", finalText, { fromUser: true, force: true });
+        vscode.window.showInformationMessage(`Rescue handoff sent to ${targetPick.peer.id}`);
+      } catch (e) {
+        vscode.window.showErrorMessage(`Failed to send rescue handoff: ${e}`);
+      }
     }),
 
     vscode.commands.registerCommand("agentPeers.startBroker", async () => {
@@ -1002,12 +1287,13 @@ AGENT_PEERS_AGENT_TYPE = "codex"
       controlProvider.refresh();
     }),
 
-    vscode.commands.registerCommand("agentPeers.setMaxContextLength", async () => {
+    vscode.commands.registerCommand("agentPeers.setContextBudget", async () => {
       const cfg = vscode.workspace.getConfiguration("agentPeers");
-      const current = cfg.get<number>("maxContextLength", 30);
+      const configured = cfg.get<number>("maxRecentContextChars");
+      const current = configured && configured > 0 ? configured : 6000;
       const input = await vscode.window.showInputBox({
-        title: "Max Context Length",
-        prompt: "Number of recent conversation exchanges to include in shared context",
+        title: "Context Budget",
+        prompt: "Maximum total characters to keep in shared recent conversation context",
         value: String(current),
         validateInput: (v) => {
           const n = parseInt(v, 10);
@@ -1016,9 +1302,46 @@ AGENT_PEERS_AGENT_TYPE = "codex"
       });
       if (input === undefined) return;
       const newValue = parseInt(input, 10);
-      await cfg.update("maxContextLength", newValue, vscode.ConfigurationTarget.Global);
-      await brokerClient.updateConfig({ maxContextLength: newValue });
+      await cfg.update("maxRecentContextChars", newValue, vscode.ConfigurationTarget.Global);
+      await brokerClient.updateConfig({ maxRecentContextChars: newValue });
       controlProvider.refresh();
+    }),
+
+    vscode.commands.registerCommand("agentPeers.updateLongMemory", async () => {
+      const health = await brokerClient.health(500);
+      if (!health) {
+        vscode.window.showWarningMessage("Agent Peers broker is not running.");
+        return;
+      }
+
+      const gitRoot = await brokerClient.getGitRoot();
+      if (!gitRoot) {
+        vscode.window.showWarningMessage("Open a git repository before updating long memory.");
+        return;
+      }
+
+      const memories = buildCanonicalArchitectureMemories(gitRoot);
+      if (memories.length === 0) {
+        vscode.window.showInformationMessage("No long memory entries found to update.");
+        return;
+      }
+
+      try {
+        for (const memory of memories) {
+          await brokerClient.upsertRepoMemory({
+            gitRoot,
+            type: memory.type,
+            summary: memory.summary,
+            files: memory.files,
+            areas: memory.areas,
+            expiresAt: memory.expiresAt,
+          });
+        }
+        memoryProvider.refresh();
+        vscode.window.showInformationMessage(`Updated ${memories.length} long memory entr${memories.length === 1 ? "y" : "ies"}.`);
+      } catch (e) {
+        vscode.window.showErrorMessage(`Failed to update long memory: ${e}`);
+      }
     }),
 
     vscode.commands.registerCommand("agentPeers.openMessageInEditor", async (item?: MessageViewItem) => {
@@ -1103,7 +1426,7 @@ AGENT_PEERS_AGENT_TYPE = "codex"
   brokerClient.on("broker-connected", () => {
     setBrokerConnected(true);
     // First recover existing terminal bindings, then remove truly stale peers.
-    void reconcileTerminalNames().then(() => cleanupStalePeers());
+    void reconcileTerminalNames().then(() => cleanupPendingReservations()).then(() => cleanupStalePeers());
     // Register the extension itself as a peer (source="extension", no terminalId).
     // preferredId is per-workspace so each VSCode window gets a stable, distinct ext peer.
     const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();

@@ -188,7 +188,7 @@ bun src/cli.ts context <id>    # Show peer's full context
 | `agentPeers.pollIntervalMs` | `1000` | Message polling interval (ms) |
 | `agentPeers.autoDeliveryMessage` | `true` | Auto-deliver incoming messages to the terminal; when off, messages require manual approval |
 | `agentPeers.autoConflictCheck` | `true` | Run conflict check automatically before every prompt (via hook) and on `share_context` |
-| `agentPeers.maxContextLength` | `30` | Number of recent conversation exchanges to include in the shared context digest |
+| `agentPeers.maxRecentContextChars` | `6000` | Maximum total characters to include in shared recent conversation context |
 
 ## Build & Install
 

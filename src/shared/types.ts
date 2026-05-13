@@ -219,27 +219,13 @@ export interface PollMessagesResponse {
   messages: Message[];
 }
 
-/** Reserve a terminal slot before spawning the terminal.
- *  Extension calls this to get the animal name before createTerminal. */
-export interface ReservePeerRequest {
-  terminalId: string;
-  extHostId: string;
-  agentType: AgentType;
-}
-
-export interface ReservePeerResponse {
-  id: PeerId;
-  /** The animal noun assigned as the peer id (e.g. "goat") */
-  name: string;
-}
-
 export interface BrokerHealthResponse {
   status: "ok";
   pid: number;
   peerCount: number;
   uptime: number;
   autoConflictCheck?: boolean;
-  maxContextLength?: number;
+  maxRecentContextChars?: number;
 }
 
 // ─── WebSocket Events (real-time push) ─────────────────────────
@@ -292,31 +278,27 @@ export interface WsMemoryAddedEvent extends WsEvent {
 
 // ─── Repo Memory ─────────────────────────────────────────────
 
-export type MemoryCategory = "task" | "issue" | "architecture";
+export type MemoryType = "long" | "short";
 
 export interface RepoMemory {
   id: number;
   gitRoot: string;
-  category: MemoryCategory;
-  title: string;
-  content: string;
+  type: MemoryType;
+  summary: string;
   files: string[];
   areas: string[];
-  sourcePeerId: string | null;
-  contentHash: string;
+  expiresAt?: string;
   createdAt: string;
   updatedAt: string;
 }
 
 export interface AddMemoryRequest {
   gitRoot: string;
-  category: MemoryCategory;
-  title: string;
-  content: string;
+  type: MemoryType;
+  summary: string;
   files?: string[];
   areas?: string[];
-  sourcePeerId?: string;
-  sourceExchange?: string;
+  expiresAt?: string;
 }
 
 export interface AddMemoryResponse {
@@ -331,7 +313,7 @@ export interface SearchMemoryRequest {
   query: string;
   files?: string[];
   areas?: string[];
-  category?: MemoryCategory;
+  type?: MemoryType;
   limit?: number;
 }
 
@@ -341,7 +323,7 @@ export interface SearchMemoryResponse {
 
 export interface ListMemoriesRequest {
   gitRoot: string;
-  category?: MemoryCategory;
+  type?: MemoryType;
   limit?: number;
   offset?: number;
 }
@@ -361,12 +343,11 @@ export interface DeleteMemoryResponse {
 
 /** A memory extracted from session exchanges by the compression module */
 export interface ExtractedMemory {
-  category: MemoryCategory;
-  title: string;
-  content: string;
+  type: MemoryType;
+  summary: string;
   files: string[];
   areas: string[];
-  sourceExchange?: string;
+  expiresAt?: string;
 }
 
 // ─── Conflict Detection ───────────────────────────────────────
@@ -380,9 +361,8 @@ export interface CheckConflictsRequest {
 /** Advisory from repo memory surfaced during conflict detection (non-blocking) */
 export interface ConflictAdvisory {
   memoryId: number;
-  category: string;
-  title: string;
-  content: string;
+  type: MemoryType;
+  summary: string;
 }
 
 export interface ConflictResult {
@@ -393,7 +373,7 @@ export interface ConflictResult {
   reason: string;
   confidence: "high" | "medium" | "low";
   /** Relevant repo memories surfaced during conflict detection */
-  relatedMemories?: Array<{ id: number; category: string; title: string; createdAt: string }>;
+  relatedMemories?: Array<{ id: number; type: MemoryType; summary: string; createdAt: string }>;
 }
 
 export interface CheckConflictsResponse {

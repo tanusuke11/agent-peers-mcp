@@ -10,3 +10,6 @@ vsix: build
 update-claude:
     npm install -g @anthropic-ai/sdk
     npm update @anthropic-ai/sdk
+
+update-codex:
+    npm install -g @openai/codex@latest

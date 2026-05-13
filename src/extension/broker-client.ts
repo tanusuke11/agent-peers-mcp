@@ -11,15 +11,27 @@ import type {
   AgentType,
   BrokerHealthResponse,
   RepoMemory,
+  AddMemoryResponse,
+  MemoryType,
   SearchMemoryResponse,
   ListMemoriesResponse,
   WsEvent,
-  ReservePeerRequest,
-  ReservePeerResponse,
 } from "../shared/types";
 import { findNodeBinary } from "../shared/process";
 
 type EventHandler = (data: unknown) => void;
+
+const DEFAULT_MAX_RECENT_CONTEXT_CHARS = 6000;
+
+function getConfiguredMaxRecentContextChars(): number {
+  const cfg = vscode.workspace.getConfiguration("agentPeers");
+  const configured = cfg.get<number>("maxRecentContextChars");
+  if (configured && configured > 0) {
+    return configured;
+  }
+
+  return DEFAULT_MAX_RECENT_CONTEXT_CHARS;
+}
 
 export class BrokerClient {
   private baseUrl: string;
@@ -107,8 +119,8 @@ export class BrokerClient {
     }
   }
 
-  async sendMessage(fromId: string, toId: string, type: MessageType, text: string): Promise<void> {
-    await this.post("/send-message", { fromId, toId, type, text });
+  async sendMessage(fromId: string, toId: string, type: MessageType, text: string, options?: { fromUser?: boolean; force?: boolean }): Promise<void> {
+    await this.post("/send-message", { fromId, toId, type, text, fromUser: options?.fromUser, force: options?.force });
   }
 
   async unregisterPeer(id: string): Promise<void> {
@@ -185,20 +197,12 @@ export class BrokerClient {
     }
   }
 
-  async updateConfig(config: { autoConflictCheck?: boolean; maxContextLength?: number }): Promise<{ ok: boolean; autoConflictCheck: boolean; maxContextLength: number } | null> {
+  async updateConfig(config: { autoConflictCheck?: boolean; maxRecentContextChars?: number }): Promise<{ ok: boolean; autoConflictCheck: boolean; maxRecentContextChars: number } | null> {
     try {
-      return await this.post<{ ok: boolean; autoConflictCheck: boolean; maxContextLength: number }>("/update-config", config);
+      return await this.post<{ ok: boolean; autoConflictCheck: boolean; maxRecentContextChars: number }>("/update-config", config);
     } catch {
       return null;
     }
-  }
-
-  async reservePeer(terminalId: string, extHostId: string, agentType: AgentType): Promise<ReservePeerResponse> {
-    return await this.post<ReservePeerResponse>("/reserve-peer", {
-      terminalId,
-      extHostId,
-      agentType,
-    } satisfies ReservePeerRequest);
   }
 
   async registerPeer(agentType: string, pid: number, cwd: string, gitRoot: string | null, source: "terminal" | "extension" = "extension", opts?: { extHostId?: string; terminalId?: string; preferredId?: string }): Promise<{ id: string }> {
@@ -233,14 +237,14 @@ export class BrokerClient {
     const { spawn } = require("child_process") as typeof import("child_process");
     const cfg = vscode.workspace.getConfiguration("agentPeers");
     const autoConflict = cfg.get<boolean>("autoConflictCheck", true);
-    const maxContextLength = cfg.get<number>("maxContextLength", 30);
+    const maxRecentContextChars = getConfiguredMaxRecentContextChars();
     const proc = spawn(findNodeBinary(), [brokerPath], {
       stdio: "ignore",
       detached: true,
       env: {
         ...process.env,
         AGENT_PEERS_AUTO_CONFLICT_CHECK: String(autoConflict),
-        AGENT_PEERS_MAX_CONTEXT_LENGTH: String(maxContextLength),
+        AGENT_PEERS_MAX_CONTEXT_CHARS: String(maxRecentContextChars),
       },
     });
     proc.unref();
@@ -321,14 +325,25 @@ export class BrokerClient {
 
   // ─── Repo Memory ────────────────────────────────────────
 
-  async listRepoMemories(gitRoot: string, category?: string, limit?: number): Promise<RepoMemory[]> {
-    const result = await this.post<ListMemoriesResponse>("/repo-memory/list", { gitRoot, category, limit });
+  async listRepoMemories(gitRoot: string, type?: string, limit?: number): Promise<RepoMemory[]> {
+    const result = await this.post<ListMemoriesResponse>("/repo-memory/list", { gitRoot, type, limit });
     return result.memories;
   }
 
   async searchRepoMemories(gitRoot: string, query: string): Promise<RepoMemory[]> {
     const result = await this.post<SearchMemoryResponse>("/repo-memory/search", { gitRoot, query });
     return result.memories;
+  }
+
+  async upsertRepoMemory(memory: {
+    gitRoot: string;
+    type: MemoryType;
+    summary: string;
+    files?: string[];
+    areas?: string[];
+    expiresAt?: string;
+  }): Promise<AddMemoryResponse> {
+    return await this.post<AddMemoryResponse>("/repo-memory/upsert", memory);
   }
 
   // ─── Cleanup ──────────────────────────────────────────
